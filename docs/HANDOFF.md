@@ -80,6 +80,16 @@ to start at Phase 1 of that list, and should update
 — that document, not this one, is now the source of truth for this
 effort's day-to-day state.
 
+**Addendum (same day):** the training-loop side of that chain (Phase 2)
+now has its own dedicated design document,
+[`experiments/simulator-indels/TRAINING_PLAN.md`](../experiments/simulator-indels/TRAINING_PLAN.md)
+— reframed from an in-place model widening to a **new model with its
+own training script(s)** (`train_diploid_indel.py`), reusing existing
+CRF kernels/callbacks/Lightning wiring where they're feature-width-
+independent, rebuilding the encoder's cell-embedding and affinity/het
+logic for the ternary value range. Still design-only; no `.py` files
+changed. Overall status is unchanged: design phase, no code yet.
+
 ## ACTIVE (2026-08-28): branch consolidation + grits_workdir scripts/results brought in — DONE, review pending
 
 **Context.** Several weeks of RIL2 founder-path-decode-error investigation

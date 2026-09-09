@@ -32,6 +32,18 @@ rounds (§5). This entry exists so the next session (human or Claude)
 knows exactly where this stands: design is settled enough to start §5
 Phase 1, but Phase 1 has not been started.
 
+### 2026-09-09 — Training-side design reframed as a new model line
+
+The training-loop side of §5 Phase 2 (below) was originally designed as
+an in-place widening of `FounderPathEncoder`/`GRITSCRFDiploid`, gated
+behind a checkpoint-compatibility hyperparameter. That framing was
+explicitly rejected: this is being built as **a new model with its own
+training script(s)**, not an upgrade to the existing one, reusing
+existing data structures/classes only where they're genuinely
+feature-width-independent. Full design now lives in
+[`TRAINING_PLAN.md`](TRAINING_PLAN.md); §5.2 below is a pointer to it,
+not the design itself. Still no code changed.
+
 ---
 
 ## 1. Why this work exists
@@ -227,13 +239,16 @@ species by re-fitting parameters, not rewriting the generator.
    the offset-tracking mechanism to `simulate_alleles.py`; emit the new
    `2K+2` layout (§2.3) behind a new CLI flag (e.g. `--simulate-indels`)
    so existing behavior is preserved when the flag is off.
-2. **Training-side format updates.** Dataset loader changes for the new
-   distance block; `FounderPathEncoder.cell` widened from
-   `nn.Linear(1, d_model)` to `nn.Linear(2, d_model)` (a per-cell
-   2-vector, not a wider founder axis) — checkpoint-compatible via
-   zero-init on the new column, mirroring the `ext_bias` pattern
-   (§4); `binary_cells`/`_het_scale`/`_founder_affinity` recalibration
-   for the ternary value range (§4).
+2. **Training-side format updates.** Full design now in
+   [`TRAINING_PLAN.md`](TRAINING_PLAN.md) — reframed (2026-09-09, see
+   §0) as a new model with its own training script(s)
+   (`train_diploid_indel.py`), not an in-place widening of
+   `FounderPathEncoder`/`GRITSCRFDiploid`; existing CRF kernels,
+   `EMACallback`, and Lightning wiring are reused, while the
+   cell-embedding transform, `_het_scale`/`_founder_affinity`
+   equivalents, and Dataset classes are rebuilt for the ternary value
+   range. No checkpoint-compatibility constraint with
+   `diploid-affinity-sim512-h3` — see `TRAINING_PLAN.md` §1.
 3. **Retrain and evaluate** against this project's established
    SNP+RefCall baselines (genome-wide 0.0711% error; B73×CML103
    chr5:86–134Mb IBD-zone 1.181% SNP-class error — see
