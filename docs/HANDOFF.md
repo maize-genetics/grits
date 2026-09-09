@@ -1,10 +1,84 @@
-# Session handoff — crf-relatedness (2026-08-28, branch consolidation + grits_workdir bring-in)
+# Session handoff — crf-relatedness (2026-09-09, indel-modeling design)
 
 Status snapshot for resuming work. Full per-experiment detail is in
 [`docs/RESULTS.md`](RESULTS.md); experiment spec in [`docs/PLAN.md`](PLAN.md).
-Older active threads (2026-07-13 sim→real transfer, 2026-07-10 checkpoint/eval
-hardening + sim data regen, 2026-06-28 whole-genome, 2026-06-26 het, 2026-06-25
-IBD-ceiling, 2026-06-24 E1-maize) are below as history.
+Older active threads (2026-08-28 branch consolidation, 2026-07-13 sim→real
+transfer, 2026-07-10 checkpoint/eval hardening + sim data regen, 2026-06-28
+whole-genome, 2026-06-26 het, 2026-06-25 IBD-ceiling, 2026-06-24 E1-maize) are
+below as history.
+
+## ACTIVE (2026-09-09): realistic indel modeling for the training simulator — DESIGN DONE, no code changed yet
+
+**Context.** The 2026-08-28 entry below committed to a follow-through
+chain after that session's `ropebwt3-phg` work (branch
+`lift-ridx-ternary-dist-map`, in the separate `ropebwt3-phg` repo,
+pushed, not yet merged there): rework `src/python/crf/simulate_alleles.py`
+to emit synthetic training data matching the new `refmap --anchor-dist-npy`
+feature (a per-founder ternary read-sharing state — match/diverged/
+deletion — plus a distance-to-nearest-anchor value), then widen the
+model's input, then retrain. This entry scopes and designs the simulator
+side of that chain. This is now explicitly a **shared, ongoing project
+between the user and collaborators working on the same machine** — see
+`experiments/simulator-indels/` for the durable, git-committed design
+document collaborators should read and edit directly, rather than
+relying on any session-local planning file.
+
+**Full design:** [`experiments/simulator-indels/PLAN.md`](../experiments/simulator-indels/PLAN.md)
+— read this first before touching `simulate_alleles.py`. Biological
+grounding (general plant indel-mutation literature + real maize
+calibration numbers from this project's own founder gVCFs):
+[`experiments/simulator-indels/results/indel_biology_notes.md`](../experiments/simulator-indels/results/indel_biology_notes.md).
+
+**Summary of what was decided this round** (all detail, sources, and
+exact code citations are in the linked `PLAN.md` — this is a summary,
+not a duplicate):
+- **Goal, clarified beyond the original ask:** the ternary+distance
+  features aren't just about indel realism for its own sake — they're
+  the intended mechanism for letting the model directly observe (rather
+  than infer) whether a locus is genuinely **heterozygous** (both
+  homologs present, different founders), **hemizygous** (one homolog has
+  a real deletion relative to reference, so only one copy exists), or
+  showing **recombination** (a real founder-path switch, no deletion).
+  An earlier, unimplemented idea for this same problem (`docs/PLAN.md`'s
+  "E10", a per-read position float) is explicitly **superseded and
+  deferred** — it wanted read-position clustering to indirectly infer
+  what the ternary state now observes directly. If E10 is ever revisited,
+  its conflict with this feature over `FounderPathEncoder.cell`'s
+  per-cell embedding slot must be resolved first.
+- **Coordinate system:** no new/independent bp-space model. B73/reference
+  is the coordinate backbone (matching the real pipeline exactly); each
+  founder gets a running offset relative to it, diverging through indel
+  runs — the same mechanism as the real `.lift`-anchor slope/distance
+  logic in `ropebwt3-phg`.
+- **Indels are a property of the founder's own genome**, not
+  redrawn per individual — any individual inheriting a founder's
+  haplotype at a locus inherits its indel structure there.
+- **Output is exactly 2 matrices**, verified against the actual
+  committed `ropebwt3-phg` C code (not assumed from memory): the
+  simulator's matrix 1 **is** the ternary state, replacing today's
+  binary features in place (same column position) — unlike the real
+  refmap C code, which keeps a legacy-unchanged 3rd block purely for its
+  own backward compatibility, a constraint that doesn't apply to a new
+  simulator format. Matrix 2 (distance) is a new trailing block after
+  the unchanged label columns. No VCF-shaped output — the model never
+  reads one.
+- **Indel size model:** a two-component mixture (small,
+  replication-slippage-driven; large, LTR-retrotransposon-driven),
+  mechanistically motivated and calibrated from real maize founder gVCF
+  data (excluding a confirmed assembly-quality outlier, A188) — not a
+  single distribution, and not maize-specific in structure.
+
+**Explicitly not done in this round:** no changes to
+`simulate_alleles.py`, `train_diploid.py`, or `train_crf.py`.
+Implementation is deferred to separately-approved future phases listed
+in `experiments/simulator-indels/PLAN.md` §5 (simulator core → training-
+side format/encoder updates → retrain and evaluate against the
+established SNP+RefCall baselines → decide on merging
+`lift-ridx-ternary-dist-map`). Whoever picks this up next should expect
+to start at Phase 1 of that list, and should update
+`experiments/simulator-indels/PLAN.md`'s own Progress log (§0) directly
+— that document, not this one, is now the source of truth for this
+effort's day-to-day state.
 
 ## ACTIVE (2026-08-28): branch consolidation + grits_workdir scripts/results brought in — DONE, review pending
 
