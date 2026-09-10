@@ -90,6 +90,36 @@ independent, rebuilding the encoder's cell-embedding and affinity/het
 logic for the ternary value range. Still design-only; no `.py` files
 changed. Overall status is unchanged: design phase, no code yet.
 
+**Addendum (2026-09-10): collaborator review incorporated.** A
+collaborator reviewed the simulator design and raised seven points, now
+folded into `PLAN.md` — most notably: recombination across indels was
+previously unanswered and now has a direct answer (§2.6, indels atomic
+w.r.t. crossover, breakpoints snapped out of indel tracts, local
+suppression via the existing E2 rate-map machinery); indels draw from
+the same Ewens/GEM(θ) coalescent as SNPs (§2.2, via the existing
+`_gem_lineages`); a genuine read-sampling/coverage layer is now
+in scope (§2.5, the simulator currently has none — exactly 1
+read/site by construction — this is what will produce read stacking and
+coverage blotchiness, not a refinement of existing code); and explicit
+acceptance criteria now exist (§2.7), grounded in a real, previously
+unexplained sim-vs-real gap already on record
+(`docs/notes/cassava_data_diagnostic.md`: real heterozygous individuals
+show only ~72% either-true-founder read coverage vs. the simulator's
+~96% — indels are a strong candidate explanation). The ~40%
+indel-affected-genome figure is now measured directly from founder
+gVCFs (39–42% across founders, deletion+gap bp only — a real
+double-counting bug from including insertion bp in an earlier pass at
+this measurement was caught and corrected, see
+`experiments/simulator-indels/results/indel_biology_notes.md`), with a
+reproducible script and figure
+(`experiments/simulator-indels/scripts/indel_size_report.py`,
+`results/indel_size_distribution.png`). One design point was revisited
+and held as originally committed: the ternary `2K+2` matrix-1 layout
+does not need a count block for stacking, since stacking is represented
+as row multiplicity (matching the existing PS4G convention), not a cell
+value. Cassava validation deferred pending data from the collaborator.
+Still design-only; no `.py` files changed.
+
 ## ACTIVE (2026-08-28): branch consolidation + grits_workdir scripts/results brought in — DONE, review pending
 
 **Context.** Several weeks of RIL2 founder-path-decode-error investigation

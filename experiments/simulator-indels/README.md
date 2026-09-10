@@ -15,10 +15,17 @@ exactly where the last one left off.
 
 **Biological grounding:** [`results/indel_biology_notes.md`](results/indel_biology_notes.md)
 — general plant indel-mutation mechanisms plus real maize calibration
-numbers measured from this project's own founder gVCFs.
+numbers measured from this project's own founder gVCFs, including the
+event-vs-bp-weighted size distribution
+([`results/indel_size_distribution.png`](results/indel_size_distribution.png),
+reproducible via `scripts/indel_size_report.py`).
+
+**What "done" means for Phase 1:** `PLAN.md` §2.7 — acceptance criteria
+grounded in real sim-vs-real gaps already measured
+(`docs/notes/cassava_data_diagnostic.md`), not just "the code runs."
 
 ## Status
 
-Design phase — no code changes yet. See `PLAN.md`'s "This round's
-deliverables" and "Future work" sections for exactly what's done and
-what's next.
+Design phase — no code changes yet. See `PLAN.md` §0 (Progress log) for
+what's been decided so far and `PLAN.md` §5 (Future work) for what's
+next.

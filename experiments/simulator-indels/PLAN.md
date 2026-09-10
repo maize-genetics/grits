@@ -6,7 +6,7 @@
 > `docs/PLAN.md`) as design decisions change or implementation phases
 > land, so a fresh Claude Code session or a collaborator with no prior
 > context can pick this up correctly. **Last reconciled with the code:
-> 2026-09-09** — no simulator/model code has changed yet; see §0.
+> 2026-09-10** — no simulator/model code has changed yet; see §0.
 
 > **Scope of this document:** reworking `src/python/crf/simulate_alleles.py`
 > to (a) generate realistic insertion/deletion (indel) patterns relative
@@ -43,6 +43,41 @@ existing data structures/classes only where they're genuinely
 feature-width-independent. Full design now lives in
 [`TRAINING_PLAN.md`](TRAINING_PLAN.md); §5.2 below is a pointer to it,
 not the design itself. Still no code changed.
+
+### 2026-09-10 — Collaborator review incorporated
+
+A collaborator reviewed this design and returned seven points, folded in
+below: (1) report the large-indel size distribution explicitly —
+bp-weighted, not just event-weighted; (2) the read-sampling model must
+produce **stacking** (many rows at one reference position for large
+insertions) since ~40% of the maize genome is indel-divergent between
+two inbreds; (3) add Cassava as a second validation system (deferred —
+cassava has assemblies, not gVCFs, and needs data the collaborator will
+supply); (4) answer how recombination is modeled across indels — not
+previously addressed anywhere in this document, now §2.6; (5) indels
+should follow the same Ewens/GEM(θ) coalescent as SNPs, possibly a
+shorter one — now §2.2; (6) the acceptance bar is that heterozygous
+individuals show **hemizygous-looking read sharing at many positions**
+and homozygous lines show **blotchy coverage** — now §2.7, with real
+targets from `docs/notes/cassava_data_diagnostic.md`.
+
+The 40% figure is now measured directly (not just taken on faith):
+39.0–42.6% of reference bp across B97/CML103/Tzi8 chr1 carries no
+homologous founder sequence (deletion+gap, i.e. excluding insertion bp,
+which doesn't consume reference span — see the definitional note in
+`results/indel_biology_notes.md`). Full multi-chromosome, multi-founder
+figures in `results/indel_size_distribution.png`, reproducible via
+`scripts/indel_size_report.py`.
+
+One design point from the 2026-09-09 entry was revisited and **held**:
+I initially flagged a conflict between §2.3's strict ternary matrix 1
+and the stacking requirement (a pile-up would encode identically to a
+single read under a value-only representation). Per the collaborator,
+stacking is a **row-multiplicity** phenomenon, not a cell value — the
+existing PS4G convention already expands read counts into consecutive
+duplicate rows (verified in `ropebwt_npy_to_matrix.py`'s docstring and
+in real matrices, where zero rows are ever all-zero). §2.3's `2K+2`
+ternary layout is correct as committed; see the note added there.
 
 ---
 
@@ -127,6 +162,28 @@ This reuses the existing founder-subset/individual-assignment machinery
 with no new grouping code required — indels attach to the founder-id
 axis that already exists.
 
+**Indel presence is drawn from the same Ewens/GEM(θ) coalescent process
+as SNP sharing, not an independent distribution.** The simulator already
+draws SNP mini-haplotype sharing this way: `_gem_lineages`
+(`:245–267`) assigns each founder's mosaic segments a lineage via
+GEM(θ) stick-breaking (`--sharing-theta`), and `_coalescent_feats`
+(`:292–351`) indexes per-lineage SNP alleles (`lin_alleles`) through
+that same `lineage [n,K,T]` array — two founders on the same lineage at
+a site are identical-by-descent and share the same mini-haplotype. Draw
+per-lineage indel presence/absence exactly in parallel, indexed by the
+*same* `lineage` array: two IBD founders then share indel content and
+mini-haplotype identically, which is the biologically correct coupling
+(a real segment inherited without recombination carries both together)
+and gives consistent co-support structure rather than two independently
+noisy signals.
+
+Default: indels reuse `--sharing-theta` directly (no separate draw). Add
+`--indel-theta` (default: unset, inherits `--sharing-theta`) to let
+indels follow a shorter coalescent than SNPs if calibration later shows
+that fits better — real indel tract boundaries plausibly turn over
+faster than point-mutation lineages. Treat as a tuning knob to explore
+once real simulator output exists, not a default to guess ahead of data.
+
 ### 2.3 Output: exactly two matrices, verified against the real implementation
 
 Verified directly against the actual committed C code in `ropebwt3-phg`
@@ -162,6 +219,19 @@ total width `2K+2` (up from today's `K+2`). Labels don't move — this
 narrows the training-side blast radius to "matrix 1's value range
 changed" plus "one new trailing block," not a full column renumbering.
 
+**Why this stays a value-only matrix rather than needing a count block:**
+a collaborator review (2026-09-10, §0) raised a real concern here — a
+strict ternary/binary *value* can't distinguish a 40-read pile-up from a
+single read, which matters once read stacking (§2.5) is modeled. The
+resolution is that stacking is represented as **row multiplicity, not a
+cell value**: matching the existing PS4G convention, where multiple
+reads at the same region become additional consecutive rows carrying
+the same founder profile, not a larger count in one row (confirmed
+against `ropebwt_npy_to_matrix.py`'s "non-collapsed, row-not-position"
+windowing convention, and against real training matrices, where no row
+is ever all-zero). So the `2K+2` ternary layout is unaffected by
+stacking — see §2.5 for how rows get produced.
+
 ### 2.4 Indel size model: two-component mixture
 
 Real maize founder gVCF data is genuinely bimodal in indel length (see
@@ -184,6 +254,107 @@ Defaults are maize-calibrated from the real numbers in
 assembly-quality outlier — see that document), but the two-component
 *structure* is the general-plant-biology claim, portable to other
 species by re-fitting parameters, not rewriting the generator.
+
+### 2.5 Read sampling and coverage: the mechanism that produces stacking
+
+The simulator currently has **no coverage model at all**: per its own
+docstring (`:21`), "each of the T positions is ONE read" — exactly 1×
+by construction — and `_coalescent_feats` returns one binary match value
+per site. Nothing can stack, and nothing can be uncovered. This is a
+real gap, not a refinement — reproducing the acceptance criteria in
+§2.7 requires an actual read-sampling layer:
+
+1. Sample reads in **founder (assembly) coordinates**, proportional to
+   founder sequence content — a founder carrying a large insertion
+   contributes reads across the full length of the inserted sequence,
+   same as real sequencing coverage would.
+2. Project sampled reads onto the reference coordinate system (§2.1).
+   Inserted sequence has no reference span, so every read landing inside
+   an insertion projects to the **single reference anchor point**
+   flanking it → many consecutive rows at one reference position. This
+   *is* the stacking, emitted as row duplication per §2.3's note, not a
+   count value.
+3. Reads sampled from within a deletion interval don't exist — that
+   founder contributes **zero rows** at those reference positions.
+4. Net effect: rows per unit reference bp becomes highly non-uniform
+   along the genome — dense at large insertions, absent through
+   deletions — which is the mechanism behind the coverage "blotchiness"
+   in §2.7.
+
+### 2.6 Recombination across indels
+
+Not previously addressed anywhere in this design; a collaborator asked
+directly (2026-09-10, §0). Answer:
+
+- **Crossovers are drawn on the reference backbone** (§2.1), the frame
+  in which homology — and therefore meiotic pairing — is defined,
+  reusing `_segment_index`/`_build_paths`/`_rate_map` unchanged.
+- **Indels are atomic with respect to crossover**: no breakpoint falls
+  inside an indel tract. Mechanistic basis — crossover requires
+  homologous synapsis, and a hemizygous insertion has no pairing partner
+  on the other homolog at that interval. Implementation: after drawing
+  breakpoints, snap any landing inside an indel interval out to the
+  nearest flanking colinear position.
+- **Large indels locally suppress crossover** beyond strict atomicity —
+  no new mechanism needed: `_segment_index` already accepts a per-site
+  `rate`, so scale it down inside and near indel-divergent intervals,
+  reusing the existing hidden `--recomb-span` rate-map machinery (E2).
+- **Truth labels stay defined everywhere**, including inside deletions —
+  a reference position has a well-defined founder assignment even where
+  the individual carries no sequence there. Those become *labeled but
+  uncovered* positions, which is exactly the blotchiness in §2.7 and is
+  currently excluded from SNP+RefCall scoring project-wide.
+- **The coupling that matters**: indel content is a lineage-level
+  property (§2.2), and a crossover switches which lineage is active — so
+  crossing over changes which indel structure an individual carries
+  downstream. This is the mechanism by which hemizygosity varies along a
+  chromosome instead of being a fixed per-individual property.
+
+### 2.7 Calibration targets and acceptance criteria
+
+The collaborator's stated priority, more important than any single
+parameter choice: heterozygous individuals must show **hemizygous-
+looking read sharing at many positions**, and homozygous lines must show
+**high blotchiness in coverage**. Both already have measured real-data
+targets, recorded in `docs/notes/cassava_data_diagnostic.md`
+(2026-06-24), which found a then-unexplained ceiling that the indel
+model is now a strong candidate explanation for:
+
+| metric | real cassava (het) | real maize (inbred) | current simulator |
+|---|---|---|---|
+| true H1 founder has ≥1 supporting read | 42.4% | 71.6% | ~96% |
+| **either true founder (H1 or H2) has a read** | **72.1%** | **71.6%** | **~96%** |
+
+At ~40% of reference bp indel-divergent (see `results/indel_biology_notes.md`),
+a large share of positions genuinely have no homologous founder
+sequence to sample a read from — so reproducing the real **~72% ceiling**
+instead of the simulator's current ~96% is the sharpest available test
+that the indel model (§2.5, §2.6) is doing real work, not just adding
+noise. Acceptance criteria for Phase 1 (§5):
+
+- Simulated either-true-founder-covered rate should land near 70–75%
+  for outbred (heterozygous) individuals, not ~96%.
+- Add a **coverage-dispersion statistic** for blotchiness: index of
+  dispersion (variance/mean) of rows-per-reference-bin, plus the
+  zero-coverage run-length distribution. Poisson (uniform) sampling
+  gives an index ≈1; real blotchy coverage should be markedly ≫1. No
+  real-data target number yet — flagged in §7.
+- Realized genome-wide indel-affected fraction should land near the
+  measured **~40%** target (§2.4, `results/indel_size_distribution.png`),
+  reported as an explicit simulator QC line, not just implied by config.
+
+**Cassava as a second validation system** (deferred): a highly
+heterozygous, clonally propagated outcrosser — structurally opposite to
+inbred maize — with existing infrastructure
+(`experiments/cassava-diploid-crf/`, the cassava row above) but no
+indel calibration data yet. Cassava has assemblies, not gVCFs
+(`grits_workdir/cassava/fasta_for_index/`), so the gVCF `ASM_*`-span
+method used for maize can't run there directly; a `.lift`-anchor route
+exists (`cassava/ropebwt_index/cassavaChrIndex.lift`, reusable via
+`experiments/ril2-error-regions/scripts/parse_lift_file.py`) but is
+blind below its ~2kb anchor spacing, so it would only extend the large-
+indel calibration, not the small-indel one. On hold until the
+collaborator supplies cassava data to work from.
 
 ## 3. Terminology (use precisely and consistently)
 
@@ -208,6 +379,11 @@ species by re-fitting parameters, not rewriting the generator.
 - Founder-subset/individual-assignment machinery (`_build_paths_subset`,
   E11/Tier2 breeding-population mechanism) — indel presence attaches to
   the founder-id axis these already manage.
+- `_gem_lineages` (`:245–267`) and the `lineage [n,K,T]` array it
+  produces — indel presence draws through the same lineage assignment
+  as SNP sharing (§2.2), no new partition machinery needed.
+- `--recomb-span`'s hidden per-site rate map (E2) — reused to suppress
+  crossover near large indels (§2.6), no new rate mechanism needed.
 - The model-side zero-init, checkpoint-compatible extension pattern
   already established for `ext_bias`/`het_head`
   (`src/python/crf/train_crf.py:177–194`) — the template for adding the
@@ -221,6 +397,12 @@ species by re-fitting parameters, not rewriting the generator.
   ternary/distance derivation (§2.1).
 - The two-component mixture length model with real-data-calibrated
   defaults (§2.4).
+- A genuine read-sampling/coverage layer (§2.5) — the simulator has none
+  today (exactly 1 read/site by construction); this is what produces
+  stacking and blotchiness, not a refinement of existing code.
+- Breakpoint-snapping to keep crossovers out of indel tracts (§2.6).
+- The coverage-dispersion QC statistic (§2.7) — new, no existing
+  analogue in the simulator's diagnostics.
 - `train_crf.py`'s `binary_cells` fast path (`:218–222`) hardcodes a
   2-row `{0,1}` lookup table — must be widened or disabled for ternary
   data.
@@ -235,10 +417,13 @@ species by re-fitting parameters, not rewriting the generator.
 
 ## 5. Future work (not started — each phase needs its own review/approval)
 
-1. **Simulator core.** Add the indel-tract generator (§2.1, §2.4) and
-   the offset-tracking mechanism to `simulate_alleles.py`; emit the new
-   `2K+2` layout (§2.3) behind a new CLI flag (e.g. `--simulate-indels`)
-   so existing behavior is preserved when the flag is off.
+1. **Simulator core.** Add the indel-tract generator (§2.1, §2.2, §2.4),
+   the offset-tracking mechanism, the read-sampling/coverage layer
+   (§2.5), and breakpoint-snapping (§2.6) to `simulate_alleles.py`; emit
+   the new `2K+2` layout (§2.3) behind a new CLI flag (e.g.
+   `--simulate-indels`) so existing behavior is preserved when the flag
+   is off. Done when it meets the acceptance criteria in §2.7, not just
+   when it runs.
 2. **Training-side format updates.** Full design now in
    [`TRAINING_PLAN.md`](TRAINING_PLAN.md) — reframed (2026-09-09, see
    §0) as a new model with its own training script(s)
@@ -284,3 +469,13 @@ species by re-fitting parameters, not rewriting the generator.
 - Whether the solo-LTR partial-deletion mechanism (§2.4,
   `results/indel_biology_notes.md`) gets its own explicit sub-model or
   folds into the general large-indel component's length distribution.
+- `--indel-theta` (§2.2): whether indels genuinely need a shorter
+  coalescent than SNPs, and if so by how much — untunable until real
+  simulator output exists to check co-support structure against.
+- Exact read-sampling distribution for §2.5 (uniform over founder
+  assembly coordinates is the starting assumption; real sequencing
+  coverage has its own biases — e.g. GC content — not modeled here).
+- No real-data target yet for the coverage-dispersion statistic (§2.7)
+  — only the qualitative "≫1, not ≈1" expectation is established.
+- Breakpoint-snapping distance in §2.6 (how far "near" an indel
+  suppression extends) — not yet parameterized.
