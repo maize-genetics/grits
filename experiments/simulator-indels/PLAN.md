@@ -16,11 +16,17 @@
 > merged there either). See `docs/HANDOFF.md`'s top entry for how this
 > connects to the rest of the project's history.
 
-> **Workflow diagram:** [`results/simulator_workflow.png`](results/simulator_workflow.png)
-> — the §2/§4 pipeline at a glance, color-coded reused / new / modified,
-> capped by the §2.7 acceptance gate. Regenerate via
-> `scripts/simulator_workflow_diagram.py` after any change to §2 or §4's
-> stage list, so the picture never drifts from the prose.
+> **Workflow diagrams:** [`results/simulator_workflow_before.png`](results/simulator_workflow_before.png)
+> (today — 5 stages, binary `K+2` output, grounded directly in
+> `simulate()`'s current body) vs.
+> [`results/simulator_workflow.png`](results/simulator_workflow.png)
+> (planned — the §2/§4 pipeline, color-coded reused / new / modified,
+> capped by the §2.7 acceptance gate). Same box grid/size in both so
+> they compare directly. Regenerate via
+> `scripts/simulator_workflow_diagram.py` /
+> `scripts/simulator_workflow_before_diagram.py` after any change to
+> §2/§4's stage list or to `simulate()` itself, so neither picture
+> drifts from the prose or the code.
 
 ---
 
@@ -110,6 +116,19 @@ regardless of prefix). §2.7's cassava paragraph and
 for numbers. The event/bp-weighted size inversion (§2.4's core claim)
 reproduces closely in cassava; the indel-affected-fraction target is
 organism-specific (32.7% cassava vs. 39.3% maize), not a universal 40%.
+
+### 2026-09-11 — "Before" diagram added for direct comparison
+
+Built `results/simulator_workflow_before.png`
+(`scripts/simulator_workflow_before_diagram.py`), grounded directly in
+`simulate()`'s current body (`simulate_alleles.py:354–497`, not
+inferred from this document's own prose): 5 stages — founder paths,
+genotyping-error mask, the inline H1-or-H2 "one read" pick (no separate
+read-sampling function exists today), SNP match features, write
+`K+2`/binary matrix. Uses the identical box grid/size as
+`simulator_workflow.png` so the two are directly comparable side by
+side; a red "not present today" panel occupies the same canvas space
+the planned diagram's stages 6–8 fill.
 
 ---
 

@@ -13,10 +13,15 @@ Progress log entry, same convention as `docs/PLAN.md`) as work
 progresses, so any collaborator's Claude Code session can pick up
 exactly where the last one left off.
 
-**At a glance:** [`results/simulator_workflow.png`](results/simulator_workflow.png)
-— the pipeline's 8 stages, color-coded reused / new / modified, capped
-by the acceptance gate. Regenerate via `scripts/simulator_workflow_diagram.py`
-whenever the stage list changes.
+**At a glance, before vs. after:**
+[`results/simulator_workflow_before.png`](results/simulator_workflow_before.png)
+(today's 5-stage pipeline, binary `K+2` output) vs.
+[`results/simulator_workflow.png`](results/simulator_workflow.png)
+(the planned 8-stage pipeline, color-coded reused / new / modified,
+capped by the acceptance gate) — same box grid in both, meant to be
+viewed side by side. Regenerate via `scripts/simulator_workflow_before_diagram.py`
+/ `scripts/simulator_workflow_diagram.py` whenever `simulate()` or the
+stage list changes.
 
 **Biological grounding:** [`results/indel_biology_notes.md`](results/indel_biology_notes.md)
 — general plant indel-mutation mechanisms plus real calibration numbers
