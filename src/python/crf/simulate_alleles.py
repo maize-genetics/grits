@@ -60,6 +60,26 @@ from pathlib import Path
 
 import numpy as np
 
+# --- Indel-mode (--simulate-indels) sentinels and constants ---------------
+# Matrix-1 ternary state, mirroring ropebwt3-phg's rb3_lift_ternary_state
+# exactly: deletion / diverged / match relative to reference. TERN_PAD is
+# reserved for the rare edge case where a window's generation region could
+# not produce T real rows (see _sample_rows) -- never written on a normal
+# window.
+TERN_DEL, TERN_DIV, TERN_MATCH, TERN_PAD = -1, 0, 1, -2
+# Matrix-2 (distance-to-anchor) padding and saturation sentinels, int8.
+DIST_PAD = -1
+DIST_SAT = 127
+# H1/H2 label padding on the same rare-edge-case rows. Kept at -1 (not K),
+# matching the existing real-data convention documented in
+# ropebwt_npy_to_matrix.py: the producer emits -1 for "no label", the
+# consumer remaps -1 -> K (the CRF's own unknown-founder state).
+LABEL_PAD = -1
+# Log-scale compression for the distance-to-anchor block, matching the
+# existing recomb-rate track's clip-and-round precedent (:threshold near
+# line 492 below): code = clip(round(scale*log2(1+d)), 0, DIST_SAT-1).
+DIST_LOG_SCALE = 8.0
+
 
 def _rate_map(rng, n, T, span, tile):
     """Hidden per-window recomb-rate map [n, T] in [1, span].
@@ -289,9 +309,324 @@ def _good_mask(rng, n, T, bad_frac, block):
     return good
 
 
+# --- Indel modeling (--simulate-indels), PLAN.md experiments/simulator- ---
+# indels/PLAN.md SS2 (Design) / SS4 (reusable vs. new). Indels are a
+# property of the founder's LINEAGE (SS2.2), not the raw founder id or the
+# individual, so the functions below operate on the same lineage axis
+# `_gem_lineages` already produces (`M` lineages, gathered onto founders via
+# `_gather_by_lineage`, mirroring how `_coalescent_feats` gathers
+# lin_alleles -> G).
+
+def _indel_lengths(rng, size, large_frac, small_alpha, small_max,
+                    large_logmean, large_logsd, max_len):
+    """Indel event lengths [size] in bp, two-component mixture (PLAN SS2.4).
+
+    Small component (replication slippage at homopolymer/microsatellite
+    tracts): a discrete power law P(L) ~ L^-small_alpha on [1, small_max]
+    via `rng.zipf`, clipped into range -- 1bp-dominant, matching the
+    measured ~41.5%-of-events-at-1bp / ~0.07%-of-bp shape (see
+    experiments/simulator-indels/results/indel_biology_notes.md).
+    Large component (LTR-retrotransposon insertion/removal): LogNormal in
+    bp, clipped to [small_max+1, max_len] -- this component carries the
+    large majority of indel bp on a small minority of events.
+
+    Fully vectorized, no Python-level loop: both components are drawn at
+    the full `size` and selected by one Bernoulli mask, so rng consumption
+    is always exactly 3 draws (mask, small, large) regardless of the
+    mixture weight -- required so a reference-oracle reimplementation can
+    reproduce the exact draw sequence for testing.
+    """
+    is_large = rng.random(size) < large_frac
+    small = np.clip(rng.zipf(small_alpha, size), 1, small_max)
+    large = np.clip(np.rint(rng.lognormal(large_logmean, large_logsd, size)),
+                     small_max + 1, max_len)
+    return np.where(is_large, large, small).astype(np.int64)
+
+
+def _encode_dist(d, scale=DIST_LOG_SCALE):
+    """int (bp) distance -> int8 log-scale code.
+
+    code = clip(round(scale * log2(1 + d)), 0, DIST_SAT - 1); exactly 0 at
+    d=0 (colinear), monotone non-decreasing, naturally saturates toward
+    DIST_SAT-1 for very large or "no real anchor found" distances (see
+    `_anchor_distance`) -- same clip-and-round precedent as the existing
+    recomb-rate track (:~510 below).
+    """
+    code = np.rint(scale * np.log2(1.0 + np.asarray(d, dtype=np.float64)))
+    return np.clip(code, 0, DIST_SAT - 1).astype(np.int8)
+
+
+def _anchor_distance(del_mask):
+    """Distance [same leading shape as del_mask] to the nearest colinear
+    (non-deleted) site along the last axis.
+
+    0 wherever this lineage/founder is colinear (it IS an anchor); inside a
+    deletion tract, the distance to the true NEAREST REAL anchor on either
+    side -- matching rb3_lift_nearest_ref's nearest-anchor semantics.
+    Deliberately does NOT fabricate a "virtual anchor" at the edge of the
+    array for a tract that runs off either edge without a confirmed real
+    anchor on that side: doing so would systematically UNDERESTIMATE the
+    true distance for edge-touching tracts (verified numerically while
+    designing this function -- a virtual-edge-anchor version gives
+    distance 1 immediately at the array boundary regardless of how far the
+    tract actually extends beyond what's simulated, which is a real,
+    avoidable bias). Instead, a side with no real anchor in view uses a
+    sentinel far outside the array's own index range, so `_encode_dist`
+    naturally saturates it; only genuinely known anchors ever produce a
+    small distance.
+
+    Vectorized via the running max/min "nearest real anchor index seen so
+    far" trick (`np.maximum.accumulate` / `np.minimum.accumulate`) instead
+    of a per-tract Python loop; works on any leading shape (`[n,M,R]`
+    lineage-space or `[n,K,R]` founder-space) since only the last axis is
+    treated as the reference-site axis.
+    """
+    R = del_mask.shape[-1]
+    idx = np.arange(R)
+    neg_sentinel, pos_sentinel = -(R + 1), 2 * R
+    last = np.maximum.accumulate(np.where(del_mask, neg_sentinel, idx), axis=-1)
+    rev_del = del_mask[..., ::-1]
+    rev_idx = idx[::-1]
+    nxt = np.minimum.accumulate(
+        np.where(rev_del, pos_sentinel, rev_idx), axis=-1)[..., ::-1]
+    dist = np.minimum(idx - last, nxt - idx)
+    return np.where(del_mask, dist, 0).astype(np.int32)
+
+
+def _gather_by_lineage(a_lin, lineage):
+    """[n,M,...] lineage-space array -> [n,K,...] founder-space, via the
+    SAME `take_along_axis` gather `_coalescent_feats` uses for
+    `lin_alleles -> G`, so IBD founders (those sharing a lineage) are
+    guaranteed byte-identical rather than merely similar."""
+    return np.take_along_axis(a_lin, lineage.astype(np.intp), axis=1)
+
+
+def _indel_tracts(rng, n, M, R, density, ins_frac, large_frac, small_alpha,
+                   small_max, large_logmean, large_logsd, max_len):
+    """Per-LINEAGE indel structure over an R-site generation region
+    (PLAN.md SS2.2, SS2.4): `(del_mask[n,M,R] bool, ins_bp[n,M,R] int32)`.
+
+    Indels are a property of the LINEAGE, not the raw founder id -- this
+    array is `[n,M,R]`, gathered onto founders via `_gather_by_lineage` the
+    same way `_coalescent_feats` gathers `lin_alleles -> G`, which is what
+    makes two IBD founders carry byte-identical indel content.
+
+    Events are drawn as one flat bundle across all (window,lineage) cells
+    (Poisson total count, then each event assigned a (window,lineage) cell
+    and a start position), turned into an interval-union mask via the
+    standard +1/-1 scatter + cumsum trick (`np.add.at`, no per-event Python
+    loop). Insertions are point events (zero reference span): their length
+    is scatter-ADDED into `ins_bp` at their single reference anchor, which
+    is `start` itself -- the reference site immediately before the
+    insertion begins (matching VCF/lift-file convention: an insertion has
+    no reference span of its own, so its anchor is the last colinear
+    reference base before it, not "nearest of either flank").
+
+    Boundary correction: event start positions are drawn on the EXTENDED
+    interval `[-max_len, R)`, not `[0, R)` -- a tract or a large insertion
+    whose start falls before the region but whose body/anchor still
+    overlaps it must still be represented, or long tracts are
+    systematically undercounted near the region's left edge.
+    """
+    span = R + max_len
+    lam = density * span
+    cnt = rng.poisson(lam, size=n * M)
+    E = int(cnt.sum())
+    if E == 0:
+        return (np.zeros((n, M, R), dtype=bool),
+                np.zeros((n, M, R), dtype=np.int32))
+
+    cell = np.repeat(np.arange(n * M), cnt)
+    start = rng.integers(-max_len, R, E)
+    L = _indel_lengths(rng, E, large_frac, small_alpha, small_max,
+                        large_logmean, large_logsd, max_len)
+    is_ins = rng.random(E) < ins_frac
+    is_del = ~is_ins
+
+    depth = np.zeros((n * M, R + 1), dtype=np.int16)
+    if is_del.any():
+        s = np.clip(start[is_del], 0, R)
+        e = np.clip(start[is_del] + L[is_del], 0, R)
+        np.add.at(depth, (cell[is_del], s), 1)
+        np.add.at(depth, (cell[is_del], e), -1)
+    del_mask = (np.cumsum(depth, axis=1)[:, :R] > 0).reshape(n, M, R)
+
+    ins_bp = np.zeros((n * M, R), dtype=np.int32)
+    if is_ins.any():
+        a = start[is_ins]
+        ok = (a >= 0) & (a < R)
+        np.add.at(ins_bp, (cell[is_ins][ok], a[ok]), L[is_ins][ok])
+    ins_bp = ins_bp.reshape(n, M, R)
+    ins_bp[del_mask] = 0    # an insertion inside a deletion for the same
+                             # lineage is not present in that haplotype
+    return del_mask, ins_bp
+
+
+def _indel_suppressed_rate(rate, del_mask, ins_bp, suppress, flank):
+    """Recomb-rate map [n, R] with crossover locally suppressed near
+    indels (PLAN.md SS2.6), reusing the EXISTING `--recomb-span` rate-map
+    channel rather than a new breakpoint mechanism -- the result is passed
+    straight into `_build_paths` / `_build_paths_subset` /
+    `_segment_index`'s existing `rate` argument, unchanged otherwise.
+
+    Suppression is driven by the per-site FRACTION OF LINEAGES that are
+    structurally variable, `f[n,R] = mean over M of (del_mask | ins_bp>0)`
+    -- not by the individual's own two homologs, which don't exist yet at
+    this point in the pipeline (that is exactly the circular dependency
+    this design avoids: paths need the rate map; the rate map needs the
+    tracts; the tracts are drawn independent of any individual's path).
+
+    `f` is dilated by `flank` sites via an explicit sliding-window max (a
+    small shift-and-max loop over `flank`, not scipy), then
+    `rate *= clip(1 - suppress*f, floor, 1)`, floored at a small positive
+    value so `_build_paths`'s `log(rate)` never sees exactly zero.
+
+    `rate=None` (uniform recombination, `--recomb-span` 1) is handled by
+    starting from an all-ones map, so suppression works even in the E1
+    layout, not only when `--recomb-span > 1`.
+    """
+    n, M, R = del_mask.shape
+    f = (del_mask | (ins_bp > 0)).astype(np.float64).mean(axis=1)  # [n,R]
+
+    if flank > 0:
+        padded = np.pad(f, ((0, 0), (flank, flank)), mode="edge")  # [n,R+2*flank]
+        dil = padded[:, 0:R]
+        for shift in range(1, 2 * flank + 1):
+            dil = np.maximum(dil, padded[:, shift:shift + R])
+        f = dil
+
+    base = np.ones((n, R)) if rate is None else np.asarray(rate, dtype=np.float64)
+    return base * np.clip(1.0 - suppress * f, 1e-3, 1.0)
+
+
+def _row_counts(rng, pres1, pres2, ins1, ins2, gamete_balance, coverage,
+                 ins_read_per_bp, max_stack):
+    """Reads emitted per (window, reference site) by source (PLAN.md
+    SS2.5). Replaces today's "exactly ONE read per site" convention (this
+    module's own docstring, and the `active = np.where(gamete, h1, h2)`
+    line in `simulate()`) with a real coverage model:
+
+      * colinear reads, per homolog: `Bernoulli(coverage * gamete_weight)
+        AND structurally present`. `gamete_weight` is `gamete_balance` for
+        H1, `1 - gamete_balance` for H2, so `coverage=1` reproduces
+        today's exactly-one-read density on average. A hemizygous site
+        (one homolog deleted) loses half its expected depth AND every
+        read there comes from the surviving homolog -- this IS the
+        "hemizygous-looking read sharing" SS2.7 acceptance criterion,
+        falling directly out of sampling rather than being special-cased.
+      * insertion reads, per homolog: `Binomial(ins_bp, ins_read_per_bp)`
+        capped at `max_stack`. Inserted sequence has no reference span, so
+        all of these project to the SINGLE flanking reference anchor ->
+        real row stacking at one position.
+      * a nullizygous site (both homologs structurally absent) emits ZERO
+        rows from either source.
+
+    Returns `(on1, on2 [n,R] bool, c1, c2 [n,R] int32, cnt [n,R] int32)`
+    where `cnt = on1 + on2 + c1 + c2`.
+    """
+    w1, w2 = gamete_balance, 1.0 - gamete_balance
+    on1 = (rng.random(pres1.shape) < coverage * w1) & pres1
+    on2 = (rng.random(pres2.shape) < coverage * w2) & pres2
+    p = float(np.clip(ins_read_per_bp, 0.0, 1.0))
+    c1 = np.minimum(rng.binomial(ins1, p), max_stack).astype(np.int32)
+    c2 = np.minimum(rng.binomial(ins2, p), max_stack).astype(np.int32)
+    cnt = on1.astype(np.int32) + on2.astype(np.int32) + c1 + c2
+    return on1, on2, c1, c2, cnt
+
+
+def _sample_rows(cnt, T):
+    """Flat row plan over the R-site generation region: which (window,
+    site) each of the first `T` real rows (in reference-site order) comes
+    from, per window -- a plain PREFIX-TAKE, not random thinning. Real
+    ps4g windowing is exactly this operation: a window is "the next T rows
+    in sorted order," not "rows covering a fixed reference-bp span" (this
+    is the corrected design from this session -- see the plan's Context
+    section for why the earlier padded-row-budget approach was dropped).
+
+    `cnt[n,R]` gives the row count at each (window, reference site); rows
+    are enumerated in non-decreasing site order within each window (the
+    natural order of iterating sites 0..R-1), and only the first `T` per
+    window are kept.
+
+    Returns `(w_of, t_of, row_of, o_of [Rows] int64, short [n] bool)`. One
+    entry per emitted row that's kept: `w_of`/`t_of` are its window and
+    source reference site, `row_of` its destination row index `0..T-1`,
+    `o_of` its WITHIN-SITE ordinal (0-based; distinguishes multiple rows
+    stacked at the same site, in emission order -- needed by `_indel_chunk`
+    to tell which underlying read/homolog a stacked row came from). `short`
+    is True for windows whose TOTAL row count over the whole R-site region
+    falls short of `T` -- the rare edge case; `_indel_chunk` pads those,
+    see its docstring.
+    """
+    n, R = cnt.shape
+    cnt64 = cnt.astype(np.int64)
+    total = cnt64.sum(axis=1)
+    short = total < T
+
+    flat_cnt = cnt64.ravel()
+    nz = np.flatnonzero(flat_cnt)
+    if nz.size == 0:
+        empty = np.array([], dtype=np.int64)
+        return empty, empty, empty, empty, short
+
+    w_site = nz // R
+    t_site = nz % R
+    reps = flat_cnt[nz]
+    w_of_all = np.repeat(w_site, reps)
+    t_of_all = np.repeat(t_site, reps)
+
+    order = np.arange(w_of_all.size)
+
+    # Ordinal of each row WITHIN its (window, site) CELL (0-based, in
+    # emission order): the standard "repeat with within-group index" trick
+    # -- cumsum(reps)-reps is each cell's starting absolute-order index,
+    # broadcast back out to its reps rows.
+    cell_starts = np.repeat(np.cumsum(reps) - reps, reps)
+    o_of_all = order - cell_starts
+
+    # Ordinal of each row WITHIN its window (0-based, in emission order --
+    # already non-decreasing site order since `nz` is sorted by flat index
+    # window*R + site). `w_of_all` is sorted ascending by window, so the
+    # first position of each window's block is a plain searchsorted.
+    win_starts = np.searchsorted(w_of_all, np.arange(n))
+    ordinal = order - win_starts[w_of_all]
+
+    keep = ordinal < T
+    return (w_of_all[keep], t_of_all[keep], ordinal[keep], o_of_all[keep],
+            short)
+
+
+def _draw_lineages(rng, n, T, K, A, anc_cx, rate, theta, max_lineages):
+    """(lineage [n,K,T] int32, M int) -- the lineage draw hoisted out of
+    `_coalescent_feats` (body identical to its original inline version,
+    same rng call order) so indel tracts, which are a LINEAGE-level
+    property (PLAN.md SS2.2), can be built BEFORE the founder paths are
+    drawn -- required because the indel tracts feed the suppressed
+    recombination rate map the paths are drawn on (SS2.6), which would
+    otherwise be circular (paths need the rate map; the rate map needs the
+    tracts; the tracts need the lineage assignment paths are drawn from).
+
+    theta is None -> A fixed ancestors, each founder iid-uniform over them
+    (legacy island model). theta set -> Ewens/GEM(theta) partition via
+    `_gem_lineages`. M is the number of lineages actually used (A in the
+    legacy case, max_lineages or K in the Ewens/GEM case).
+    """
+    anc_nc = rng.poisson(anc_cx, n * K).clip(0, T - 1).astype(np.int64)
+    rate_rep = None if rate is None else np.repeat(rate, K, axis=0)
+    if theta is None:
+        M = A
+        lineage = _build_paths(rng, n * K, T, A, anc_nc, rate_rep)
+        lineage = lineage.reshape(n, K, T).astype(np.int32)
+    else:
+        M = max_lineages or K
+        lineage = _gem_lineages(rng, n, K, T, theta, M, anc_nc, rate_rep)
+    return lineage, M
+
+
 def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
                       h1, h2, rate, good, gamete, theta=None, max_lineages=None,
-                      emit_panel=False):
+                      emit_panel=False, lineage=None, lineage_M=None,
+                      per_gamete=False):
     """Mini-haplotype match features [n, T, K] + IBD lineage labels [n, K, T].
 
     Each founder is a piecewise-constant mosaic over ancestral lineages (same
@@ -310,17 +645,27 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
     a full-read match is a strong IBD signal, not a common-allele coincidence
     (different lineages can still coincide → thin homoplasy).  The returned
     `lineage` is the per-site IBD ground truth for the ceiling analysis.
+
+    `lineage`/`lineage_M` (both or neither): if given, skip the internal
+    lineage draw and use this precomputed array instead -- used by
+    --simulate-indels so indel tracts are drawn from the SAME partition
+    (PLAN.md SS2.2). If both are None (default), drawn exactly as before
+    via `_draw_lineages`, byte-identical rng order.
+
+    `per_gamete`: if True, compute and return BOTH gametes' reads
+    `(match1, match2)`, each `[n,T,K]`, instead of one `gamete`-selected
+    read -- the indel read-sampling layer needs both homologs' support
+    independently, since real coverage/stacking is sampled per homolog.
+    `gamete` is unused in this mode. If False (default), behavior is
+    bit-for-bit unchanged from before this addition.
     """
     L = read_snps
-    anc_nc = rng.poisson(anc_cx, n * K).clip(0, T - 1).astype(np.int64)
-    rate_rep = None if rate is None else np.repeat(rate, K, axis=0)
-    if theta is None:
-        M = A
-        lineage = _build_paths(rng, n * K, T, A, anc_nc, rate_rep)
-        lineage = lineage.reshape(n, K, T).astype(np.int32)
+    if lineage is None:
+        lineage, M = _draw_lineages(rng, n, T, K, A, anc_cx, rate, theta, max_lineages)
     else:
-        M = max_lineages or K
-        lineage = _gem_lineages(rng, n, K, T, theta, M, anc_nc, rate_rep)
+        if lineage_M is None:
+            raise ValueError("lineage_M must be given alongside a precomputed lineage array")
+        M = lineage_M
 
     f = rng.beta(sfs_shape, 1.0, size=(n, 1, T, L))     # per-SNP derived freq
     lin_alleles = (rng.random((n, M, T, L)) < f).astype(np.int8)  # [n,M,T,L]
@@ -330,25 +675,123 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
     G = lin_alleles[wi, lineage, ti]                    # [n,K,T,L] mini-haplotypes
     ii = np.arange(n)[:, None]
     tt = np.arange(T)[None, :]
-    # One read per site, sampled from the active gamete (H1 if gamete else H2).
-    active = np.where(gamete, h1, h2)                   # [n,T]
-    Sa = G[ii, active, tt]                              # active mini-hap read [n,T,L]
-    # Bad sites: corrupt the read to a RANDOM founder's mini-haplotype (the read
-    # mis-maps to a wrong founder) rather than an out-of-panel marginal draw. The
-    # latter usually matched no founder's exact L-SNP haplotype, leaving ~40% of
-    # bad sites all-zero; sourcing from a real founder guarantees the read still
-    # matches that founder's lineage group, so bad sites show random (wrong)
-    # matches instead of blanks.
     bad = ~good
-    rand_founder = rng.integers(0, K, size=(n, T))     # [n,T] usually != active
-    Sa = np.where(bad[:, :, None], G[ii, rand_founder, tt], Sa)
-
-    match = (G == Sa[:, None]).all(-1)                  # [n,K,T] exact full-read match
     # E6: founder × SNP allele panel for SNP-level imputation accuracy. G[w,k,t,l]
     # is founder k's allele at read t, SNP l — the genotype implied by decoding the
     # path to founder k. Returned as [n,T,K,L] for per-site indexing (eval only).
     panel = np.transpose(G, (0, 2, 1, 3)).astype(np.int8) if emit_panel else None
+
+    def _match_for(active, rand_founder):
+        # Bad sites: corrupt the read to a RANDOM founder's mini-haplotype (the
+        # read mis-maps to a wrong founder) rather than an out-of-panel marginal
+        # draw. The latter usually matched no founder's exact L-SNP haplotype,
+        # leaving ~40% of bad sites all-zero; sourcing from a real founder
+        # guarantees the read still matches that founder's lineage group, so
+        # bad sites show random (wrong) matches instead of blanks.
+        Sa = G[ii, active, tt]                          # active mini-hap read [n,T,L]
+        Sa = np.where(bad[:, :, None], G[ii, rand_founder, tt], Sa)
+        return (G == Sa[:, None]).all(-1)               # [n,K,T] exact full-read match
+
+    if per_gamete:
+        rf1 = rng.integers(0, K, size=(n, T))           # independent corruption
+        rf2 = rng.integers(0, K, size=(n, T))            # draw per homolog
+        match1 = np.transpose(_match_for(h1, rf1), (0, 2, 1)).astype(np.int8)
+        match2 = np.transpose(_match_for(h2, rf2), (0, 2, 1)).astype(np.int8)
+        return (match1, match2), lineage, panel
+
+    # One read per site, sampled from the active gamete (H1 if gamete else H2).
+    active = np.where(gamete, h1, h2)                   # [n,T]
+    rand_founder = rng.integers(0, K, size=(n, T))      # [n,T] usually != active
+    match = _match_for(active, rand_founder)
     return np.transpose(match, (0, 2, 1)).astype(np.int8), lineage, panel
+
+
+def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
+                  match1, match2, gamete_balance, coverage, ins_read_per_bp,
+                  max_stack, anchor_thresh, ref_founder, dist_scale):
+    """Assemble one chunk's indel-mode output:
+    `(tern, dist [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T] int32,
+    short [n] bool)`.
+
+    `h1`/`h2`/`lineage`/`del_lin`/`ins_lin`/`match1`/`match2` are all
+    indexed over the R-site GENERATION region; the output arrays are
+    indexed over the T-row OUTPUT -- a plain prefix of the R-site region's
+    real rows, in reference order (PLAN.md's row-assembly note; see
+    `_sample_rows`).
+
+    Ternary derivation mirrors `rb3_lift_ternary_state` exactly: `tern=1`
+    if this row's read matched founder k (from `match1`/`match2`,
+    unchanged SNP-identity logic); elif founder k's nearest-anchor
+    distance exceeds `anchor_thresh` -> `tern=-1` (deletion); else `0`
+    (diverged -- structurally present, no read here). Distance is
+    reference-site-resolved: it does NOT depend on which row/read is
+    being assembled at a stacked site, only on the reference site.
+
+    Insertion-stacked rows (no SNP-identity read exists for them -- they
+    represent a read sampled from the inserted sequence itself) match
+    exactly the founders sharing the emitting lineage: a pure IBD signal
+    this round, documented simplification (PLAN.md's adopted-conventions
+    note; no additional SNP-level homoplasy noise modeled here).
+
+    Rare edge case: a window whose R-site region produces fewer than `T`
+    real rows is padded with the module's sentinel constants
+    (`TERN_PAD`/`DIST_PAD`/`LABEL_PAD`) -- flagged via the returned
+    `short` array for the caller's QC reporting, not silently absorbed.
+    """
+    dist_lin = _anchor_distance(del_lin)                     # [n,M,R]
+    dist_kt = _gather_by_lineage(dist_lin, lineage)           # [n,K,R]
+    if ref_founder >= 0:
+        dist_kt = dist_kt.copy()
+        dist_kt[:, ref_founder, :] = 0    # reference has no anchors vs itself
+
+    ii = np.arange(n)[:, None]
+    tt = np.arange(R)[None, :]
+    m1 = lineage[ii, h1, tt]              # [n,R] active lineage, H1
+    m2 = lineage[ii, h2, tt]
+    pres1 = dist_kt[ii, h1, tt] <= anchor_thresh
+    pres2 = dist_kt[ii, h2, tt] <= anchor_thresh
+    ins1 = ins_lin[ii, m1, tt]
+    ins2 = ins_lin[ii, m2, tt]
+
+    on1, on2, c1, c2, cnt = _row_counts(rng, pres1, pres2, ins1, ins2,
+                                         gamete_balance, coverage,
+                                         ins_read_per_bp, max_stack)
+    w, t, r, o, short = _sample_rows(cnt, T)
+
+    tern_out = np.full((n, T, K), TERN_PAD, dtype=np.int8)
+    dist_out = np.full((n, T, K), DIST_PAD, dtype=np.int8)
+    lab1_out = np.full((n, T), LABEL_PAD, dtype=np.int8)
+    lab2_out = np.full((n, T), LABEL_PAD, dtype=np.int8)
+    refpos_out = np.full((n, T), -1, dtype=np.int32)
+
+    if w.size:
+        b1 = on1[w, t].astype(np.int64)
+        b2 = b1 + on2[w, t].astype(np.int64)
+        b3 = b2 + c1[w, t].astype(np.int64)
+        kind = np.where(o < b1, 0, np.where(o < b2, 1, np.where(o < b3, 2, 3)))
+
+        tern_rows = np.zeros((w.size, K), dtype=np.int8)
+        for k_id, mt in ((0, match1), (1, match2)):
+            sel = kind == k_id
+            if sel.any():
+                tern_rows[sel] = mt[w[sel], t[sel]]
+        for k_id, ml in ((2, m1), (3, m2)):
+            sel = kind == k_id
+            if sel.any():
+                tern_rows[sel] = (lineage[w[sel], :, t[sel]] ==
+                                   ml[w[sel], t[sel]][:, None]).astype(np.int8)
+
+        dist_row = dist_kt[w, :, t]                           # [Rows,K]
+        deleted = dist_row > anchor_thresh
+        tern_rows = np.where(deleted, TERN_DEL, tern_rows).astype(np.int8)
+
+        tern_out[w, r] = tern_rows
+        dist_out[w, r] = _encode_dist(dist_row, dist_scale)
+        lab1_out[w, r] = h1[w, t].astype(np.int8)
+        lab2_out[w, r] = h2[w, t].astype(np.int8)
+        refpos_out[w, r] = t
+
+    return tern_out, dist_out, lab1_out, lab2_out, refpos_out, short
 
 
 def simulate(rng, windows, sites, founders, min_cross, max_cross,
@@ -359,10 +802,51 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              windows_per_individual=0, min_founders=2, max_founders=24,
              emit_snp_panel=False, inbreeding_per_window=None,
              breeding_classes=None, class_inbred_frac=0.5,
-             constant_pair_frac=0.0, constant_inbred_frac=0.5, chunk=1000):
+             constant_pair_frac=0.0, constant_inbred_frac=0.5, chunk=1000,
+             simulate_indels=False, indel_density=2.65e-3, indel_ins_frac=0.5,
+             indel_large_frac=0.027, indel_small_alpha=1.7, indel_small_max=50,
+             indel_large_logmean=8.6, indel_large_logsd=1.6,
+             indel_max_len=65536, indel_coverage=2.0,
+             indel_ins_read_per_bp=2e-3, indel_max_stack=64,
+             indel_region_mult=4, indel_recomb_suppress=0.9,
+             indel_recomb_flank=32, indel_anchor_thresh=0,
+             indel_ref_founder=-1):
+    """... (see module docstring / experiments/simulator-indels/PLAN.md
+    for the full --simulate-indels design). All `simulate_indels=False`
+    (default) behavior, including rng draw order, is byte-for-byte
+    unchanged from before this parameter existed -- every new rng call
+    this feature adds sits inside an `if simulate_indels:` branch.
+
+    simulate_indels: emit the indel-aware ternary+distance layout
+    (2K+2 columns: [ternary(K) | H1 | H2 | distance(K)]) instead of the
+    binary K+2 (or K+3 with the eval-only recomb-rate column) layout.
+    Windows still have exactly `sites` OUTPUT rows (PLAN.md's row-
+    assembly note: a window is "the next T real rows in reference
+    order," not "rows covering a fixed reference-bp span" -- no padding
+    in the routine case); generation itself runs over a larger
+    `indel_region_mult * sites`-site region internally, purely as a
+    buffer to produce enough real rows. Requires `sharing_model=
+    'coalescent'` (indel content is drawn through the lineage array,
+    which only exists there). `emit_snp_panel` and the eval-only
+    recomb-rate column are dropped in this mode (both are reference-
+    site-indexed at `sites` granularity; the row axis no longer aligns
+    1:1 with reference sites) -- use the `.refpos.npy`-equivalent
+    return value (`refpos_out`) to join rows back to reference
+    coordinates instead.
+    """
     K = founders
     T = sites
     coalescent = sharing_model == "coalescent"
+    if simulate_indels and not coalescent:
+        raise ValueError(
+            "simulate_indels=True requires sharing_model='coalescent' "
+            "(indel content is drawn through the lineage array, which "
+            "only exists in coalescent mode)")
+    if simulate_indels and emit_snp_panel:
+        raise ValueError(
+            "emit_snp_panel is not supported with simulate_indels (the "
+            "panel is reference-site indexed; this mode's row axis is "
+            "not)")
     if not coalescent:
         q = (allele_sharing * K - 1.0) / (K - 1)   # match rate for non-true founders
         if q < 0:
@@ -386,19 +870,123 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             rng, windows, windows_per_individual, K, min_founders, max_founders)
     ind_out = ind if (grouped or breeding) else None
 
-    track = recomb_span > 1.0                       # emit hidden true-rate column
-    ncol = K + 2 + (1 if track else 0)
-    out = np.empty((windows, T, ncol), dtype=np.int8)
-    ibd = np.empty((windows, T, K), dtype=np.int8) if coalescent else None
-    panel_on = emit_snp_panel and coalescent
-    panel = np.empty((windows, T, K, read_snps), dtype=np.int8) if panel_on else None
+    refpos_out = short_out = None
+    if simulate_indels:
+        R = indel_region_mult * T
+        ncol = 2 * K + 2
+        out = np.empty((windows, T, ncol), dtype=np.int8)
+        # Unlike the base case, ibd is R-site indexed here (the same
+        # generation-region axis as the indel tracts), not T-site indexed
+        # -- it is genuinely more informative to keep the full region's
+        # lineage ground truth than to force it onto the row axis.
+        ibd = np.empty((windows, R, K), dtype=np.int8)
+        panel = None
+        track = False
+        refpos_out = np.empty((windows, T), dtype=np.int32)
+        short_out = np.empty(windows, dtype=bool)
+        # Tract arrays scale as n*M*R; keep the per-chunk memory bounded
+        # (~4M site-slots/chunk) the same way regardless of how large R is.
+        chunk = min(chunk, max(16, int(2 ** 22 // max(1, R))))
+    else:
+        track = recomb_span > 1.0                       # emit hidden true-rate column
+        ncol = K + 2 + (1 if track else 0)
+        out = np.empty((windows, T, ncol), dtype=np.int8)
+        ibd = np.empty((windows, T, K), dtype=np.int8) if coalescent else None
+        panel_on = emit_snp_panel and coalescent
+        panel = np.empty((windows, T, K, read_snps), dtype=np.int8) if panel_on else None
 
     for start in range(0, windows, chunk):
         n = min(chunk, windows - start)
+        sl = slice(start, start + n)
+
+        if simulate_indels:
+            # ---- indel-mode chunk body: everything below runs over the
+            # R-site generation region, then _indel_chunk collapses it to
+            # the T-row output. Tracts/lineages must be drawn BEFORE paths
+            # (they feed the suppressed rate map paths are drawn on) --
+            # the one real reordering relative to the base case below.
+            rmap_R = (_rate_map(rng, n, R, recomb_span, recomb_tile)
+                      if recomb_span > 1.0 else None)
+            max_lin = (None if sharing_theta is None
+                       else min(64, max(K, int(round(4 * sharing_theta)))))
+            lineage, M = _draw_lineages(rng, n, R, K, ancestors,
+                                         ancestor_crossovers, rmap_R,
+                                         sharing_theta, max_lin)
+            del_lin, ins_lin = _indel_tracts(
+                rng, n, M, R, indel_density, indel_ins_frac,
+                indel_large_frac, indel_small_alpha, indel_small_max,
+                indel_large_logmean, indel_large_logsd, indel_max_len)
+            rmap_path = _indel_suppressed_rate(
+                rmap_R, del_lin, ins_lin, indel_recomb_suppress,
+                indel_recomb_flank)
+
+            n_cross = rng.integers(min_cross, max_cross + 1, n)
+            if is_const is not None:
+                n_cross = np.where(is_const[sl], 0, n_cross)
+            if grouped or breeding:
+                h1 = _build_paths_subset(rng, sub[sl], win_k[sl], R, n_cross, rmap_path)
+            else:
+                h1 = _build_paths(rng, n, R, K, n_cross, rmap_path)
+
+            if breeding:
+                het_t = het_tw[sl]
+                k_w = np.maximum(win_k[sl], 2)
+                p_ind = np.clip(het_t / (1.0 - 1.0 / k_w), 0.0, 1.0)
+                nc2 = rng.integers(min_cross, max_cross + 1, n)
+                if is_const is not None:
+                    nc2 = np.where(is_const[sl], 0, nc2)
+                h2_ind = _build_paths_subset(rng, sub[sl], win_k[sl], R, nc2, rmap_path)
+                n_share = rng.integers(min_cross, max_cross + 1, n)
+                seg = _segment_index(rng, n, R, n_share, rmap_path)
+                max_seg = int(seg.max()) + 1
+                seg_indep = rng.random((n, max_seg)) < p_ind[:, None]
+                independent = np.take_along_axis(seg_indep, seg, axis=1)
+                h2 = np.where(independent, h2_ind, h1)
+                if is_const is not None:
+                    m = is_const[sl]
+                    if m.any():
+                        h1[m] = const_h1[sl][m][:, None]
+                        h2[m] = const_h2[sl][m][:, None]
+            else:
+                F = inbreeding if inbreeding_per_window is None else inbreeding_per_window[sl]
+                inbred = rng.random(n) < F
+                h2 = h1.copy()
+                outbred = np.flatnonzero(~inbred)
+                if outbred.size:
+                    nc2 = rng.integers(min_cross, max_cross + 1, outbred.size)
+                    r2 = None if rmap_path is None else rmap_path[outbred]
+                    if grouped:
+                        h2[outbred] = _build_paths_subset(
+                            rng, sub[sl][outbred], win_k[sl][outbred], R, nc2, r2)
+                    else:
+                        h2[outbred] = _build_paths(rng, outbred.size, R, K, nc2, r2)
+
+            good = _good_mask(rng, n, R, bad_frac, error_block)
+            (match1, match2), lineage, _ = _coalescent_feats(
+                rng, n, R, K, ancestors, ancestor_crossovers, derived_sfs,
+                read_snps, h1, h2, None, good, gamete=None,
+                theta=sharing_theta, max_lineages=max_lin,
+                lineage=lineage, lineage_M=M, per_gamete=True)
+
+            tern, dist, lab1, lab2, refpos, short = _indel_chunk(
+                rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
+                match1, match2, gamete_balance, indel_coverage,
+                indel_ins_read_per_bp, indel_max_stack, indel_anchor_thresh,
+                indel_ref_founder, DIST_LOG_SCALE)
+
+            out[sl, :, :K] = tern
+            out[sl, :, K] = lab1
+            out[sl, :, K + 1] = lab2
+            out[sl, :, K + 2:] = dist
+            ibd[sl] = np.transpose(lineage, (0, 2, 1)).astype(np.int8)
+            refpos_out[sl] = refpos
+            short_out[sl] = short
+            continue
+
+        # ---- non-indel chunk body: UNCHANGED from before this feature ----
         rmap = _rate_map(rng, n, T, recomb_span, recomb_tile) if track else None
 
         n_cross = rng.integers(min_cross, max_cross + 1, n)
-        sl = slice(start, start + n)
         if is_const is not None:
             # Tier2: constant individuals get 0 explicit crossovers here --
             # also what avoids a real crash, since _build_paths would raise
@@ -492,7 +1080,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             out[start:start + n, :, K + 2] = np.clip(
                 np.rint(rmap), 1, 127).astype(np.int8)
 
-    return out, ibd, ind_out, panel, het_tw, cls_w
+    return out, ibd, ind_out, panel, het_tw, cls_w, refpos_out, short_out
 
 
 def parse_args():
@@ -587,8 +1175,234 @@ def parse_args():
                    help="crf-relatedness Tier2: of the --constant-pair-frac individuals, "
                         "fraction that are single-founder homozygous (k=1, het=0) "
                         "rather than a constant two-founder pair (k=2, het=1).")
+
+    # --simulate-indels: experiments/simulator-indels/PLAN.md SS2. Realistic
+    # indels + the ternary/distance two-matrix layout. Default off = today's
+    # exact output, byte for byte (pinned by tests/python/crf/test_simulate_alleles.py's
+    # golden-hash regression test).
+    p.add_argument("--simulate-indels", action="store_true",
+                   help="Emit the indel-aware two-matrix layout "
+                        "[ternary(K) | H1 | H2 | distance(K)] = 2K+2 columns, instead "
+                        "of today's binary K+2 (or K+3 with --recomb-span) layout. "
+                        "Requires --sharing-model coalescent (indels are a lineage "
+                        "property, SS2.2). Off = today's exact output, byte for byte. "
+                        "--sites stays small-window-friendly by default; indel "
+                        "structure (mean event ~530bp, bp-dominant class 4-64kb) needs "
+                        "a much larger --sites (8192+) to be meaningfully represented "
+                        "in a single window.")
+    p.add_argument("--indel-density", type=float, default=2.65e-3,
+                   help="Indel events per reference bp per lineage (ins+del combined). "
+                        "Calibrated against real maize founder gVCFs to hit the "
+                        "measured ~39%% indel-affected-reference-bp target -- see "
+                        "experiments/simulator-indels/results/indel_biology_notes.md. "
+                        "Re-tune if --indel-ins-frac or the length-mixture params change.")
+    p.add_argument("--indel-ins-frac", type=float, default=0.5,
+                   help="Fraction of indel events that are insertions relative to "
+                        "reference; 0.5 reproduces the measured ~0.99:1 ins:del symmetry.")
+    p.add_argument("--indel-large-frac", type=float, default=0.027,
+                   help="Weight of the LARGE (LTR-retrotransposon) length-mixture "
+                        "component. Measured: ~2.7%% of events but ~94.8%% of indel bp "
+                        "-- calibrate against the bp-weighted table, never the raw "
+                        "event histogram (indel_biology_notes.md explains why).")
+    p.add_argument("--indel-small-alpha", type=float, default=1.7,
+                   help="Small (replication-slippage) component: discrete power-law "
+                        "exponent, P(L) ~ L^-alpha on [1,--indel-small-max]. 1.7 puts "
+                        "~40-50%% of small events at exactly 1bp, matching the measured "
+                        "41.5%%.")
+    p.add_argument("--indel-small-max", type=int, default=50,
+                   help="Max length (bp) of the small/slippage mixture component.")
+    p.add_argument("--indel-large-logmean", type=float, default=8.6,
+                   help="Large component: mean of log(length in bp). 8.6 => median "
+                        "~5.4kb, spanning the measured 4-64kb bp-dominant classes.")
+    p.add_argument("--indel-large-logsd", type=float, default=1.6,
+                   help="Large component: sd of log(length in bp).")
+    p.add_argument("--indel-max-len", type=int, default=65536,
+                   help="Hard clip on event length (bp); also the left-overhang span "
+                        "on which tract start positions are drawn, so a long tract "
+                        "overlapping the generation region from outside is still "
+                        "represented rather than undercounted at the region's edge.")
+    p.add_argument("--indel-coverage", type=float, default=2.0,
+                   help="Expected colinear reads per reference bp when BOTH homologs "
+                        "are present. 1.0 reproduces today's exactly-one-read-per-site "
+                        "density; higher is needed to approach the measured ~70-75%% "
+                        "either-true-founder-covered acceptance target (PLAN.md SS2.7).")
+    p.add_argument("--indel-ins-read-per-bp", type=float, default=2e-3,
+                   help="Reads sampled per bp of INSERTED founder sequence; all of "
+                        "them project to the single reference site immediately before "
+                        "the insertion (real row stacking, not a count value -- PLAN.md "
+                        "SS2.3/SS2.5). 2e-3 ~= one read per 500bp of inserted sequence.")
+    p.add_argument("--indel-max-stack", type=int, default=64,
+                   help="Cap on insertion-derived rows per homolog per reference site.")
+    p.add_argument("--indel-region-mult", type=int, default=4,
+                   help="Generation-side buffer only, NOT an output-shape parameter: "
+                        "indel/path/coverage structure is drawn over "
+                        "(mult * --sites) reference sites, then the first --sites REAL "
+                        "rows (in reference order) become the output -- a plain "
+                        "prefix-take, not padding to a budget. A window whose region "
+                        "genuinely can't produce --sites rows is the rare-edge-case "
+                        "fallback (padded, counted in the printed QC line) -- raise "
+                        "this or --indel-coverage if that rate is not ~0%%.")
+    p.add_argument("--indel-recomb-suppress", type=float, default=0.9,
+                   help="Fractional reduction of the local recombination rate at "
+                        "indel-variable sites (0=off, 0.9=10x colder), reusing the "
+                        "existing --recomb-span rate-map channel. Soft suppression "
+                        "only this round -- crossovers are NOT hard-forbidden from "
+                        "landing inside an indel tract (PLAN.md SS2.6).")
+    p.add_argument("--indel-recomb-flank", type=int, default=32,
+                   help="Sites of dilation applied to the recombination-suppression "
+                        "footprint around each indel-variable region.")
+    p.add_argument("--indel-anchor-thresh", type=int, default=0,
+                   help="Nearest-anchor distance (bp) at or below which a founder "
+                        "with no read still scores 0 (diverged) rather than -1 "
+                        "(deletion) -- the `thresh` argument of the real "
+                        "rb3_lift_ternary_state. 0 = any site inside a deletion tract "
+                        "is -1.")
+    p.add_argument("--indel-ref-founder", type=int, default=-1,
+                   help="Founder index treated as the reference (e.g. B73): never "
+                        "given deletions, distance pinned to 0. -1 = no reference "
+                        "founder in this panel (all K founders carry indels).")
+
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
+
+
+def _print_indel_summary(args, data, refpos, short, out_path, refpos_path):
+    """--simulate-indels verification summary: the real empirical
+    validation of PLAN.md SS2.7's acceptance criteria, not just "the code
+    ran". All stats are computed per UNIQUE (window, reference site) --
+    deduplicated across any stacked rows sharing a site -- via a single
+    combined-key trick, not a per-window Python loop, so this stays fast
+    even at large --windows.
+    """
+    K = args.founders
+    tern = data[:, :, :K]
+    lab1 = data[:, :, K].astype(np.int64)
+    lab2 = data[:, :, K + 1].astype(np.int64)
+    dist_code = data[:, :, K + 2:]
+
+    print(f"\nWrote {out_path}")
+    print(f"  shape={data.shape}  dtype={data.dtype}  "
+          f"size={data.nbytes / 1e9:.2f} GB  (2K+2 ternary+distance layout)")
+    print(f"  windows needing padding: {short.mean()*100:.2f}%  "
+          f"(should be ~0% at sane --indel-coverage/--indel-density; if not, "
+          f"raise --indel-region-mult or --indel-coverage)")
+
+    valid = lab1 != LABEL_PAD
+    if not valid.any():
+        print("  WARNING: every row was padding -- no real output to summarize.")
+        return
+
+    w_idx = np.repeat(np.arange(data.shape[0])[:, None], data.shape[1], axis=1)
+    # combined (window, reference-site) key; refpos is bounded by the
+    # generation region size, always well under 1e6 at any sane --sites.
+    key = w_idx[valid].astype(np.int64) * 1_000_000 + refpos[valid].astype(np.int64)
+    uniq_keys, first_idx, inv, counts = np.unique(
+        key, return_index=True, return_inverse=True, return_counts=True)
+
+    flat_tern = tern[valid]                             # [n_valid_rows, K]
+    flat_lab1, flat_lab2 = lab1[valid], lab2[valid]
+
+    # Deletion state is a pure function of (window, site, founder) -- ANY
+    # row at a shared site carries the same deletion truth -- so a plain
+    # first-occurrence dedup is exact, not an approximation.
+    site_tern = flat_tern[first_idx]
+    indel_affected = float((site_tern == TERN_DEL).mean())
+    print(f"  indel-affected ref bp: {indel_affected*100:.2f}%  "
+          f"(measured maize target ~39.3%, cassava ~32.7% -- "
+          f"experiments/simulator-indels/results/indel_biology_notes.md)")
+
+    # "Either true founder covered": per UNIQUE site, was ANY row there
+    # (stacked or not) a real match (ternary==1) to h1's or h2's founder --
+    # a max-reduction over the rows sharing that site, via np.maximum.at.
+    row_ids = np.arange(flat_lab1.size)
+    m1v = flat_tern[row_ids, flat_lab1] == TERN_MATCH
+    m2v = flat_tern[row_ids, flat_lab2] == TERN_MATCH
+    covered_row = (m1v | m2v).astype(np.int8)
+    site_covered = np.zeros(uniq_keys.size, dtype=np.int8)
+    np.maximum.at(site_covered, inv, covered_row)
+    either_covered = float(site_covered.mean())
+    print(f"  either-founder covered: {either_covered*100:.2f}%  "
+          f"(measured target ~70-75% for outbred individuals -- today's "
+          f"non-indel simulator gives ~96%; PLAN.md SS2.7)")
+
+    # Hemizygous/nullizygous, AMONG COVERED (>=1 row) SITES ONLY -- per
+    # unique site, is h1's founder deleted, h2's founder deleted, both, or
+    # neither (using the SAME dedup key, since deletion truth doesn't
+    # depend on which row is sampled). Two real caveats, not bugs:
+    #  (1) at --inbreeding=1.0 (the CLI default) h1==h2 always, so del1
+    #      and del2 are the SAME founder's deletion state at every site
+    #      -> hemi is 0 by construction, not a measurement of anything.
+    #      Pass --inbreeding < 1 for a real hemizygous read.
+    #  (2) a genuinely NULLIZYGOUS site (both true homologs absent) emits
+    #      ZERO rows by construction (no colinear read is possible from
+    #      an absent homolog) -- it can never appear in `refpos`/`valid`,
+    #      so this dedup-over-emitted-rows count structurally CANNOT see
+    #      it and will read ~0% regardless of the true rate. The nearest
+    #      proxy for true genome-wide absence is the coverage-rate line
+    #      below (fraction of the R-site generation region that produced
+    #      any output at all).
+    lab1_site, lab2_site = flat_lab1[first_idx], flat_lab2[first_idx]
+    del1 = site_tern[np.arange(site_tern.shape[0]), lab1_site] == TERN_DEL
+    del2 = site_tern[np.arange(site_tern.shape[0]), lab2_site] == TERN_DEL
+    hemi = (del1 ^ del2).mean()
+    null = (del1 & del2).mean()
+    print(f"  hemizygous / nullizygous ref sites (among COVERED sites only): "
+          f"{hemi*100:.2f}% / {null*100:.2f}%  (one vs. both true homologs "
+          f"structurally absent; hemi is exactly 0 whenever --inbreeding=1.0 "
+          f"since h1==h2 then by construction; null is structurally "
+          f"invisible here -- a nullizygous site emits zero rows so it "
+          f"never enters this dedup -- see coverage-rate line below instead)")
+
+    R = args.sites * args.indel_region_mult
+    coverage_rate = float(uniq_keys.size / (data.shape[0] * R))
+    print(f"  genome-wide site coverage: {coverage_rate*100:.2f}% of the "
+          f"{data.shape[0]}x{R}-site generation region produced >=1 output "
+          f"row (the rest is either truly uncovered -- including "
+          f"nullizygous sites -- or beyond the first-{data.shape[1]}-rows "
+          f"prefix-take)")
+
+    # Coverage dispersion (index of dispersion, var/mean) over sites that
+    # received >=1 row; Poisson/uniform sampling gives ~1, real blotchy
+    # coverage should be markedly higher -- no numeric precedent yet, this
+    # run establishes a first real baseline (PLAN.md SS2.7). Printed with
+    # extra precision -- this is often a small-but-nonzero number, not
+    # literally 0, and `.2f` was rounding it away to a misleading "0.00".
+    disp = float(counts.var() / counts.mean()) if counts.mean() > 0 else float("nan")
+    print(f"  coverage dispersion (var/mean rows-per-site): {disp:.4f}  "
+          f"(Poisson~=1; want >>1 -- qualitative target, no numeric precedent yet)")
+    print(f"  insertion stacking: max {int(counts.max())} rows at one site, "
+          f"mean {counts[counts > 1].mean() if (counts > 1).any() else 0:.2f} "
+          f"among stacked sites ({(counts > 1).mean()*100:.2f}% of covered sites)")
+
+    # Mean gap (in skipped reference sites) between consecutive covered
+    # sites within a window -- a cheap proxy for zero-coverage run length.
+    refpos_valid = refpos[valid]
+    w_flat = w_idx[valid]
+    order = np.lexsort((refpos_valid, w_flat))
+    rp_sorted, w_sorted = refpos_valid[order], w_flat[order]
+    same_window = w_sorted[1:] == w_sorted[:-1]
+    gaps = (rp_sorted[1:] - rp_sorted[:-1] - 1)[same_window]
+    gaps = gaps[gaps >= 0]
+    if gaps.size:
+        print(f"  zero-coverage gap (sites) between covered positions: "
+              f"mean {gaps.mean():.2f}  p95 {np.percentile(gaps, 95):.1f}")
+
+    tern_vals, tern_counts = np.unique(flat_tern, return_counts=True)
+    tot = flat_tern.size
+    hist = {int(v): c / tot for v, c in zip(tern_vals, tern_counts)}
+    print(f"  ternary histogram (all real rows): "
+          f"deletion(-1)={hist.get(TERN_DEL, 0)*100:.2f}%  "
+          f"diverged(0)={hist.get(TERN_DIV, 0)*100:.2f}%  "
+          f"match(1)={hist.get(TERN_MATCH, 0)*100:.2f}%")
+
+    dist_valid = dist_code[valid]
+    real_dist = dist_valid[dist_valid != DIST_PAD]
+    if real_dist.size:
+        print(f"  distance code (all real rows): mean {real_dist.mean():.2f}  "
+              f"p99 {np.percentile(real_dist, 99):.1f}  "
+              f"saturated(={DIST_SAT-1}) frac {(real_dist == DIST_SAT-1).mean()*100:.2f}%")
+    if refpos_path is not None:
+        print(f"  reference positions → {refpos_path}  shape={refpos.shape}")
 
 
 def main():
@@ -626,7 +1440,28 @@ def main():
     if args.constant_pair_frac > 0 and not args.breeding_pop:
         raise SystemExit("--constant-pair-frac requires --breeding-pop")
 
-    data, ibd, ind, panel, het_tgt, cls = simulate(
+    if args.simulate_indels:
+        if args.sharing_model != "coalescent":
+            raise SystemExit(
+                "--simulate-indels requires --sharing-model coalescent "
+                "(indel content is drawn through the lineage array, which "
+                "only exists in coalescent mode)")
+        if args.sharing_theta is None:
+            print("  WARNING: --simulate-indels without --sharing-theta falls back "
+                  f"to the legacy island model, so only --ancestors={args.ancestors} "
+                  "distinct indel haplotypes exist panel-wide; --sharing-theta is "
+                  "strongly recommended.")
+        if args.emit_snp_panel:
+            raise SystemExit(
+                "--emit-snp-panel is not supported with --simulate-indels (the "
+                "panel is reference-site indexed; this mode's row axis is not)")
+        if args.sites < 4096:
+            print(f"  WARNING: --simulate-indels with --sites={args.sites} is small "
+                  "relative to real indel structure (mean event ~530bp, bp-dominant "
+                  "class 4-64kb) -- consider --sites 8192 or larger so a window can "
+                  "represent more than one indel-affected region.")
+
+    data, ibd, ind, panel, het_tgt, cls, refpos, short = simulate(
         rng, args.windows, args.sites, args.founders,
         args.min_crossovers, args.max_crossovers,
         args.inbreeding, args.allele_sharing, args.bad_frac,
@@ -639,7 +1474,22 @@ def main():
         breeding_classes=breeding_classes,
         class_inbred_frac=args.class_inbred_frac,
         constant_pair_frac=args.constant_pair_frac,
-        constant_inbred_frac=args.constant_inbred_frac)
+        constant_inbred_frac=args.constant_inbred_frac,
+        simulate_indels=args.simulate_indels,
+        indel_density=args.indel_density, indel_ins_frac=args.indel_ins_frac,
+        indel_large_frac=args.indel_large_frac,
+        indel_small_alpha=args.indel_small_alpha,
+        indel_small_max=args.indel_small_max,
+        indel_large_logmean=args.indel_large_logmean,
+        indel_large_logsd=args.indel_large_logsd,
+        indel_max_len=args.indel_max_len, indel_coverage=args.indel_coverage,
+        indel_ins_read_per_bp=args.indel_ins_read_per_bp,
+        indel_max_stack=args.indel_max_stack,
+        indel_region_mult=args.indel_region_mult,
+        indel_recomb_suppress=args.indel_recomb_suppress,
+        indel_recomb_flank=args.indel_recomb_flank,
+        indel_anchor_thresh=args.indel_anchor_thresh,
+        indel_ref_founder=args.indel_ref_founder)
 
     # E11: per-window het target plays the role of F (.finb) for eval-by-F tooling.
     if het_tgt is not None and finb is None:
@@ -658,6 +1508,10 @@ def main():
     if panel is not None:
         panel_path = out_dir / (Path(args.out).stem + ".panel.npy")
         np.save(panel_path, panel)
+    refpos_path = None
+    if refpos is not None:
+        refpos_path = out_dir / (Path(args.out).stem + ".refpos.npy")
+        np.save(refpos_path, refpos)
     if finb is not None:
         finb_path = out_dir / (Path(args.out).stem + ".finb.npy")
         np.save(finb_path, finb)
@@ -679,6 +1533,10 @@ def main():
         print(f"  class id (.cls)     → {cls_path}  "
               f"mix k2/k8/outbred/constant = "
               f"{frac[0]*100:.0f}/{frac[1]*100:.0f}/{frac[2]*100:.0f}/{frac[3]*100:.0f}%")
+
+    if args.simulate_indels:
+        _print_indel_summary(args, data, refpos, short, out_path, refpos_path)
+        return
 
     # Verification summary
     K = args.founders

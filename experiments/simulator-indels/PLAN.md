@@ -130,6 +130,40 @@ read-sampling function exists today), SNP match features, write
 side; a red "not present today" panel occupies the same canvas space
 the planned diagram's stages 6–8 fill.
 
+### 2026-09-11 — Phase 1 implemented; acceptance criteria not yet fully met
+
+`simulate_alleles.py` now has the full indel model behind
+`--simulate-indels`: tract generation, offset/distance tracking,
+read-sampling/coverage, soft recombination suppression, the new
+`2K+2` output layout, and 16 new CLI flags — see
+`results/phase1_validation_2026-09-11.md` for the full report.
+Output shape design was corrected mid-implementation from an earlier
+padded-row-budget plan to a plain prefix-take over a larger internal
+generation region (`R = indel_region_mult * T`), matching how real
+`ropebwt_npy_to_matrix.py` windowing already works — no output-shape
+widening, no routine-path padding. 49 new unit tests
+(`tests/python/crf/test_simulate_alleles.py`), all passing; a
+golden-hash regression test proves the flag-off path is byte-identical
+to pre-change output.
+
+Real validation run (K=24, 8192 sites, 60 windows): indel-affected
+fraction 30–36% (target ~33–39%, partially met); size-distribution
+shape (event/bp inversion, ins:del symmetry) matches real biology
+well. **Not met**: either-founder-covered lands at ~97.5–97.7% vs. the
+§2.7 target of 70–75% (essentially unchanged from today's non-indel
+simulator's ~96%) — the single sharpest acceptance test, and it fails.
+Coverage dispersion is 0.13–0.22, markedly *under*-dispersed rather
+than the target ≫1. Windows-needing-padding is 1.7–3.3%, not the
+~0% expected at sane settings. All reported plainly per this plan's own
+instruction not to silently re-tune to hit the numbers — see the
+results doc's "Against §2.7's acceptance criteria" section for root-
+cause analysis and the specific levers (`--indel-coverage`,
+`--indel-ins-read-per-bp`, deletion-correlation between IBD-adjacent
+founders) a future calibration round should target.
+
+**Status: Phase 1 code complete and tested; not yet "done" by §2.7's
+own bar.** §5 item 1 updated accordingly below.
+
 ---
 
 ## 1. Why this work exists
@@ -472,15 +506,25 @@ layer actually built, not just biological calibration input.
   to the existing rate-track's `np.clip(np.rint(...), 1, 127)`
   precedent at `simulate_alleles.py:492–493`.
 
-## 5. Future work (not started — each phase needs its own review/approval)
+## 5. Future work (items 2–4 not started — each phase needs its own review/approval)
 
-1. **Simulator core.** Add the indel-tract generator (§2.1, §2.2, §2.4),
-   the offset-tracking mechanism, the read-sampling/coverage layer
-   (§2.5), and breakpoint-snapping (§2.6) to `simulate_alleles.py`; emit
-   the new `2K+2` layout (§2.3) behind a new CLI flag (e.g.
-   `--simulate-indels`) so existing behavior is preserved when the flag
-   is off. Done when it meets the acceptance criteria in §2.7, not just
-   when it runs.
+1. **Simulator core — code complete, acceptance criteria not yet met
+   (2026-09-11).** Indel-tract generator (§2.1, §2.2, §2.4),
+   offset/distance tracking, read-sampling/coverage layer (§2.5), and
+   soft recombination suppression near tracts (§2.6, not hard
+   breakpoint-snapping — see §2.6/§6) implemented in
+   `simulate_alleles.py` behind `--simulate-indels`, with the new
+   `2K+2` layout (§2.3) and existing (flag-off) behavior preserved
+   byte-identically (golden-hash regression test). 49 unit tests pass.
+   **Not yet done by this section's own bar**: a real validation run
+   does not meet the either-founder-covered (~97% vs. 70–75% target) or
+   coverage-dispersion (0.13–0.22 vs. ≫1 target) acceptance criteria —
+   see the dated §0 entry and `results/phase1_validation_2026-09-11.md`
+   for the full numbers and root-cause analysis. Next step for this
+   item, if picked back up: a calibration round targeting those two
+   specific gaps (likely `--indel-coverage`, `--indel-ins-read-per-bp`,
+   and/or correlated deletion structure between IBD-adjacent founders),
+   not a rewrite of the architecture already built.
 2. **Training-side format updates.** Full design now in
    [`TRAINING_PLAN.md`](TRAINING_PLAN.md) — reframed (2026-09-09, see
    §0) as a new model with its own training script(s)

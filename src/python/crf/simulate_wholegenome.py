@@ -83,7 +83,7 @@ def main():
             for hlabel, inbred_frac in HETS:
                 het_t = 0.0 if hlabel == "inbred" else het
                 for ind_i in range(args.n_per_cell):       # N individuals/cell -> stable
-                    out, _ibd, _ind, _panel, het_tw, cls_w = simulate(
+                    out, _ibd, _ind, _panel, het_tw, cls_w, _refpos, _short = simulate(
                         rng, windows=NC, sites=T, founders=K,
                         min_cross=mn, max_cross=mx, inbreeding=1.0,
                         allele_sharing=0.2, bad_frac=args.bad_frac,
