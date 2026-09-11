@@ -120,6 +120,22 @@ as row multiplicity (matching the existing PS4G convention), not a cell
 value. Cassava validation deferred pending data from the collaborator.
 Still design-only; no `.py` files changed.
 
+**Addendum (2026-09-11):** cassava gVCFs landed
+(`grits_workdir/cassava/gvcfs/`, 106 haplotype-resolved files, same
+PHGv2 `ASM_Start`/`ASM_End` format as maize) — the deferred cassava
+validation from the 2026-09-10 entry is now **measured** (12
+haplotypes × 18 chromosomes, run in parallel): the event/bp-weighted
+size inversion reproduces closely (confirming §2.4's mixture structure
+is general-plant biology, not maize-specific), while the
+indel-affected-fraction target is organism-specific (32.7% cassava vs.
+39.3% maize pooled mean) — see
+`experiments/simulator-indels/results/indel_biology_notes.md` for the
+full write-up. Also established a new standing practice: every plan
+document in this project should ship a workflow diagram alongside the
+prose, color-coded reused/new/modified — first one is
+`experiments/simulator-indels/results/simulator_workflow.png` (source:
+`scripts/simulator_workflow_diagram.py`).
+
 ## ACTIVE (2026-08-28): branch consolidation + grits_workdir scripts/results brought in — DONE, review pending
 
 **Context.** Several weeks of RIL2 founder-path-decode-error investigation

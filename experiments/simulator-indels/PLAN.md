@@ -6,7 +6,7 @@
 > `docs/PLAN.md`) as design decisions change or implementation phases
 > land, so a fresh Claude Code session or a collaborator with no prior
 > context can pick this up correctly. **Last reconciled with the code:
-> 2026-09-10** — no simulator/model code has changed yet; see §0.
+> 2026-09-11** — no simulator/model code has changed yet; see §0.
 
 > **Scope of this document:** reworking `src/python/crf/simulate_alleles.py`
 > to (a) generate realistic insertion/deletion (indel) patterns relative
@@ -15,6 +15,12 @@
 > (`ropebwt3-phg`, branch `lift-ridx-ternary-dist-map`, pushed, not yet
 > merged there either). See `docs/HANDOFF.md`'s top entry for how this
 > connects to the rest of the project's history.
+
+> **Workflow diagram:** [`results/simulator_workflow.png`](results/simulator_workflow.png)
+> — the §2/§4 pipeline at a glance, color-coded reused / new / modified,
+> capped by the §2.7 acceptance gate. Regenerate via
+> `scripts/simulator_workflow_diagram.py` after any change to §2 or §4's
+> stage list, so the picture never drifts from the prose.
 
 ---
 
@@ -78,6 +84,32 @@ existing PS4G convention already expands read counts into consecutive
 duplicate rows (verified in `ropebwt_npy_to_matrix.py`'s docstring and
 in real matrices, where zero rows are ever all-zero). §2.3's `2K+2`
 ternary layout is correct as committed; see the note added there.
+
+### 2026-09-11 — Standing practice: a workflow diagram alongside this plan
+
+Going forward, a plan document in this project should ship with a
+diagram showing its pipeline stages and which are reused / new /
+modified — not just prose. First one built: `results/simulator_workflow.png`
+(source: `scripts/simulator_workflow_diagram.py`), covering §2's 8
+pipeline stages plus the §2.7 acceptance gate. Keep the diagram and the
+prose in sync — regenerate the PNG (hand-authored SVG, rasterized via
+`rsvg-convert`) whenever §2 or §4's stage list changes, rather than
+letting the picture go stale.
+
+### 2026-09-11 — Cassava calibration data landed and measured
+
+Real cassava gVCFs arrived (`grits_workdir/cassava/gvcfs/`, 106
+haplotype-resolved files); measured with the same
+`scripts/indel_size_report.py` used for maize, no changes needed beyond
+two generality fixes caught while reusing it (the figure title was
+hardcoded to "maize" — now an `--organism` flag; the chromosome-sort in
+panel D assumed a literal `chr` prefix and would have crashed on
+cassava's `Chromosome01`-style names — now sorts by trailing digits
+regardless of prefix). §2.7's cassava paragraph and
+`results/indel_biology_notes.md` updated with the findings — see there
+for numbers. The event/bp-weighted size inversion (§2.4's core claim)
+reproduces closely in cassava; the indel-affected-fraction target is
+organism-specific (32.7% cassava vs. 39.3% maize), not a universal 40%.
 
 ---
 
@@ -343,18 +375,24 @@ noise. Acceptance criteria for Phase 1 (§5):
   measured **~40%** target (§2.4, `results/indel_size_distribution.png`),
   reported as an explicit simulator QC line, not just implied by config.
 
-**Cassava as a second validation system** (deferred): a highly
-heterozygous, clonally propagated outcrosser — structurally opposite to
-inbred maize — with existing infrastructure
-(`experiments/cassava-diploid-crf/`, the cassava row above) but no
-indel calibration data yet. Cassava has assemblies, not gVCFs
-(`grits_workdir/cassava/fasta_for_index/`), so the gVCF `ASM_*`-span
-method used for maize can't run there directly; a `.lift`-anchor route
-exists (`cassava/ropebwt_index/cassavaChrIndex.lift`, reusable via
-`experiments/ril2-error-regions/scripts/parse_lift_file.py`) but is
-blind below its ~2kb anchor spacing, so it would only extend the large-
-indel calibration, not the small-indel one. On hold until the
-collaborator supplies cassava data to work from.
+**Cassava as a second validation system** — biological calibration
+**done** (2026-09-11); simulator-output validation still pending. Real
+haplotype-resolved cassava gVCFs landed
+(`grits_workdir/cassava/gvcfs/`, 106 files, same PHGv2 `ASM_Start`/
+`ASM_End` format as maize — the earlier concern about needing the
+`.lift`-anchor route instead was moot once real gVCFs arrived).
+Measured 12 haplotypes × 18 chromosomes: the event/bp-weighted size
+inversion reproduces almost exactly (43.9% of events at 1bp vs. 0.17%
+of bp; ~1.3% of events ≥4kb vs. 88.1% of bp), directly supporting
+§2.4's two-component-mixture claim as general-plant biology, not a
+maize-only fit. Indel-affected fraction is measurably lower than
+maize's (32.7% pooled mean vs. 39.3%) — reported as found, cause not
+yet determined. Full write-up and figure:
+`results/indel_biology_notes.md`, `results/cassava_indel_size_distribution.png`.
+**What's still deferred**: the simulator-*output* side of cassava
+validation (reproducing the ~72%-either-founder-covered acceptance
+check from §2.7's table) — that needs §2.5's read-sampling/coverage
+layer actually built, not just biological calibration input.
 
 ## 3. Terminology (use precisely and consistently)
 

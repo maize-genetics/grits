@@ -13,12 +13,19 @@ Progress log entry, same convention as `docs/PLAN.md`) as work
 progresses, so any collaborator's Claude Code session can pick up
 exactly where the last one left off.
 
+**At a glance:** [`results/simulator_workflow.png`](results/simulator_workflow.png)
+— the pipeline's 8 stages, color-coded reused / new / modified, capped
+by the acceptance gate. Regenerate via `scripts/simulator_workflow_diagram.py`
+whenever the stage list changes.
+
 **Biological grounding:** [`results/indel_biology_notes.md`](results/indel_biology_notes.md)
-— general plant indel-mutation mechanisms plus real maize calibration
-numbers measured from this project's own founder gVCFs, including the
-event-vs-bp-weighted size distribution
-([`results/indel_size_distribution.png`](results/indel_size_distribution.png),
-reproducible via `scripts/indel_size_report.py`).
+— general plant indel-mutation mechanisms plus real calibration numbers
+from **two organisms' own gVCFs**, maize
+([`results/indel_size_distribution.png`](results/indel_size_distribution.png))
+and cassava
+([`results/cassava_indel_size_distribution.png`](results/cassava_indel_size_distribution.png)),
+both reproducible via `scripts/indel_size_report.py` (`--organism` flag
+only affects the figure title).
 
 **What "done" means for Phase 1:** `PLAN.md` §2.7 — acceptance criteria
 grounded in real sim-vs-real gaps already measured

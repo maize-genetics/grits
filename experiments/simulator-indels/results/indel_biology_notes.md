@@ -8,7 +8,9 @@ directly from this project's own maize founder gVCF data. **Updated
 2026-09-10** after collaborator review: bp-weighted size distribution,
 a multi-founder/multi-chromosome measurement, and a figure
 (`indel_size_distribution.png`), plus a real measurement bug caught and
-corrected along the way (see below).
+corrected along the way (see below). **Updated 2026-09-11**: cassava
+calibration data added (second organism, confirms the general-plant
+framing — see below), reusing the same script unchanged.
 
 ## Two distinct mutational mechanisms, two distinct size regimes
 
@@ -228,6 +230,54 @@ A188 has 282–1,682 assembly sequences and 6.9% scaffold content, versus
 B73's 12 sequences and 0% scaffold content — an assembly-quality
 artifact, not real biology. **Do not fit indel-model parameters on
 A188.**
+
+## Cassava calibration data (second organism, confirms the general-plant framing)
+
+Measured 2026-09-11 from `grits_workdir/cassava/gvcfs/` (106
+haplotype-resolved gVCFs, same PHGv2 `ASM_Start`/`ASM_End` format as the
+maize founder gVCFs — the same method and script apply unchanged). 6
+individuals (12 haplotypes: BGM_2098, COL1734, COL386, ECU72,
+IITA_TMS_IBA000070, TMe_261) × all 18 chromosomes = 216
+haplotype/chromosome pairs, run in parallel (12-way, sharded by
+haplotype) rather than serially, per this project's standing
+resource-check-before-parallelizing practice. Figure:
+[`cassava_indel_size_distribution.png`](cassava_indel_size_distribution.png).
+
+**The event/bp inversion is not maize-specific — it reproduces almost
+exactly in cassava**, a highly heterozygous, clonally propagated
+outcrosser structurally opposite to inbred maize:
+
+| | maize (chr1, 8 founders×10 chroms) | cassava (12 haplotypes×18 chroms) |
+|---|---|---|
+| 1bp events | 41.5% of events, 0.07% of bp | 43.9% of events, 0.17% of bp |
+| ≥4kb events | ~2.7% of events, ~94.8% of bp | ~1.3% of events, 88.1% of bp |
+| ins:del ratio | 0.95–1.07 (most classes) | 0.99–1.03 (most classes) |
+
+This is real support for §2.4's core design claim — the two-component
+mixture *structure* (small/slippage-driven, large/retrotransposon-
+driven) is general-plant biology, not something fit to maize's numbers
+specifically.
+
+**The indel-affected reference-bp fraction is measurably lower in
+cassava than maize**: pooled mean **32.7%** (per-haplotype means
+30.5–35.2%, per-pair range 10.9–55.3%) versus maize's 39.3% pooled mean.
+Reported as found, not forced to match — a ~7 percentage-point gap
+between an inbred-vs-reference comparison (maize) and a heterozygous-
+individual-haplotype-vs-reference comparison (cassava) is plausible from
+several non-exclusive causes (assembly quality, time since divergence
+from the specific reference genotype, real biological turnover rate)
+that this measurement alone can't distinguish — flagged as an open
+question, not resolved here. No cassava analogue of maize's A188 outlier
+has been identified in this 12-haplotype subset, but that is not a
+systematic outlier scan (only ~11% of the 106 available gVCFs were
+sampled) and shouldn't be read as "cassava has no outliers."
+
+**Practical consequence for `PLAN.md` §2.7**: cassava calibration input
+is no longer blocked — the earlier "on hold until the collaborator
+supplies cassava data" note is stale as of this measurement. What's
+still deferred is the *simulator-output* side of cassava validation (the
+~72%-either-founder-covered acceptance check), which needs the
+read-sampling/coverage layer (§2.5) actually built first.
 
 ## Why this matters for the model's current error budget
 

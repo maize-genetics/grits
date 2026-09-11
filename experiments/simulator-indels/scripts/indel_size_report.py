@@ -169,7 +169,7 @@ def build_size_table(all_events):
     return pd.DataFrame(rows).sort_values("bucket").reset_index(drop=True)
 
 
-def make_figure(size_table, summary_df, out_path):
+def make_figure(size_table, summary_df, out_path, organism="maize"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -217,7 +217,9 @@ def make_figure(size_table, summary_df, out_path):
 
     ax = axes[1, 1]
     piv = fit_df.pivot_table(index="chrom", columns="founder", values="indel_affected_frac")
-    piv = piv.reindex(sorted(piv.index, key=lambda c: int(c.replace("chr", ""))))
+    # Sort chromosomes by their trailing digits, independent of naming scheme
+    # (maize's "chr1".."chr10", cassava's "Chromosome01".."Chromosome18", ...).
+    piv = piv.reindex(sorted(piv.index, key=lambda c: int(re.search(r"(\d+)$", c).group(1))))
     for founder in piv.columns:
         ax.plot(range(len(piv)), 100 * piv[founder], marker="o", alpha=0.7, label=founder)
     ax.axhline(40, color="gray", linestyle="--", linewidth=1, label="40% target")
@@ -230,7 +232,7 @@ def make_figure(size_table, summary_df, out_path):
     ax.set_title(title)
     ax.legend(fontsize=6, ncol=2, loc="lower right")
 
-    fig.suptitle("Real maize founder indel structure (founder gVCFs, ASM_Start/ASM_End spans)",
+    fig.suptitle(f"Real {organism} founder indel structure (founder gVCFs, ASM_Start/ASM_End spans)",
                  fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(out_path, dpi=150)
@@ -246,6 +248,8 @@ def parse_args():
                     "(writes <prefix>_summary.tsv and <prefix>_sizes.tsv).")
     p.add_argument("--out-fig", default=None, help="If set, write the 4-panel PNG here "
                     "(requires matplotlib).")
+    p.add_argument("--organism", default="maize", help="Used only in the figure's title "
+                    "(e.g. 'cassava'); does not affect the measurement itself.")
     return p.parse_args()
 
 
@@ -291,7 +295,7 @@ def main():
         print(f"indel bp from events >=4kb: {ge4k:.1f}%")
 
     if args.out_fig:
-        make_figure(size_table, summary_df, args.out_fig)
+        make_figure(size_table, summary_df, args.out_fig, organism=args.organism)
 
 
 if __name__ == "__main__":
