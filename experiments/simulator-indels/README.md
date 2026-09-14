@@ -36,8 +36,23 @@ only affects the figure title).
 grounded in real sim-vs-real gaps already measured
 (`docs/notes/cassava_data_diagnostic.md`), not just "the code runs."
 
+**Training side (Phase 2):** [`TRAINING_PLAN.md`](TRAINING_PLAN.md) — the
+model/training-loop design, implemented on branch `indel-training-loop`
+(`src/python/crf/crf_kernels.py`, `IndelFounderPathEncoder` in `train_crf.py`,
+`train_diploid_indel.py`). Model architecture, before vs. after:
+[`results/model_architecture_before.png`](results/model_architecture_before.png)
+vs.
+[`results/model_architecture_after.png`](results/model_architecture_after.png)
+— same visual convention as the simulator-pipeline diagrams above.
+Verified against a synthetic fixture only (`tests/python/crf/
+test_train_diploid_indel.py`); real training still needs Phase 1's simulator
+output.
+
 ## Status
 
-Design phase — no code changes yet. See `PLAN.md` §0 (Progress log) for
-what's been decided so far and `PLAN.md` §5 (Future work) for what's
-next.
+Phase 1 (simulator core): in progress, no `2K+2` write path yet — see
+`PLAN.md` §0 (Progress log) and §5 (Future work).
+
+Phase 2 (training loop): implemented and verified against a synthetic
+fixture — see `TRAINING_PLAN.md` §0's 2026-09-14 entry. Blocked on Phase 1
+for real training data.

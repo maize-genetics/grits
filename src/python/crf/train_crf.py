@@ -277,6 +277,160 @@ class FounderPathEncoder(nn.Module):
         return -(p.clamp_min(1e-9).log() * p).sum(-1)
 
 
+class IndelFounderPathEncoder(nn.Module):
+    """Sibling of FounderPathEncoder for the ternary+distance ("indel-aware")
+    input format: per (site,founder) cell is (ternary in {-2,-1,0,1}, distance
+    code in {-1,0..127}) instead of a single binary value. Structurally
+    identical to FounderPathEncoder elsewhere (pooling/transformer/heads) —
+    only the cell embedding and the recomb-head's depth/del_frac features
+    differ. A sibling class, not a refactor of FounderPathEncoder: this keeps
+    the deployed diploid-affinity-sim512-h3 checkpoint's code path completely
+    untouched (experiments/simulator-indels/TRAINING_PLAN.md §2, open
+    engineering-judgment call — sibling class chosen for now).
+
+    The cell alphabet is finite: 4 ternary states x 129 distance codes = 516.
+    fast_cells replaces the per-cell MLP with an exact 516-row lookup table —
+    the same idea as FounderPathEncoder's binary_cells (2-row table) but for
+    this wider alphabet.
+    """
+    N_TERN = 4           # {-2,-1,0,1} one-hot'd, index = value + 2
+    N_DIST = 129          # {-1,0..127}, index = value + 1
+    N_STATES = N_TERN * N_DIST   # 516
+
+    def __init__(self, d_model=128, n_heads=4, n_layers=4, ext_dim=0,
+                 time_local_emis=False, window_c=False, learned_het=False,
+                 fast_cells=False):
+        super().__init__()
+        self.d_model = d_model
+        self.time_local_emis = time_local_emis
+        self.window_c = window_c
+        self.fast_cells = fast_cells
+        if learned_het:
+            self.het_head = nn.Linear(d_model, 1)
+            nn.init.zeros_(self.het_head.weight)
+            nn.init.constant_(self.het_head.bias, -5.0)   # softplus(-5)~0 => starts off
+        else:
+            self.het_head = None
+        # cell input: [onehot4(ternary) | distance-scalar] -> 5 dims. log1p is
+        # unsafe here (log1p(-1)=-inf on the ternary channel, DIST_PAD=-1 on
+        # the distance channel), so the cell embed is redesigned rather than
+        # reusing FounderPathEncoder's log1p(X) transform.
+        self.cell = nn.Sequential(nn.Linear(5, d_model), nn.GELU(),
+                                  nn.Linear(d_model, d_model))
+        self.ext_bias = nn.Linear(ext_dim, 1) if ext_dim > 0 else None
+        if self.ext_bias is not None:
+            nn.init.zeros_(self.ext_bias.weight)
+            nn.init.zeros_(self.ext_bias.bias)
+        self.fpool = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.fquery = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        enc = nn.TransformerEncoderLayer(d_model, n_heads, 4 * d_model,
+                                         batch_first=True, activation="gelu")
+        self.pos_encoder = nn.TransformerEncoder(enc, n_layers)
+        self.gate_head = nn.Linear(d_model, 1)
+        # +4: depth, del_frac, entropy, log1p(dbp) -- one wider than
+        # FounderPathEncoder's +3 (depth, entropy, log1p(dbp)): del_frac is a
+        # genuinely new recomb-head input (PLAN.md §2.6 — indels locally
+        # suppress crossover; local deletion density is the observable).
+        self.recomb_head = nn.Linear(d_model + 4, 1)
+        self.scale = d_model ** -0.5
+
+    @staticmethod
+    def _posenc(T, d, device):
+        pe = torch.zeros(T, d, device=device)
+        pos = torch.arange(T, device=device).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d, 2, device=device).float()
+                        * (-math.log(10000.0) / d))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        return pe
+
+    @staticmethod
+    def _cell_input(tern, dist):
+        """tern, dist: matching-shape int/float tensors -> [...,5] float input
+        for self.cell. tern in {-2,-1,0,1} one-hot'd (index=tern+2); dist in
+        {-1,0..127} mapped to a scalar in [-1,1], with -1 the explicit
+        no-anchor sentinel -- NOT 0, which would instead claim "sitting
+        exactly on an anchor" (the opposite fact)."""
+        onehot = F.one_hot(tern.long() + 2, num_classes=4).float()
+        dist_f = dist.float()
+        dist_scalar = torch.where(dist_f < 0, torch.full_like(dist_f, -1.0),
+                                  dist_f / 127.0).unsqueeze(-1)
+        return torch.cat([onehot, dist_scalar], dim=-1)
+
+    def _embed_cells(self, X):
+        """Per-(site,founder) embedding [B,T,K,d] from (ternary, distance).
+        X: [B,T,K,2], X[...,0]=ternary, X[...,1]=distance code. With
+        fast_cells, the finite 516-state alphabet collapses the per-cell MLP
+        to an exact table lookup, mirroring FounderPathEncoder.binary_cells."""
+        tern, dist = X[..., 0], X[..., 1]
+        if self.fast_cells:
+            tern_idx = torch.arange(4, device=X.device) - 2           # {-2,-1,0,1}
+            dist_idx = torch.arange(-1, 128, device=X.device)         # {-1,0..127}
+            tt, dd = torch.meshgrid(tern_idx, dist_idx, indexing="ij")
+            table = self.cell(self._cell_input(tt.reshape(-1), dd.reshape(-1)))  # [516,d]
+            state_id = (tern.long() + 2) * self.N_DIST + (dist.long() + 1)       # [B,T,K]
+            return table[state_id]
+        return self.cell(self._cell_input(tern, dist))
+
+    def forward(self, X, founder_mask, dbp=None, ext_emb=None, emit_het=False):
+        B, T, K, _ = X.shape
+        cells = self._embed_cells(X)
+
+        cf = cells.reshape(B * T, K, self.d_model)
+        q = self.fquery.expand(B * T, 1, self.d_model)
+        kpad = ~founder_mask.bool().unsqueeze(1).expand(B, T, K).reshape(B * T, K)
+        h, _ = self.fpool(q, cf, cf, key_padding_mask=kpad)
+        h = h.reshape(B, T, self.d_model) + self._posenc(T, self.d_model, X.device)
+        H = self.pos_encoder(h)
+
+        tern = X[..., 0]
+        if self.time_local_emis:
+            # Per-site founder key: emission at site t scores founder f using
+            # its cell embedding AT t, not averaged over the window. Required
+            # when the active founder switches within a window (recombination).
+            cf_local = cells.masked_fill(~founder_mask.bool().view(B, 1, K, 1), 0.0)
+            emis = torch.einsum("btd,btkd->btk", H, cf_local) * self.scale
+        else:
+            e = cells.mean(dim=1)
+            e = e.masked_fill(~founder_mask.bool().unsqueeze(-1), 0.0)
+            emis = torch.einsum("btd,bkd->btk", H, e) * self.scale
+        if self.ext_bias is not None and ext_emb is not None:
+            emis = emis + self.ext_bias(ext_emb).squeeze(-1).unsqueeze(1)   # [B,1,K]
+        emis = emis.masked_fill(~founder_mask.bool().unsqueeze(1), NEG_INF)
+
+        g = torch.sigmoid(self.gate_head(H)).squeeze(-1)
+        valid = founder_mask.bool().unsqueeze(1)
+        emis = torch.where(valid, g.unsqueeze(-1) * emis.clamp(min=NEG_INF / 2),
+                           torch.full_like(emis, NEG_INF))
+
+        # depth: count of MATCHING founders per site (ternary==1) -- the
+        # ternary analogue of FounderPathEncoder's log1p(X.sum(-1)). A raw sum
+        # over {-2,-1,0,1} can go negative and make log1p produce NaN, so this
+        # counts matches specifically rather than summing the raw channel.
+        depth = torch.log1p((tern == 1).float().sum(-1, keepdim=True))
+        # del_frac: fraction of founders reading as a real deletion at this
+        # site -- new recomb-head input, no analogue in FounderPathEncoder.
+        del_frac = (tern == -1).float().mean(-1, keepdim=True)
+        ent = self._entropy(emis, founder_mask).unsqueeze(-1)
+        if dbp is None:
+            dbp = torch.ones(B, T, 1, device=X.device)
+        feats = torch.cat([H, depth, del_frac, ent, torch.log1p(dbp)], dim=-1)
+        if self.window_c:
+            c = F.softplus(self.recomb_head(feats.mean(dim=1))).squeeze(-1)  # [B]
+            c = c.unsqueeze(1).expand(B, T)
+        else:
+            c = F.softplus(self.recomb_head(feats)).squeeze(-1)              # [B,T]
+        if emit_het:
+            het = (self.het_head(H).squeeze(-1) if self.het_head is not None
+                   else torch.zeros(B, T, device=X.device))                 # [B,T] logit
+            return emis, g, c, het
+        return emis, g, c
+
+    def _entropy(self, emis, founder_mask):
+        p = torch.softmax(emis.masked_fill(~founder_mask.bool().unsqueeze(1), NEG_INF), dim=-1)
+        return -(p.clamp_min(1e-9).log() * p).sum(-1)
+
+
 class NeuralCRF(nn.Module):
     def __init__(self):
         super().__init__()

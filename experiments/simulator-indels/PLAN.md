@@ -164,6 +164,22 @@ founders) a future calibration round should target.
 **Status: Phase 1 code complete and tested; not yet "done" by §2.7's
 own bar.** §5 item 1 updated accordingly below.
 
+### 2026-09-14 — Training-side (§5 Phase 2) implemented against a synthetic fixture
+
+`TRAINING_PLAN.md` §0/§2/§3 fully implemented on branch `indel-training-loop`
+(worktree off `simulator-indel-modeling`, run concurrently with this file's
+own in-progress simulator edits — no changes made here or to
+`simulate_alleles.py`): `crf_kernels.py` extraction, the new
+`IndelFounderPathEncoder` sibling class, `train_diploid_indel.py`, and a
+model-architecture diagram pair (`results/model_architecture_before.png` /
+`model_architecture_after.png`, same visual convention as this document's
+own simulator-pipeline diagrams). Verified against a synthetic fixture only
+— see `TRAINING_PLAN.md` §0 for the full account, including two corrections
+to that document's earlier text (`founder_mask` does not exclude the null
+founder; the distance channel needs the same `log1p`-hazard treatment as the
+ternary one). §5 Phase 2 is done; Phase 1 (this document, simulator core)
+remains the blocker for real training data.
+
 ---
 
 ### 2026-09-14 — Calibration sweep found a real bug in the either-covered QC stat

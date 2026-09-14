@@ -18,6 +18,91 @@
 - **2026-09-09**: Training-side design reframed as a new model line
   (this document created); no code changed.
 
+### 2026-09-14 — §2/§3 implemented against a synthetic fixture (real simulator output still pending)
+
+All of §2 (shared code) and §3 (new code) built on branch `indel-training-loop`
+(worktree off `simulator-indel-modeling`, since the simulator side was
+mid-edit in the shared checkout at the time — no changes made to
+`simulate_alleles.py` or its in-progress `TERN_*`/`DIST_*`/`LABEL_PAD`
+constants; this script defines its own literal copies with a note to
+reconcile once both land on the same branch). Also delivered: two
+architecture diagrams (`results/model_architecture_before.png` /
+`model_architecture_after.png`, source `scripts/model_architecture_*_diagram.py`),
+following the same hand-authored-SVG convention as `simulator_workflow.png`.
+
+**§2 (shared)**: `src/python/crf/crf_kernels.py` — `build_pair_tables`,
+`_dcrf_nll`, `_dcrf_viterbi`, `_dcrf_marginal`, `_dcrf_viterbi_factored`
+extracted verbatim from `train_diploid.py`, which now re-imports them under
+the same names so every external `from python.crf.train_diploid import
+_dcrf_viterbi`-style call site (≈15 across `experiments/*/scripts/` and
+`src/python/crf/*.py`) keeps working unchanged. Verified: loaded
+`diploid-affinity-sim512-h3` post-extraction and scored its full 10,000-row
+val split — `val_pair_acc = 0.6181` vs. the checkpoint's own recorded 0.6179
+(within noise), confirming the extraction is a pure move with zero effect on
+the deployed model.
+
+**§3 (new), open question resolved**: encoder-sharing went with **(a) sibling
+class** — `IndelFounderPathEncoder` added to `train_crf.py` alongside
+`FounderPathEncoder`, which is untouched. Cell embedding: one-hot(4) ternary
+state + one scalar log-distance → `Linear(5, d_model)`, plus an exact
+516-row (4 ternary × 129 distance codes) lookup table (`fast_cells=True`),
+mirroring `binary_cells`. `recomb_head` widened by one input:
+`del_frac = (ternary == -1).mean(-1)` alongside the existing
+`depth = log1p((ternary == 1).sum(-1))` — PLAN.md §2.6's local-crossover-
+suppression claim made a directly observable recomb-head input.
+
+New training script `src/python/crf/train_diploid_indel.py`:
+`IndelDiploidDataset`/`IndelDiploidIndividualDataset`/`IndelDiploidAffinityDataset`
+reading the `2K+2` layout, `GRITSCRFDiploidIndel`, `parse_args()`/`main()`
+following `train_diploid.py`'s flag names plus `--fast-cells`,
+`--het-inbred`/`--het-outbred` (defaults 0.23/0.50, unchanged from the binary
+model — explicitly flagged as **not yet recalibrated**, printed at Dataset
+construction so the real distribution falls out of the first real-data run's
+log). `_founder_affinity` is imported and reused bit-identically (no
+calibration constants); `_het_scale`'s body is reused with the two endpoint
+constants parameterized rather than hardcoded (`_het_scale_indel`). Both
+operate on `M = (ternary == 1)` — proven bit-identical to today's binary
+"supported" semantic (`ternary==1` IS today's binary presence, verified
+against `rb3_lift_ternary_state` in the ropebwt3-phg C source this session).
+
+Two corrections to this document's earlier text, found reading the code
+directly rather than assuming:
+- **`founder_mask` does NOT exclude the pad founder** (`train_diploid.py:
+  416-417`: `founder_mask = ones(B, K)`, all-ones). The null founder is a
+  live decode state, so the pad value matters numerically. Resolved: the
+  null-founder pad is `(TERN_DIV, DIST_PAD)`, not `(0, 0)` — `DIST_PAD` a
+  genuine "no anchor" sentinel, distinct from a real distance of 0
+  ("sitting exactly on an anchor," the opposite fact). Tested directly
+  (`test_dist_pad_differs_from_distance_zero`).
+- **`log1p` is unsafe on the distance channel too**, not just ternary — this
+  document's §3 claimed distance "is already non-negative," but the real
+  feature's `rb3_lift_nearest_ref` returns `-1` for "no anchor" (verified in
+  `lift.c`), so `DIST_PAD=-1` breaks `log1p` exactly like `TERN_DEL=-1`
+  breaks it on the ternary side. The distance scalar in the cell embed is a
+  linear `dist/127` mapping (with `-1.0` for the pad), never `log1p`.
+
+Verification run (`tests/python/crf/test_train_diploid_indel.py`, 8/8
+passing, run in isolation per this repo's established convention): CRF
+kernel extraction bit-exact against an independent reference reimplementation;
+`fast_cells` bit-identical to the per-cell MLP path; Dataset round-trip
+(`LABEL_PAD` → `K` not founder 0, `DIST_PAD` → `-1.0` not `0.0`); an
+overfit-one-batch smoke test on a synthetic fixture (known founder paths +
+one planted deletion tract per window) — loss falls to <50% in 150 steps,
+hap_acc rises well above chance. Pair-state accuracy itself lags hap_acc in
+this test (expected: no het prior is active, and `GRITSCRFDiploid`'s own
+`homo_penalty` comment documents single-read data biasing pair-state decode
+toward homozygous pairs without one) — hap_acc is the correct diagnostic for
+"do gradients reach every new component," not pair_acc alone.
+
+**What's still open**: real simulator output. The fixture above is
+synthetic, built only to exercise the code path — it does not resemble the
+real indel/coverage statistics PLAN.md §2.7 targets. Training cannot start
+for real until the simulator emits the actual `2K+2` format (§5 below,
+Phase 1). Also open: `--het-inbred`/`--het-outbred` recalibration (still the
+binary model's 0.23/0.50 placeholders) and the §4 evaluation-tooling
+`--model-class` selector, both explicitly deferred to once a real checkpoint
+exists to test against.
+
 ## 1. Why this is a new model, not an upgrade
 
 `experiments/simulator-indels/PLAN.md` scopes the simulator emitting a
@@ -215,16 +300,24 @@ designed in detail in this training-loop document.
    worth keeping on real (not just synthetic) data — same decision
    point already named in `../PLAN.md` §5.4.
 
-## 6. Open questions (unresolved, need a decision before or during implementation)
+## 6. Open questions
 
-- Encoder-sharing strategy: (a) sibling class vs. (b) pluggable
-  embedder refactor (§2) — recommended (a) to start, not decided as
-  final.
-- Exact ternary cell-embedding transform (§3, first bullet) — no
-  specific transform chosen yet, only the `log1p(-1)` hazard to avoid.
-- `HET_INBRED`/`HET_OUTBRED`-equivalent calibration constants for the
-  redesigned affinity/het logic (§3) — needs real simulator output to
-  calibrate against, not guessable ahead of time.
-- Null-founder pad value for the `[ternary, distance]` 2-vector case
-  (§3) — pending confirmation that `founder_mask` fully excludes it
-  from `depth`/`recomb_head` regardless of the chosen value.
+**Resolved (2026-09-14, see §0):**
+- Encoder-sharing strategy — went with **(a) sibling class**
+  (`IndelFounderPathEncoder`). Not revisited: (b)'s pluggable-embedder
+  refactor remains a reasonable future cleanup once this model's shape has
+  stabilized, per the original recommendation.
+- Ternary cell-embedding transform — one-hot(4) ternary state + scalar
+  `dist/127` (with `-1.0` for `DIST_PAD`) → `Linear(5, d_model)`, plus an
+  exact 516-state lookup fast path.
+- Null-founder pad value — `(TERN_DIV, DIST_PAD)`. `founder_mask` does
+  **not** exclude it (verified false, not confirmed true as this document
+  originally hoped) — see §0's 2026-09-14 entry for why the pad value
+  matters numerically as a result.
+
+**Still unresolved, need real simulator output:**
+- `HET_INBRED`/`HET_OUTBRED`-equivalent calibration constants
+  (`--het-inbred`/`--het-outbred` in `train_diploid_indel.py`, currently the
+  binary model's 0.23/0.50 placeholders) — code prints the measured
+  het-proxy distribution at Dataset construction so the real values fall out
+  of the first real-data run's log, but they haven't been measured yet.
