@@ -1,24 +1,36 @@
 """
-E4 diploid training — joint pair-state CRF on the shared FounderPathEncoder.
+Indel-aware diploid training — ternary+distance ("2K+2") input format.
 
-The encoder is unchanged (one emis_f [B,T,K] per founder). The diploid layer
-forms pair-state emissions emis_p[b,t,(i,j)] = emis_f[i] + emis_f[j] over the
-P = K(K+1)/2 unordered founder pairs, and decodes a pair path with a CRF whose
-transition cost is -c * (#chromosomes that switch), nsw in {0,1,2}. A two-
-chromosome switch therefore costs exp(-2c) = exp(-c)^2 — two INDEPENDENT
-chromosome switches, matching the generative sim (no hard ban).
+New model line, not an upgrade of GRITSCRFDiploid: the input representation
+is materially different (2 channels per cell instead of 1, with different
+semantics — see experiments/simulator-indels/TRAINING_PLAN.md §1), so this
+gets its own training script, its own LightningModule (GRITSCRFDiploidIndel),
+and its own checkpoint lineage. diploid-affinity-sim512-h3 stays deployed and
+untouched — a comparison target, not a checkpoint this script ever loads.
 
-Reuses the state-count-agnostic forward/Viterbi structure from train_haploid
-with a pair switch matrix. Only [B,P,P] is materialized per timestep (never
-[B,T,P,P]).
+Data layout (experiments/simulator-indels/PLAN.md §2.3), width 2K+2:
+    cols 0:K      ternary read-sharing state per founder, {-1,0,1} =
+                  deletion/diverged/match relative to reference (producer may
+                  also emit TERN_PAD=-2 on the rare short-window edge case)
+    col  K        H1 founder label (0..K-1, or LABEL_PAD=-1 if unlabeled)
+    col  K+1      H2 founder label (0..K-1, or LABEL_PAD=-1 if unlabeled)
+    cols K+2:2K+2 distance to nearest reference anchor per founder, int8
+                  log-coded (DIST_PAD=-1 = no anchor, else 0..DIST_SAT-1)
 
-Data: (N, T, K+2) — cols 0:K features, col K = H1, col K+1 = H2 (make_splits).
+The TERN_*/DIST_*/LABEL_PAD constants below are literal copies of the
+producer's contract (simulate_alleles.py, branch simulator-indel-modeling),
+not an import from that file: this script's worktree branches off that
+file's last-committed state, which predates those constants landing there —
+importing them would create a runtime dependency on a file that is actively
+being edited by a parallel effort. Keep these values in sync with
+simulate_alleles.py's own TERN_DEL/TERN_DIV/TERN_MATCH/TERN_PAD/DIST_PAD/
+DIST_SAT/LABEL_PAD/DIST_LOG_SCALE block once both land on the same branch.
 
 Usage:
-    pixi run --environment gpu python src/python/crf/train_diploid.py \
-        --data /workdir/esb33/data/training/sim_diploid_512.npy \
+    pixi run -- python src/python/crf/train_diploid_indel.py \
+        --data /workdir/esb33/data/training/sim_diploid_indel.npy \
         --time-local-emis --lr 1e-4 --warmup-steps 500 --precision bf16-mixed \
-        --max-epochs 5 --run-name diploid-pair
+        --max-epochs 5 --run-name diploid-indel-pair
 """
 
 import argparse
@@ -36,29 +48,29 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import Dataset, DataLoader
 
-from python.crf.train_crf import FounderPathEncoder
-from python.crf.train_haploid import make_splits
+from python.crf.train_crf import IndelFounderPathEncoder
+from python.crf.crf_kernels import _dcrf_nll, _dcrf_viterbi, build_pair_tables
+from python.crf.train_diploid import _founder_affinity
 from python.crf.callbacks import EMACallback
-# Pair-state CRF kernels — extracted verbatim into crf_kernels.py (2026-09,
-# experiments/simulator-indels/TRAINING_PLAN.md §2) so the new indel-aware
-# model (train_diploid_indel.py) shares them instead of duplicating them.
-# Re-imported into this module's namespace (not just used locally) so every
-# existing `from python.crf.train_diploid import _dcrf_viterbi`-style call
-# site elsewhere in the repo keeps working unchanged.
-from python.crf.crf_kernels import (
-    _dcrf_nll, _dcrf_viterbi, _dcrf_marginal, _dcrf_viterbi_factored,
-    build_pair_tables,
-)
+
+# --- Indel-mode sentinels, mirroring simulate_alleles.py's contract -------
+TERN_DEL, TERN_DIV, TERN_MATCH, TERN_PAD = -1, 0, 1, -2
+DIST_PAD = -1
+DIST_SAT = 127
+LABEL_PAD = -1
 
 
 # --------------------------------------------------------------------------- #
 #  Dataset                                                                     #
 # --------------------------------------------------------------------------- #
 
-class PreWindowedDiploidDataset(Dataset):
-    """(N,T,K+2): cols 0:K features, col K = H1, col K+1 = H2. Returns the
-    feature window plus the two haplotype labels (pair index built in the
-    module to keep the K×K table in one place)."""
+class IndelDiploidDataset(Dataset):
+    """(N,T,2K+2): cols 0:K ternary, col K=H1, col K+1=H2, cols K+2:2K+2
+    distance. Returns the (ternary,distance) feature window plus the two
+    haplotype labels. Unlike PreWindowedDiploidDataset's np.clip(label,0,K)
+    (which wrongly maps LABEL_PAD=-1 onto founder 0), unlabeled positions are
+    explicitly remapped to the null-founder index K, matching the convention
+    ropebwt_npy_to_matrix.py already uses for real data (gA[gA<0]=K)."""
     def __init__(self, data, num_parents=24):
         self.data = data
         self.K = num_parents
@@ -68,62 +80,81 @@ class PreWindowedDiploidDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.data[idx]
-        feats = torch.tensor(row[:, :self.K], dtype=torch.float32)
-        h1 = np.clip(row[:, self.K].astype(np.int64), 0, self.K)
-        h2 = np.clip(row[:, self.K + 1].astype(np.int64), 0, self.K)
+        K = self.K
+        tern = row[:, :K].astype(np.float32)
+        dist = row[:, K + 2:2 * K + 2].astype(np.float32)
+        feats = torch.tensor(np.stack([tern, dist], axis=-1), dtype=torch.float32)  # [T,K,2]
+        h1_raw = row[:, K].astype(np.int64)
+        h2_raw = row[:, K + 1].astype(np.int64)
+        h1 = np.where(h1_raw < 0, K, h1_raw)
+        h2 = np.where(h2_raw < 0, K, h2_raw)
         return {"input_embeds": feats,
                 "h1": torch.tensor(h1, dtype=torch.long),
                 "h2": torch.tensor(h2, dtype=torch.long)}
 
 
-def make_diploid_splits(path, num_parents, val_frac, test_frac, limit_n=0):
-    """Same deterministic head-slice split as make_splits, diploid dataset."""
+def _check_width(path, data, num_parents):
+    expected = 2 * num_parents + 2
+    if data.shape[-1] != expected:
+        raise ValueError(f"{path}: expected width {expected} (2K+2, K={num_parents}), "
+                         f"got {data.shape[-1]}")
+
+
+def make_indel_diploid_splits(path, num_parents, val_frac, test_frac, limit_n=0):
+    """Same deterministic head-slice split as train_diploid.make_diploid_splits,
+    applied to the 2K+2 layout."""
     data = np.load(path, allow_pickle=True, mmap_mode="r")
+    _check_width(path, data, num_parents)
     if limit_n and limit_n < len(data):
         data = data[:limit_n]
     N = len(data)
     n_test = int(N * test_frac)
     n_val = int(N * val_frac)
     n_tr = N - n_val - n_test
-    mk = lambda a: PreWindowedDiploidDataset(a, num_parents)
-    print(f"Diploid {Path(path).name}: N={N:,} cols={data.shape[-1]}  "
+    mk = lambda a: IndelDiploidDataset(a, num_parents)
+    print(f"IndelDiploid {Path(path).name}: N={N:,} cols={data.shape[-1]}  "
           f"train={n_tr:,} val={n_val:,} test={n_test:,}")
     return mk(data[:n_tr]), mk(data[n_tr:n_tr + n_val]), mk(data[n_tr + n_val:])
 
 
-# E7: per-individual heterozygosity proxy → adaptive homozygous penalty. Inbred
-# individuals (F=1) have identical gametes, so consecutive single-gamete reads stay
-# on the same founder and their match-founder sets overlap; outbred individuals
-# interleave two gametes, so adjacent reads' match sets disagree more. Aggregated
-# over an individual's windows this tracks (1-F) almost exactly (corr -0.99), and
-# is computed from reads only — so the het prior can be set per individual.
-HET_INBRED, HET_OUTBRED = 0.23, 0.50      # proxy at F=1 and F=0 (sim calibration)
-
-
-def _het_scale(feats_block):
-    """Map an individual's windows [W,T,K] (0/1) to homo-penalty scale in [0,1]:
-    0 for inbred (allow homozygous), 1 for fully outbred (full het prior)."""
+def _het_scale_indel(feats_block, het_inbred, het_outbred):
+    """Same Jaccard-of-adjacent-match-sets proxy as train_diploid._het_scale,
+    computed over the MATCH view (ternary==1) — bit-identical arithmetic to
+    the existing binary path, since ternary==1 IS today's binary presence
+    (verified against ropebwt3-phg's rb3_lift_ternary_state). Only the two
+    calibration endpoints are parameterized rather than hardcoded: the
+    simulator now models coverage/deletions, which shifts this proxy's
+    distribution even though the definition of "supported" hasn't changed."""
     a, b = feats_block[:, :-1], feats_block[:, 1:]
     inter = (a * b).sum(-1)
     uni = ((a + b) > 0).sum(-1)
     jac = np.where(uni > 0, inter / np.maximum(uni, 1), 1.0)
     het = float((1.0 - jac).mean())
-    return float(np.clip((het - HET_INBRED) / (HET_OUTBRED - HET_INBRED), 0.0, 1.0))
+    return float(np.clip((het - het_inbred) / (het_outbred - het_inbred), 0.0, 1.0))
 
 
-class DiploidIndividualDataset(PreWindowedDiploidDataset):
-    """Diploid dataset + a per-individual adaptive homozygous-penalty scale, from
-    the genome-wide het proxy (reads only). Windows are grouped in blocks of G."""
-    def __init__(self, data, num_parents, windows_per_individual):
+class IndelDiploidIndividualDataset(IndelDiploidDataset):
+    """IndelDiploidDataset + a per-individual adaptive homozygous-penalty
+    scale, from the genome-wide het proxy over the MATCH view (ternary==1).
+    Windows grouped in blocks of G, mirroring DiploidIndividualDataset."""
+    def __init__(self, data, num_parents, windows_per_individual,
+                 het_inbred=0.23, het_outbred=0.50):
         super().__init__(data, num_parents)
         G = windows_per_individual
         if len(data) % G:
             raise ValueError(f"rows {len(data)} not divisible by windows/ind {G}")
         self.G = G
-        feats = np.asarray(data[:, :, :num_parents]).reshape(
-            len(data) // G, G, data.shape[1], num_parents).astype(np.float32)
-        self.scale = np.array([_het_scale(feats[i]) for i in range(len(feats))],
-                              dtype=np.float32)
+        tern = np.asarray(data[:, :, :num_parents])
+        M = (tern == TERN_MATCH).astype(np.float32).reshape(
+            len(data) // G, G, data.shape[1], num_parents)
+        self.scale = np.array(
+            [_het_scale_indel(M[i], het_inbred, het_outbred) for i in range(len(M))],
+            dtype=np.float32)
+        print(f"IndelDiploid(individual) het_scale: mean={self.scale.mean():.4f} "
+              f"std={self.scale.std():.4f} min={self.scale.min():.4f} "
+              f"max={self.scale.max():.4f}  (het_inbred={het_inbred}, "
+              f"het_outbred={het_outbred} — recalibrate once real indel-mode "
+              f"data's distribution is known, TRAINING_PLAN.md §3)")
 
     def __getitem__(self, idx):
         out = super().__getitem__(idx)
@@ -131,8 +162,10 @@ class DiploidIndividualDataset(PreWindowedDiploidDataset):
         return out
 
 
-def make_diploid_individual_splits(path, num_parents, val_frac, test_frac, G, limit_n=0):
+def make_indel_diploid_individual_splits(path, num_parents, val_frac, test_frac, G,
+                                         het_inbred=0.23, het_outbred=0.50, limit_n=0):
     data = np.load(path, allow_pickle=True, mmap_mode="r")
+    _check_width(path, data, num_parents)
     if limit_n:
         data = data[:(limit_n // G) * G]
     N = len(data)
@@ -140,37 +173,28 @@ def make_diploid_individual_splits(path, num_parents, val_frac, test_frac, G, li
     n_test = int(n_ind * test_frac) * G
     n_val = int(n_ind * val_frac) * G
     n_tr = N - n_val - n_test
-    mk = lambda a: DiploidIndividualDataset(a, num_parents, G)
-    print(f"Diploid(individual) {Path(path).name}: N={N:,} individuals={n_ind} "
+    mk = lambda a: IndelDiploidIndividualDataset(a, num_parents, G, het_inbred, het_outbred)
+    print(f"IndelDiploid(individual) {Path(path).name}: N={N:,} individuals={n_ind} "
           f"train={n_tr:,} val={n_val:,} test={n_test:,}")
     return mk(data[:n_tr]), mk(data[n_tr:n_tr + n_val]), mk(data[n_tr + n_val:])
 
 
-def _founder_affinity(feats_block):
-    """Per-founder genome-wide affinity for one individual (E5 relatedness signal).
-    feats_block [W,T,K] (binary match) -> [K,2] = (raw match rate, founders-mean-
-    centered rate). High for founders the individual descends from (and their IBD-
-    mates), at background for the rest; centering sharpens the contrast. Both bounded.
-    Reads only (no labels), so identical at inference."""
-    r = feats_block.reshape(-1, feats_block.shape[-1]).mean(0).astype(np.float32)  # [K]
-    return np.stack([r, r - r.mean()], axis=-1)                     # [K,2] bounded
-
-
-class DiploidAffinityDataset(PreWindowedDiploidDataset):
-    """Diploid dataset + a per-individual founder-affinity ext_emb [K,2], attached
-    to every window of the individual (windows grouped in blocks of G). Conditions
-    the encoder to favour founders the individual actually carries and break the
-    within-window IBD ties the local emission cannot."""
+class IndelDiploidAffinityDataset(IndelDiploidDataset):
+    """IndelDiploidDataset + a per-individual founder-affinity ext_emb [K,2],
+    from train_diploid._founder_affinity (reused verbatim, bit-identical — it
+    has no calibration constants to shift, just mean/centered-mean over the
+    MATCH view) attached to every window of the individual."""
     def __init__(self, data, num_parents, windows_per_individual):
         super().__init__(data, num_parents)
         G = windows_per_individual
         if len(data) % G:
             raise ValueError(f"rows {len(data)} not divisible by windows/ind {G}")
         self.G = G
-        feats = np.asarray(data[:, :, :num_parents]).reshape(
-            len(data) // G, G, data.shape[1], num_parents).astype(np.float32)
+        tern = np.asarray(data[:, :, :num_parents])
+        M = (tern == TERN_MATCH).astype(np.float32).reshape(
+            len(data) // G, G, data.shape[1], num_parents)
         self.affinity = np.stack(
-            [_founder_affinity(feats[i]) for i in range(len(feats))]).astype(np.float32)
+            [_founder_affinity(M[i]) for i in range(len(M))]).astype(np.float32)
 
     def __getitem__(self, idx):
         out = super().__getitem__(idx)
@@ -178,10 +202,12 @@ class DiploidAffinityDataset(PreWindowedDiploidDataset):
         return out
 
 
-def make_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G, limit_n=0):
-    """Individual-aligned split (same boundaries as make_diploid_individual_splits,
-    so the test set matches the head-slice splits) with founder-affinity ext_emb."""
+def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G, limit_n=0):
+    """Individual-aligned split, same boundaries as
+    make_indel_diploid_individual_splits (mirrors train_diploid.py's
+    make_diploid_affinity_splits intent)."""
     data = np.load(path, allow_pickle=True, mmap_mode="r")
+    _check_width(path, data, num_parents)
     if limit_n:
         data = data[:(limit_n // G) * G]
     N = len(data)
@@ -189,8 +215,8 @@ def make_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G, limi
     n_test = int(n_ind * test_frac) * G
     n_val = int(n_ind * val_frac) * G
     n_tr = N - n_val - n_test
-    mk = lambda a: DiploidAffinityDataset(a, num_parents, G)
-    print(f"Diploid(affinity) {Path(path).name}: N={N:,} individuals={n_ind} "
+    mk = lambda a: IndelDiploidAffinityDataset(a, num_parents, G)
+    print(f"IndelDiploid(affinity) {Path(path).name}: N={N:,} individuals={n_ind} "
           f"train={n_tr:,} val={n_val:,} test={n_test:,}")
     return mk(data[:n_tr]), mk(data[n_tr:n_tr + n_val]), mk(data[n_tr + n_val:])
 
@@ -199,13 +225,20 @@ def make_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G, limi
 #  Lightning module                                                            #
 # --------------------------------------------------------------------------- #
 
-class GRITSCRFDiploid(pl.LightningModule):
+class GRITSCRFDiploidIndel(pl.LightningModule):
+    """Mirrors GRITSCRFDiploid's structure exactly — same loss, same CRF
+    kernels (imported from crf_kernels.py), same training-loop glue.
+    TRAINING_PLAN.md §2: EMACallback and the Trainer/ModelCheckpoint/
+    EarlyStopping wiring are reusable AS WRITTEN, duplicated here as
+    boilerplate rather than imported, matching that document's
+    recommendation for a fully independent training script. Only the encoder
+    class and the null-founder pad value (§3) differ from GRITSCRFDiploid."""
     def __init__(self, num_parents=24, d_model=256, n_heads=8, n_layers=6,
                  lr=1e-4, weight_decay=1e-5, gate_reg=0.05, time_local_emis=False,
                  warmup_steps=0, homo_penalty=0.0,
                  cosine_decay=False, spike_skip=False, spike_mult=8.0,
                  loss_spike_mult=5.0,
-                 learned_het=False, founder_affinity=False):
+                 learned_het=False, founder_affinity=False, fast_cells=False):
         super().__init__()
         self.save_hyperparameters()
         self.num_parents = num_parents
@@ -214,33 +247,25 @@ class GRITSCRFDiploid(pl.LightningModule):
         self.gate_reg = gate_reg
         self.warmup_steps = warmup_steps
         self.homo_penalty = homo_penalty
-        # Stability recipe ported from E8 haploid (RESULTS E8): cosine-decay-to-0
-        # settles the basin oscillation, spike-skip drops freak-gradient steps.
         self.cosine_decay = cosine_decay
         self.spike_skip = spike_skip
         self.spike_mult = spike_mult
         self._gnorm_ema = -1.0
         self._gnorm_seen = 0
         self._n_skipped = 0
-        # A localized partition-NLL spike can corrupt the encoder without moving the
-        # GLOBAL grad-norm enough to trip spike_mult (the collapse-to-degenerate
-        # failure). Skip on a CRF-loss spike too: catch the freak batch directly.
         self.loss_spike_mult = loss_spike_mult
         self._loss_ema = -1.0
         self._loss_seen = 0
         self._loss_spike = False
-        # E7-diag fix: learned per-locus het prior replaces the fixed homo_penalty.
         self.learned_het = learned_het
-        # crf-relatedness: per-individual founder-affinity prior (ext_bias). A
-        # genome-wide per-founder presence signal that biases emissions toward the
-        # founders the individual carries and breaks within-window IBD ties.
         self.founder_affinity = founder_affinity
         ext_dim = 2 if founder_affinity else 0
 
         K = num_parents + 1                          # +1 unknown, matches encoder
-        self.encoder = FounderPathEncoder(d_model, n_heads, n_layers, ext_dim=ext_dim,
-                                          time_local_emis=time_local_emis,
-                                          learned_het=learned_het)
+        self.encoder = IndelFounderPathEncoder(
+            d_model, n_heads, n_layers, ext_dim=ext_dim,
+            time_local_emis=time_local_emis, learned_het=learned_het,
+            fast_cells=fast_cells)
         self.stay_bonus = nn.Parameter(torch.tensor(2.0))
 
         pi, pj, pair_table, nsw = build_pair_tables(K)
@@ -248,20 +273,25 @@ class GRITSCRFDiploid(pl.LightningModule):
         self.register_buffer("pj", pj)
         self.register_buffer("pair_table", pair_table)
         self.register_buffer("nsw_pair", nsw)
-        # Het prior: with one read/site the emission emis_f[i]+emis_f[j] is
-        # maximized by the homozygous pair of the observed founder, so without a
-        # counter-force the decode collapses to all-homozygous. Subtract a
-        # constant from homozygous pair-states (i==j), matching diploid_hmm.
         self.register_buffer("homo_mask", (pi == pj).float())
         self.P = pi.numel()
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"GRITSCRFDiploid: K={K} states, P={self.P} pair-states, "
+        print(f"GRITSCRFDiploidIndel: K={K} states, P={self.P} pair-states, "
               f"{n_params:,} params")
 
     def forward(self, X, homo_scale=None, ext_emb=None):
-        B, T, K_feat = X.shape
+        B, T, K_feat, _ = X.shape
         K = self.num_parents + 1
-        X_pad = torch.cat([X, torch.zeros(B, T, 1, device=X.device)], dim=-1)
+        # Null-founder pad: (TERN_DIV, DIST_PAD), not zeros — DIST_PAD=-1 is
+        # the genuine "no anchor" sentinel, and TERN_DIV=0 is the closest
+        # analogue to today's "no read support". founder_mask does NOT
+        # exclude this column (all-ones, matching GRITSCRFDiploid), so it IS
+        # a live decode state and the pad value matters numerically —
+        # TRAINING_PLAN.md §3.
+        pad = torch.empty(B, T, 1, 2, device=X.device, dtype=X.dtype)
+        pad[..., 0] = TERN_DIV
+        pad[..., 1] = DIST_PAD
+        X_pad = torch.cat([X, pad], dim=2)
         founder_mask = torch.ones(B, K, device=X.device)
         if ext_emb is not None:                                  # pad the null founder
             ext_emb = torch.cat(
@@ -273,16 +303,9 @@ class GRITSCRFDiploid(pl.LightningModule):
             emis_f, g, c = self.encoder(X_pad, founder_mask, ext_emb=ext_emb)  # [B,T,K]
         emis_p = emis_f[..., self.pi] + emis_f[..., self.pj]     # [B,T,P]
         if self.learned_het:
-            # E7-diag fix: a PER-LOCUS, encoder-driven homozygous penalty. The
-            # Transformer sees the sustained-alternation pattern of a het region and
-            # raises this where it's heterozygous; ~0 in homozygous regions. This is
-            # the emission-side het signal the transition cost provably cannot give.
             het_pen = F.softplus(het).unsqueeze(-1)              # [B,T,1] >= 0
             emis_p = emis_p - het_pen * self.homo_mask
         elif self.homo_penalty != 0.0:
-            # E7: with a per-individual scale (0=inbred → no penalty, 1=outbred →
-            # full het prior), the homozygous penalty adapts to each sample's
-            # inbreeding; without it, the fixed scalar applies to all.
             pen = self.homo_penalty
             if homo_scale is not None:
                 pen = pen * homo_scale.view(B, 1, 1)
@@ -305,14 +328,13 @@ class GRITSCRFDiploid(pl.LightningModule):
         self.log("train/loss", loss, prog_bar=True)
         self.log("train/crf_loss", crf)
         self.log("train/gate", g.mean())
-        if self.spike_skip:                                    # flag CRF-loss spikes
+        if self.spike_skip:
             self._loss_seen += 1
             cv = float(crf.detach())
             warming = self._loss_seen <= 50
             thresh = (self.loss_spike_mult * self._loss_ema
                       if self._loss_ema > 0 else float("inf"))
             self._loss_spike = (math.isfinite(cv) and not warming and cv > thresh)
-            # cap the EMA update on a spike so it can't be dragged up by the freak
             upd = min(cv, thresh) if math.isfinite(thresh) else cv
             if math.isfinite(upd):
                 self._loss_ema = (upd if self._loss_ema <= 0
@@ -324,7 +346,6 @@ class GRITSCRFDiploid(pl.LightningModule):
         pred = _dcrf_viterbi(emis_p, c, self.nsw_pair, self.stay_bonus)
         pair_true = self.pair_table[h1, h2]
         pair_acc = (pred == pair_true).float().mean()
-        # per-haplotype: both stored sorted (pi<=pj), compare to sorted truth
         pred_lo, pred_hi = self.pi[pred], self.pj[pred]
         t_lo = torch.minimum(h1, h2)
         t_hi = torch.maximum(h1, h2)
@@ -336,19 +357,12 @@ class GRITSCRFDiploid(pl.LightningModule):
         pair_acc, hap_acc = self._accuracy(emis_p, c, batch["h1"], batch["h2"])
         self.log("val/loss", loss, prog_bar=True)
         self.log("val/pair_acc", pair_acc, prog_bar=True)
-        self.log("val_pair_acc", pair_acc)              # slash-free alias: ModelCheckpoint's
-                                                          # filename= can't safely interpolate a
-                                                          # metric name containing "/" (Lightning
-                                                          # treats it as a path separator and
-                                                          # scatters checkpoints into a stray
-                                                          # val/ subdir) — see callbacks below.
+        self.log("val_pair_acc", pair_acc)              # slash-free alias, see train_diploid.py
         self.log("val/hap_acc", hap_acc, prog_bar=True)
         self.log("val/gate", g.mean())
         return loss
 
     def on_before_optimizer_step(self, optimizer):
-        # See train_haploid: runs before clipping; skip steps whose raw global
-        # grad-norm is non-finite or >> the running EMA of good norms.
         if not self.spike_skip:
             return
         norms = [p.grad.detach().norm() for p in self.parameters()
@@ -360,13 +374,9 @@ class GRITSCRFDiploid(pl.LightningModule):
         warming = self._gnorm_seen <= 50
         thresh = self.spike_mult * self._gnorm_ema if self._gnorm_ema > 0 else float("inf")
         spike = (not math.isfinite(g)) or (not warming and g > thresh)
-        # Always update the EMA (capped on a spike) so it can't lock low — see
-        # train_haploid for the death-spiral this prevents.
         g_ema = thresh if (spike and math.isfinite(thresh)) else (g if math.isfinite(g) else thresh)
         if math.isfinite(g_ema):
             self._gnorm_ema = g_ema if self._gnorm_ema <= 0 else 0.98 * self._gnorm_ema + 0.02 * g_ema
-        # also skip if this batch's CRF NLL spiked (set in training_step): a
-        # localized partition blow-up the global grad-norm may not surface.
         if spike or self._loss_spike:
             for p in self.parameters():
                 if p.grad is not None:
@@ -413,6 +423,10 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--gate-reg", type=float, default=0.05)
     p.add_argument("--time-local-emis", action="store_true")
+    p.add_argument("--fast-cells", action="store_true",
+                   help="Exact 516-row cell-embedding lookup instead of the "
+                        "per-cell MLP (inference-time speedup; off by default "
+                        "during training, mirrors FounderPathEncoder.binary_cells).")
     p.add_argument("--warmup-steps", type=int, default=0)
     p.add_argument("--grad-clip", type=float, default=1.0,
                    help="Gradient-norm clip value")
@@ -436,25 +450,33 @@ def parse_args():
                    help="Subtract from homozygous pair emissions (het prior); "
                         "counters the all-homozygous collapse of single-read diploid.")
     p.add_argument("--adaptive-homo", action="store_true",
-                   help="E7: scale --homo-penalty per individual by a genome-wide "
-                        "het proxy (0 for inbred lines, 1 for outbred), so one model "
-                        "serves a mixed-inbreeding panel. Needs --windows-per-individual.")
+                   help="Scale --homo-penalty per individual by a genome-wide het "
+                        "proxy over the ternary MATCH view (0 for inbred lines, 1 "
+                        "for outbred). Needs --windows-per-individual.")
+    p.add_argument("--het-inbred", type=float, default=0.23,
+                   help="Het-proxy calibration floor (inbred/F=1 endpoint). "
+                        "TRAINING_PLAN.md §3: needs fresh empirical values once real "
+                        "indel-mode simulator output exists — the 0.23 default is "
+                        "copied from the binary model's calibration, a placeholder, "
+                        "not a measurement on this format.")
+    p.add_argument("--het-outbred", type=float, default=0.50,
+                   help="Het-proxy calibration ceiling (outbred/F=0 endpoint); "
+                        "see --het-inbred.")
     p.add_argument("--learned-het", action="store_true",
-                   help="E7-diag fix: per-locus encoder-driven homozygous penalty "
-                        "(replaces fixed --homo-penalty). The emission-side het signal.")
+                   help="Per-locus encoder-driven homozygous penalty (replaces "
+                        "fixed --homo-penalty). The emission-side het signal.")
     p.add_argument("--windows-per-individual", type=int, default=100)
     p.add_argument("--founder-affinity", action="store_true",
-                   help="crf-relatedness: condition the encoder on a per-individual "
-                        "founder-affinity prior (ext_bias). Needs "
+                   help="Condition the encoder on a per-individual founder-affinity "
+                        "prior (ext_bias) over the ternary MATCH view. Needs "
                         "--windows-per-individual.")
     p.add_argument("--precision", default="bf16-mixed")
     p.add_argument("--max-epochs", type=int, default=5)
     p.add_argument("--val-check-interval", type=int, default=0,
-                   help="Validate every N training steps (0 = once per epoch). Maps "
-                        "the within-epoch peak/drift at fine resolution.")
+                   help="Validate every N training steps (0 = once per epoch).")
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--devices", type=int, default=1)
-    p.add_argument("--run-name", default="diploid-pair")
+    p.add_argument("--run-name", default="diploid-indel-pair")
     p.add_argument("--resume", default=None,
                    help="Path to a .ckpt to resume training from (optimizer/scheduler "
                         "state included; passed as Trainer.fit(ckpt_path=...)).")
@@ -470,15 +492,16 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
 
     if args.founder_affinity:
-        train_ds, val_ds, _ = make_diploid_affinity_splits(
+        train_ds, val_ds, _ = make_indel_diploid_affinity_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
             args.windows_per_individual, limit_n=args.limit_n)
     elif args.adaptive_homo:
-        train_ds, val_ds, _ = make_diploid_individual_splits(
+        train_ds, val_ds, _ = make_indel_diploid_individual_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
-            args.windows_per_individual, limit_n=args.limit_n)
+            args.windows_per_individual, het_inbred=args.het_inbred,
+            het_outbred=args.het_outbred, limit_n=args.limit_n)
     else:
-        train_ds, val_ds, _ = make_diploid_splits(
+        train_ds, val_ds, _ = make_indel_diploid_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
             limit_n=args.limit_n)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
@@ -486,22 +509,20 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=True)
 
-    model = GRITSCRFDiploid(
+    model = GRITSCRFDiploidIndel(
         num_parents=args.num_parents, d_model=args.d_model, n_heads=args.n_heads,
         n_layers=args.n_layers, lr=args.lr, gate_reg=args.gate_reg,
         time_local_emis=args.time_local_emis, warmup_steps=args.warmup_steps,
         homo_penalty=args.homo_penalty, cosine_decay=args.cosine_decay,
         spike_skip=args.spike_skip, spike_mult=args.spike_mult,
         loss_spike_mult=args.loss_spike_mult,
-        learned_het=args.learned_het, founder_affinity=args.founder_affinity)
+        learned_het=args.learned_het, founder_affinity=args.founder_affinity,
+        fast_cells=args.fast_cells)
 
-    # Checkpoint/stop on val/pair_acc (max): the CRF partition NLL can spike on
-    # long-block data even as Viterbi accuracy stays good, so selecting on loss
-    # can discard the best model. Accuracy is the quantity we report.
+    # Checkpoint/stop on val/pair_acc (max), matching train_diploid.py: the CRF
+    # partition NLL can spike on long-block data even as Viterbi accuracy stays
+    # good, so selecting on loss can discard the best model.
     callbacks = [
-        # monitor the slash-free "val_pair_acc" alias (logged alongside "val/pair_acc"):
-        # a filename= token containing "/" makes Lightning scatter checkpoints into a
-        # stray val/ subdir instead of writing directly under ckpt_dir.
         ModelCheckpoint(dirpath=str(ckpt_dir), monitor="val_pair_acc",
                         mode="max", save_top_k=2, save_last=True,
                         filename="d-{epoch:02d}-{val_pair_acc:.4f}"),
