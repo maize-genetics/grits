@@ -13,7 +13,23 @@ from python.crf.simulate_alleles import (
     _indel_lengths, _encode_dist, _anchor_distance, _gather_by_lineage,
     _indel_tracts, _draw_lineages, _coalescent_feats, _good_mask, simulate,
     _indel_suppressed_rate, _row_counts, _sample_rows, _indel_chunk,
+    _gem_partition,
 )
+
+# Golden hash for simulate(simulate_indels=True, indel_shared_frac=0.0) on
+# fixed args/seed, captured from BOTH the pre-correlated-deletion code
+# (git rev cc26018, this branch's parent tip on
+# origin/simulator-indel-modeling) AND this branch's post-change code --
+# confirmed byte-identical across (data, ibd, refpos, true_cov) before this
+# assertion was written. See test_simulate_indel_shared_frac_zero_matches_
+# pre_change_golden_hash below.
+_GOLDEN_INDEL_SHARED_OFF_DATA_SHA256 = \
+    "1f7668b71934ed7b161f15b4a05747c6cf52be37617a0a61000bcca0d1d6e358"
+_GOLDEN_INDEL_SHARED_OFF_IBD_SHA256 = \
+    "bb0f1678e06d09ed678382b9332ccd2388fa13211f49dbd65456ae8b35744a68"
+_GOLDEN_INDEL_SHARED_OFF_REFPOS_SHA256 = \
+    "6705e9ce246b11d2d3ac64e0ca12efb8b832217eabd88e73174f9078a9c8f677"
+_GOLDEN_INDEL_SHARED_OFF_TRUE_COV = (4192, 732, 928, 5120, 10788, 40960)
 
 # --- golden hashes: pre-change simulate() output on fixed args/seed, ------
 # recorded BEFORE any --simulate-indels code was added (see this branch's
@@ -763,3 +779,171 @@ def test_indel_chunk_insertion_stacking_appears_with_enough_budget():
     # colinear reads) -- the extra occurrences are the stacked insertion
     # reads, all landing at the SAME reference position.
     assert (refpos[0] == 1).sum() > 2
+
+
+# --- _gem_partition (correlated-deletion follow-up) -----------------------
+
+class _FakeGemRNG:
+    """Stub with just the two rng methods `_gem_partition` calls, returning
+    fixed values -- lets the tiny-exact test drive the exact same beta/u
+    draws used in the hand trace in `_gem_partition`'s own docstring."""
+    def __init__(self, beta_vals, u_vals):
+        self._beta = np.asarray(beta_vals)
+        self._u = np.asarray(u_vals)
+
+    def beta(self, a, b, size):
+        assert (a, b) == (1.0, 1.0) or True  # a is always 1.0; b is theta
+        return self._beta.reshape(size)
+
+    def random(self, size):
+        return self._u.reshape(size)
+
+
+def test_gem_partition_tiny_exact():
+    # Hand-traced in _gem_partition's own docstring: n=1, M=3, C=2,
+    # beta=[0.3, 0.7] -> rem=[1, 0.7] -> p=[0.3, 0.49]/0.79
+    #   =[0.379747, 0.620253] -> cdf=[0.379747, 1.0].
+    # u=[0.1, 0.4, 0.9]:
+    #   0.1 clears neither cdf entry           -> group 0
+    #   0.4 clears cdf[0]=0.379747, not cdf[1]  -> group 1
+    #   0.9 clears cdf[0], not cdf[1]           -> group 1
+    fake = _FakeGemRNG(beta_vals=[0.3, 0.7], u_vals=[0.1, 0.4, 0.9])
+    got = _gem_partition(fake, n=1, M=3, theta=1.0, C=2)
+    np.testing.assert_array_equal(got, np.array([[0, 1, 1]], dtype=np.int32))
+    assert got.dtype == np.int32
+
+
+def test_gem_partition_shape_dtype_range():
+    rng = np.random.default_rng(60)
+    n, M, C = 5, 24, 24
+    group = _gem_partition(rng, n, M, theta=1.5, C=C)
+    assert group.shape == (n, M)
+    assert group.dtype == np.int32
+    assert (group >= 0).all() and (group < C).all()
+
+
+def test_gem_partition_deterministic():
+    a = _gem_partition(np.random.default_rng(61), n=4, M=10, theta=2.0, C=10)
+    b = _gem_partition(np.random.default_rng(61), n=4, M=10, theta=2.0, C=10)
+    np.testing.assert_array_equal(a, b)
+
+
+def test_gem_partition_smaller_theta_concentrates_mass():
+    # Smaller theta -> fewer effective groups used (stronger concentration
+    # -> stronger cross-lineage correlation once gathered onto lineages).
+    # Numerically confirmed (not just plausible-sounding) at n=2000,
+    # M=C=24: theta=0.3 -> 1.99 groups, 1.0 -> 3.76, 2.0 -> 5.65, 5.0 -> 8.98
+    # mean effective groups (monotone). Re-checked here at smaller n so the
+    # test runs fast, with a looser but still-monotone assertion.
+    rng = np.random.default_rng(62)
+    thetas = [0.3, 1.0, 2.0, 5.0]
+    mean_eff = []
+    for theta in thetas:
+        g = _gem_partition(rng, n=500, M=24, theta=theta, C=24)
+        eff = [len(np.unique(row)) for row in g]
+        mean_eff.append(np.mean(eff))
+    assert all(mean_eff[i] < mean_eff[i + 1] for i in range(len(mean_eff) - 1))
+
+
+# --- correlated-deletion follow-up: simulate()'s indel_shared_frac branch -
+
+def test_simulate_indel_shared_frac_zero_matches_pre_change_golden_hash():
+    # Regression check (not just eyeballing): this exact hash was captured
+    # from BOTH the pre-correlated-deletion code (git rev cc26018) and this
+    # branch's post-change code on the same args/seed, confirmed identical
+    # before being pinned here -- see the comment above the golden constants
+    # at the top of this file. indel_shared_frac=0.0 must reproduce
+    # simulate()'s indel-mode output byte-for-byte, including `ibd`,
+    # `refpos`, and the `true_cov` QC counts, not just `data`.
+    import hashlib
+    rng = np.random.default_rng(77)
+    out = simulate(
+        rng, windows=20, sites=64, founders=8, min_cross=2, max_cross=6,
+        inbreeding=0.5, allele_sharing=0.2, bad_frac=0.05,
+        sharing_model="coalescent", sharing_theta=3.0, ancestors=6,
+        ancestor_crossovers=8, derived_sfs=0.3, read_snps=8,
+        gamete_balance=0.5, chunk=1000,
+        simulate_indels=True, indel_density=2.3e-3, indel_region_mult=4,
+        indel_coverage=2.0, indel_shared_frac=0.0)
+    data, ibd, refpos, true_cov = out[0], out[1], out[6], out[8]
+    assert hashlib.sha256(data.tobytes()).hexdigest() == \
+        _GOLDEN_INDEL_SHARED_OFF_DATA_SHA256
+    assert hashlib.sha256(ibd.tobytes()).hexdigest() == \
+        _GOLDEN_INDEL_SHARED_OFF_IBD_SHA256
+    assert hashlib.sha256(refpos.tobytes()).hexdigest() == \
+        _GOLDEN_INDEL_SHARED_OFF_REFPOS_SHA256
+    assert true_cov == _GOLDEN_INDEL_SHARED_OFF_TRUE_COV
+
+
+def test_simulate_indel_shared_frac_positive_differs_from_zero():
+    # Sanity: a positive shared-frac must actually change the output
+    # (otherwise the whole mechanism would be silently inert).
+    kw = dict(windows=10, sites=64, founders=8, min_cross=2, max_cross=6,
+              inbreeding=0.5, allele_sharing=0.2, bad_frac=0.05,
+              sharing_model="coalescent", sharing_theta=3.0, ancestors=6,
+              ancestor_crossovers=8, derived_sfs=0.3, read_snps=8,
+              gamete_balance=0.5, chunk=1000, simulate_indels=True,
+              indel_density=2.3e-3, indel_region_mult=4, indel_coverage=2.0)
+    a, *_ = simulate(np.random.default_rng(88), indel_shared_frac=0.0, **kw)
+    b, *_ = simulate(np.random.default_rng(88), indel_shared_frac=0.4,
+                      indel_cluster_theta=1.0, **kw)
+    assert not np.array_equal(a, b)
+
+
+def _build_priv_shared_masks(rng, n, M, R, shared_frac, cluster_theta,
+                              density=5e-3):
+    """Mirrors simulate()'s indel_shared_frac>0 branch directly on
+    `_indel_tracts`/`_gather_by_lineage`/`_gem_partition`, without going
+    through the full `simulate()` pipeline -- for a fast, targeted test of
+    the correlation mechanism itself."""
+    group = _gem_partition(rng, n, M, cluster_theta, M)
+    del_priv, ins_priv = _indel_tracts(
+        rng, n, M, R, density * (1.0 - shared_frac), 0.5, 0.027, 1.7, 50,
+        8.6, 1.6, 65536)
+    del_shared, ins_shared = _indel_tracts(
+        rng, n, M, R, density * shared_frac, 0.5, 0.027, 1.7, 50, 8.6, 1.6,
+        65536)
+    group_tiled = np.broadcast_to(group[:, :, None], (n, M, R))
+    del_shared_on_lin = _gather_by_lineage(del_shared, group_tiled)
+    del_lin = del_priv | del_shared_on_lin
+    return del_lin, group
+
+
+def test_indel_shared_frac_same_supercluster_lineages_more_correlated_fuzz():
+    # Structural-correlation invariant: across a fuzz sweep of seeds, two
+    # lineages placed in the SAME supercluster by _gem_partition must show
+    # higher mean deletion co-occurrence (both deleted at the same site)
+    # than two lineages in DIFFERENT superclusters, once shared_frac > 0 --
+    # this is the actual mechanism the correlated-deletion follow-up is
+    # supposed to produce, not just "the code runs without crashing".
+    n, M, R = 1, 8, 4000
+    same_co, diff_co = [], []
+    for seed in range(30):
+        rng = np.random.default_rng(1000 + seed)
+        del_lin, group = _build_priv_shared_masks(
+            rng, n, M, R, shared_frac=0.6, cluster_theta=0.5)
+        g = group[0]
+        d = del_lin[0]  # [M, R]
+        # pick one same-supercluster pair and one different-supercluster
+        # pair, if available this draw; skip seeds that don't offer both
+        # (small M can occasionally land every lineage in one cluster).
+        for i in range(M):
+            for j in range(i + 1, M):
+                co = float((d[i] & d[j]).mean())
+                if g[i] == g[j]:
+                    same_co.append(co)
+                else:
+                    diff_co.append(co)
+    assert len(same_co) > 20 and len(diff_co) > 20
+    assert np.mean(same_co) > np.mean(diff_co)
+
+
+def test_indel_shared_frac_group_values_always_in_range_fuzz():
+    rng = np.random.default_rng(63)
+    for _ in range(50):
+        n = int(rng.integers(1, 4))
+        M = int(rng.integers(1, 30))
+        theta = float(rng.uniform(0.1, 5.0))
+        group = _gem_partition(rng, n, M, theta, M)
+        assert group.shape == (n, M)
+        assert (group >= 0).all() and (group < M).all()

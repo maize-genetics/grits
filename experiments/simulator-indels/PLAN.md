@@ -217,6 +217,37 @@ analogous row-conditioning bias in the "indel-affected ref bp" QC line
 49/49 tests still pass. Full numbers:
 `results/calibration_sweep_2026-09-14.md`'s "Addendum" section.
 
+### 2026-09-14 — Correlated deletion across IBD-adjacent founders implemented; outbred either-covered gap closes ~93%
+
+Follow-up to this section's own "next step" and the two entries above:
+`_indel_tracts` drew structural variation per-lineage, fully
+independently across lineages, which was the confirmed root cause of
+outbred (het/cassava-like) individuals' either-covered rate coming out
+far above target with no way to fix it via `--indel-density` alone.
+Implemented a new `_gem_partition(rng, n, M, theta, C)` (static
+Ewens/GEM(theta) partition, reusing `_gem_lineages`'s stick-breaking
+construction without its genomic path-building) and used it in
+`simulate()`'s indel branch to split each window's indel density into a
+"private" per-lineage component and a "shared" per-supercluster
+component (new `--indel-shared-frac`/`--indel-cluster-theta` flags,
+additive, `indel_shared_frac=0.0` byte-identical to before by golden-hash
+regression test). Calibration sweep (12 pooled seeds, K=24/sites=8192/
+windows=60/sharing-theta=4.0, same scale as the two entries above):
+outbred either-covered moved from 82.34% (baseline) to **72.78%**
+against a 72.1% target — **~93% of the gap closed** — without pushing
+indel-affected off its own target (35.93% → 33.58% vs. 32.7% target,
+actually closer). Confirmed with two independent 6-seed batches (within
+0.15pp of each other) and a non-monotone check (`shared_frac=1.0`
+overshoots past the target with much higher variance), not accepted on
+a single run. **Defaults changed**: `--indel-shared-frac` 0.0 → 0.8,
+`--indel-cluster-theta` 1.0 → 0.3. Does **not** address the separate,
+opposite-signed inbred either-covered gap (62–67% vs. 71.6% target,
+under not over) — by design, since inbred has only one active lineage
+per individual (h1≡h2), no second homolog for correlated deletion to
+act on; still open. 8 new unit tests, 57/57 pass (49 pre-existing + 8
+new). Full numbers and methodology:
+`results/indel_correlated_deletion_2026-09-14.md`.
+
 ## 1. Why this work exists
 
 Two confirmed root causes from this project's RIL2 founder-path
@@ -559,30 +590,34 @@ layer actually built, not just biological calibration input.
 
 ## 5. Future work (items 2–4 not started — each phase needs its own review/approval)
 
-1. **Simulator core — code complete, close to but not yet at
-   acceptance criteria (2026-09-11, corrected 2026-09-14).**
+1. **Simulator core — code complete; outbred either-covered acceptance
+   criterion now met, inbred and coverage-dispersion still open
+   (2026-09-11, corrected 2026-09-14, correlated-deletion follow-up
+   2026-09-14).**
    Indel-tract generator (§2.1, §2.2, §2.4), offset/distance tracking,
-   read-sampling/coverage layer (§2.5), and soft recombination
-   suppression near tracts (§2.6, not hard breakpoint-snapping — see
-   §2.6/§6) implemented in `simulate_alleles.py` behind
+   read-sampling/coverage layer (§2.5), soft recombination suppression
+   near tracts (§2.6, not hard breakpoint-snapping — see §2.6/§6), and
+   correlated/clustered deletion across IBD-adjacent lineages
+   (`--indel-shared-frac`/`--indel-cluster-theta`, via the new
+   `_gem_partition`) implemented in `simulate_alleles.py` behind
    `--simulate-indels`, with the new `2K+2` layout (§2.3) and existing
    (flag-off) behavior preserved byte-identically (golden-hash
-   regression test). 49 unit tests pass. **Not yet done by this
-   section's own bar, but closer than first measured**: the
-   2026-09-11 validation run's either-founder-covered number (~97% vs.
-   70–75% target) turned out to be measuring the wrong thing (see the
-   2026-09-14 §0 entry) — the corrected genome-wide measurement gives
-   62.17% (inbred) / 80.72% (het) vs. a 70–75% target, ~9pp off in
-   each direction, not ~25pp. Coverage dispersion (0.13–0.22 vs. ≫1
-   target) is a real, separate, still-open gap. See
-   `results/calibration_sweep_2026-09-14.md` for the full numbers and
-   root-cause analysis. Next step for this item, if picked back up:
-   add correlated/clustered deletion structure across IBD-adjacent
-   founders to `_indel_tracts` (confirmed this is what's needed —
-   `--indel-density` alone cannot close the either-covered gap without
-   trading off the indel-affected-fraction target), plus a separate
-   pass on coverage dispersion (`--indel-ins-read-per-bp` and friends);
-   not a rewrite of the architecture already built.
+   regression test). 57 unit tests pass. **Outbred (het/cassava-like)
+   either-covered now within noise of target**: 72.78% (12-seed pooled)
+   vs. a 72.1% target, down from 82.34% at `--indel-shared-frac=0.0` —
+   ~93% of that gap closed, without disturbing the indel-affected target
+   (33.58% vs. 32.7%). **Still open**: the inbred either-covered gap
+   (62–67% vs. 71.6% target, under not over — the correlated-deletion
+   mechanism doesn't apply when h1≡h2, by design) and coverage dispersion
+   (0.13–0.22 vs. ≫1 target) remain real, separate gaps. See
+   `results/calibration_sweep_2026-09-14.md` and
+   `results/indel_correlated_deletion_2026-09-14.md` for the full
+   numbers and root-cause analysis. Next step for this item, if picked
+   back up: a density-specific fix for the inbred either-covered gap
+   (this round's mechanism was scoped to cross-homolog correlation,
+   which inbred structurally lacks), plus a separate pass on coverage
+   dispersion (`--indel-ins-read-per-bp` and friends); not a rewrite of
+   the architecture already built.
 2. **Training-side format updates.** Full design now in
    [`TRAINING_PLAN.md`](TRAINING_PLAN.md) — reframed (2026-09-09, see
    §0) as a new model with its own training script(s)

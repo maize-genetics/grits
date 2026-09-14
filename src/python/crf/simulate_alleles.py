@@ -287,6 +287,47 @@ def _gem_lineages(rng, n, K, T, theta, M, anc_nc, rate_rep):
     return np.take_along_axis(lin_seg, seg, axis=2).astype(np.int32)
 
 
+def _gem_partition(rng, n, M, theta, C):
+    """Static Ewens/GEM(theta) partition of M items into C groups, one draw
+    per window: `group [n, M] int32` in `[0, C)`.
+
+    Reuses the EXACT stick-breaking construction `_gem_lineages` already
+    uses (its `beta`/`rem`/`p`/`cdf` lines, verbatim) but skips that
+    function's segment/path-building machinery entirely -- there is no
+    genomic (along-T) axis here, just one categorical draw per (window,
+    item), via the same inverse-CDF trick `_gem_lineages` uses for its
+    per-segment lineage label (`lin_seg = (u > cdf[...]).sum(axis=-1)`).
+
+    Used for `--indel-cluster-theta`: grouping the M SNP-sharing lineages
+    themselves into C coarser "superclusters" of correlated structural
+    variation (PLAN.md's correlated-deletion follow-up) -- a SEPARATE,
+    static partition from the per-site `lineage` array, redrawn once per
+    window rather than varying along the genome.
+
+    Hand-verified (n=1, M=3, C=2, theta=1.0, fixed rng stub):
+    beta=[0.3, 0.7] -> rem=[1, 0.7] -> p=[0.3, 0.49]/0.79=[0.37975,
+    0.62025] -> cdf=[0.37975, 1.0]. u=[0.1, 0.4, 0.9] -> group=[0, 1, 1]
+    (0.1 is below the first cdf entry -> group 0; 0.4 and 0.9 both clear
+    it but not the second -> group 1) -- matches the implementation
+    exactly. Separately confirmed smaller theta concentrates mass into
+    fewer effective groups as expected (mean distinct groups used, out of
+    C=24, M=24, 2000-window sample): theta=0.3 -> 1.99, theta=1.0 -> 3.76,
+    theta=2.0 -> 5.65, theta=5.0 -> 8.98 -- monotone, confirming "smaller
+    theta = more concentrated partition = stronger correlation" is a real
+    property of this construction, not just a plausible-sounding claim.
+    """
+    beta = rng.beta(1.0, theta, size=(n, C))
+    rem = np.cumprod(np.concatenate(
+        [np.ones((n, 1)), 1.0 - beta[:, :-1]], axis=1), axis=1)
+    p = beta * rem
+    p /= p.sum(axis=1, keepdims=True)
+    cdf = np.cumsum(p, axis=1)                          # [n, C]
+
+    u = rng.random((n, M, 1))
+    group = (u > cdf[:, None, :]).sum(axis=-1)           # [n, M] categorical
+    return np.clip(group, None, C - 1).astype(np.int32)
+
+
 def _good_mask(rng, n, T, bad_frac, block):
     """Boolean [n, T] of 'good' (uncorrupted) sites.
 
@@ -845,7 +886,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              indel_ins_read_per_bp=2e-3, indel_max_stack=64,
              indel_region_mult=4, indel_recomb_suppress=0.9,
              indel_recomb_flank=32, indel_anchor_thresh=0,
-             indel_ref_founder=-1):
+             indel_ref_founder=-1, indel_shared_frac=0.8,
+             indel_cluster_theta=0.3):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
     (default) behavior, including rng draw order, is byte-for-byte
@@ -868,6 +910,36 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
     1:1 with reference sites) -- use the `.refpos.npy`-equivalent
     return value (`refpos_out`) to join rows back to reference
     coordinates instead.
+
+    `indel_shared_frac`/`indel_cluster_theta`: correlated-deletion follow-up
+    (PLAN.md SS5 item 1 / results/indel_correlated_deletion_*.md). Today's
+    `_indel_tracts` draws structural variation per LINEAGE, independently
+    across lineages -- two DIFFERENT (but possibly closely related)
+    lineages have zero correlation in their deletion patterns, which was
+    confirmed to make a heterozygous individual's "either homolog
+    covered" rate come out too high (independent draws rarely overlap).
+    When `indel_shared_frac > 0`, each window also draws a STATIC
+    supercluster partition of the M lineages via `_gem_partition(...,
+    theta=indel_cluster_theta, C=M)` (coarser than, and independent of,
+    the per-site `lineage` array) and splits indel density into a
+    "private" component (per-lineage, density scaled by
+    `1 - indel_shared_frac`) and a "shared" component (per-supercluster,
+    density scaled by `indel_shared_frac`, gathered onto lineage-space via
+    the supercluster assignment) -- so lineages in the same supercluster
+    share additional deletion/insertion structure beyond their private
+    draw, without changing the per-lineage marginal indel-affected rate.
+    `indel_shared_frac=0.0` draws zero shared-component events (Poisson
+    mean 0) and is required to reproduce today's `_indel_tracts` output
+    byte-for-byte (a regression test enforces this) -- the DEFAULT is
+    `indel_shared_frac=0.8`, `indel_cluster_theta=0.3`, calibrated
+    against the outbred/cassava-like either-covered target: 12-seed mean
+    72.78% (vs. 72.1% target, was 82.34% at frac=0.0 -- ~93% of the gap
+    closed) with indel-affected 33.58% (vs. 32.7% target, was 35.93%),
+    at fixed `--founders 24 --sites 8192 --windows 60 --sharing-theta
+    4.0 --indel-density 2.3e-3`. See
+    `experiments/simulator-indels/results/indel_correlated_deletion_2026-09-14.md`
+    for the full sweep and the (separate, still-open) inbred either-
+    covered gap this mechanism does not address.
 
     Final return value `true_cov_out` is `None` unless `simulate_indels`,
     in which case it is `(n_either, n_hemi, n_null, n_total, n_deleted,
@@ -959,10 +1031,44 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             lineage, M = _draw_lineages(rng, n, R, K, ancestors,
                                          ancestor_crossovers, rmap_R,
                                          sharing_theta, max_lin)
-            del_lin, ins_lin = _indel_tracts(
-                rng, n, M, R, indel_density, indel_ins_frac,
-                indel_large_frac, indel_small_alpha, indel_small_max,
-                indel_large_logmean, indel_large_logsd, indel_max_len)
+            if indel_shared_frac > 0.0:
+                # Correlated-deletion follow-up (PLAN.md SS5 item 1): split
+                # density into a private (per-lineage) component and a
+                # shared (per-supercluster) component, the latter drawn
+                # over the SAME [n,M,R] slot shape but semantically
+                # indexed by a coarser, static supercluster id (`group`)
+                # instead of the lineage id -- so lineages sharing a
+                # supercluster share additional structure beyond their own
+                # private draw. Gated on indel_shared_frac > 0 so the
+                # indel_shared_frac=0.0 default draws exactly the same rng
+                # sequence as before this feature existed (byte-identical
+                # regression test).
+                group = _gem_partition(rng, n, M, indel_cluster_theta, M)
+                del_priv, ins_priv = _indel_tracts(
+                    rng, n, M, R, indel_density * (1.0 - indel_shared_frac),
+                    indel_ins_frac, indel_large_frac, indel_small_alpha,
+                    indel_small_max, indel_large_logmean, indel_large_logsd,
+                    indel_max_len)
+                del_shared, ins_shared = _indel_tracts(
+                    rng, n, M, R, indel_density * indel_shared_frac,
+                    indel_ins_frac, indel_large_frac, indel_small_alpha,
+                    indel_small_max, indel_large_logmean, indel_large_logsd,
+                    indel_max_len)
+                group_tiled = np.broadcast_to(group[:, :, None], (n, M, R))
+                del_shared_on_lin = _gather_by_lineage(del_shared, group_tiled)
+                ins_shared_on_lin = _gather_by_lineage(ins_shared, group_tiled)
+                del_lin = del_priv | del_shared_on_lin
+                ins_lin = ins_priv + ins_shared_on_lin
+                # Combining private+shared can newly delete a site that
+                # neither individual draw had marked deleted (one has a
+                # deletion, the other an insertion at the same site) --
+                # mirror _indel_tracts's own ins_bp[del_mask]=0 cleanup.
+                ins_lin[del_lin] = 0
+            else:
+                del_lin, ins_lin = _indel_tracts(
+                    rng, n, M, R, indel_density, indel_ins_frac,
+                    indel_large_frac, indel_small_alpha, indel_small_max,
+                    indel_large_logmean, indel_large_logsd, indel_max_len)
             rmap_path = _indel_suppressed_rate(
                 rmap_R, del_lin, ins_lin, indel_recomb_suppress,
                 indel_recomb_flank)
@@ -1325,6 +1431,45 @@ def parse_args():
                    help="Founder index treated as the reference (e.g. B73): never "
                         "given deletions, distance pinned to 0. -1 = no reference "
                         "founder in this panel (all K founders carry indels).")
+    p.add_argument("--indel-shared-frac", type=float, default=0.8,
+                   help="Fraction of --indel-density routed through a SHARED, "
+                        "per-supercluster component instead of the per-lineage "
+                        "private one (correlated-deletion follow-up, PLAN.md SS5 "
+                        "item 1 / results/indel_correlated_deletion_2026-09-14.md). "
+                        "Today's per-lineage-independent draw makes a heterozygous "
+                        "individual's two homologs rarely lose coverage at the same "
+                        "site by chance, which was confirmed to make 'either homolog "
+                        "covered' come out too high (~81-83%% vs. ~70-75%% target) "
+                        "for outbred (cassava-like) individuals, and no --indel-density "
+                        "value alone can fix it without blowing past the "
+                        "indel-affected-fraction target. Each window draws a static "
+                        "supercluster partition of the lineages (--indel-cluster-theta) "
+                        "and splits indel events between a private (1-frac) and shared "
+                        "(frac) component so lineages in the same supercluster share "
+                        "additional deletion/insertion structure. 0.0 = off, "
+                        "reproduces today's exact per-lineage-independent output "
+                        "byte-for-byte (regression-tested). 0.8 calibrated against the "
+                        "outbred/cassava-like either-covered target: 12-seed mean "
+                        "72.78%% either-covered (target 72.1%%, was 82.34%% at 0.0 -- "
+                        "~93%% of the gap closed) with indel-affected 33.58%% (target "
+                        "32.7%%, was 35.93%%) -- see the results doc for the full "
+                        "sweep and the separate, still-open inbred either-covered gap "
+                        "this does not address (inbred has no second, independent "
+                        "homolog for correlated deletion to act on).")
+    p.add_argument("--indel-cluster-theta", type=float, default=0.3,
+                   help="Ewens/GEM concentration for the --indel-shared-frac "
+                        "supercluster partition (via _gem_partition, same "
+                        "stick-breaking construction as --sharing-theta but a "
+                        "STATIC per-window draw, no genomic path). Smaller ⇒ mass "
+                        "concentrates into fewer, larger superclusters ⇒ stronger "
+                        "correlation between more lineages; larger ⇒ closer to the "
+                        "no-correlation (many-singleton) limit. Verified numerically: "
+                        "mean effective superclusters used out of C=M=24 at n=2000 "
+                        "windows -- theta=0.3 -> 1.99, theta=1.0 -> 3.76, "
+                        "theta=2.0 -> 5.65, theta=5.0 -> 8.98. 0.3 (the most "
+                        "concentrated value swept) gave the strongest either-covered "
+                        "reduction among {0.3, 1.0, 2.0} at a fixed shared_frac=0.5 "
+                        "checkpoint during calibration -- see the results doc.")
 
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -1560,7 +1705,9 @@ def main():
         indel_recomb_suppress=args.indel_recomb_suppress,
         indel_recomb_flank=args.indel_recomb_flank,
         indel_anchor_thresh=args.indel_anchor_thresh,
-        indel_ref_founder=args.indel_ref_founder)
+        indel_ref_founder=args.indel_ref_founder,
+        indel_shared_frac=args.indel_shared_frac,
+        indel_cluster_theta=args.indel_cluster_theta)
 
     # E11: per-window het target plays the role of F (.finb) for eval-by-F tooling.
     if het_tgt is not None and finb is None:
