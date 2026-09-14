@@ -99,21 +99,89 @@ dispersion (0.13–0.22 vs. ≫1 target) is unaffected by this correction
 and remains a real, separate gap — under-dispersed coverage, not
 resolved by anything in this round.
 
-**Default `--indel-density` is left unchanged** (2.65e-3) — it was
-originally calibrated against the indel-affected-fraction target, and
-re-tuning it now would trade that hit for a partial fix on a metric
-that structurally can't be fully closed by this knob anyway (see
-above). Not silently re-tuned to chase a number it can't actually fix.
+**Default `--indel-density` was left unchanged in the first pass above,
+then revised later the same day — see the addendum below.**
 
-## Training readiness, reassessed
+## Addendum (same day): decoupling maize from cassava
+
+The comparison above mixed two different things in one number: an
+*organism* (maize vs. cassava, different real indel-affected targets)
+and a *mating structure* (inbred vs. het, paired arbitrarily with
+maize/cassava respectively). Prompted by a review question — should
+maize be calibrated on its own first, since it's this project's actual
+training target, before treating cassava as a secondary generalization
+check — the two were separated cleanly.
+
+**Maize alone (inbred, NAM-founder-like), both real maize targets
+simultaneously** (indel-affected ~39.3%, either-covered ~71.6%):
+a `--indel-density` sweep, averaged over 6–8 seeds at
+K=24/sites=8192 to control for real seed-to-seed noise (std ≈
+1.7–2.2pp at this scale — itself worth knowing when reading any single
+validation run), found the joint-error-minimizing density at
+**~2.2–2.3e-3**: indel-affected ≈35.2%, either-covered ≈64.8% (errors
+≈4–7pp on each target, both directions, roughly balanced) — a real,
+modest improvement over the original 2.65e-3 default's ≈39%/≈63%
+(≈0pp / ≈−8.6pp — nearly exact indel-affected but a much worse
+either-covered miss). **Default `--indel-density` changed from
+2.65e-3 to 2.3e-3** on this basis (`simulate()` and `--indel-density`'s
+CLI default both updated; help text revised to cite this joint
+calibration).
+
+**Cassava alone (het, outcrossing-like), as the generalization
+check** (indel-affected ~32.7%, either-covered ~72.1%): the *same*
+knob cannot get close on both. The either-covered target is reachable
+— density ≈3.5e-3 gives either-covered ≈70.9% (within ~1.2pp of
+72.1%) — but at that density indel-affected is ≈47.1%, **14.4
+percentage points above** cassava's own 32.7% target, a much larger
+and cleaner miss than maize's. This is the clearest evidence yet for
+the root cause identified earlier: heterozygous individuals draw h1
+and h2's structural-variant state *independently*, so reaching
+real-world joint coverage loss requires far more aggregate deletion
+than the population's true indel-affected rate would suggest — and no
+single density value resolves that tension, for either organism, but
+it is far sharper for the outcrossing (het) case than the inbred case.
+
+**Conclusion**: decoupling maize and cassava was the right move
+methodologically (removes a real confound, and correctly reflects that
+maize — not cassava — is this project's actual training target), but
+it does not, by itself, close the gap. It sharpens the case for the
+one concrete follow-up already identified: add correlated/clustered
+deletion structure across IBD-adjacent founders to `_indel_tracts`.
+Until that lands, no single `--indel-density` value — organism-specific
+or otherwise — will jointly satisfy both real acceptance criteria for
+an outcrossing organism; an inbred-line organism like maize gets much
+closer (as shown above) because h1≡h2 removes the independence problem
+entirely.
+
+Also fixed in this pass, for consistency with the either-covered fix
+above: "indel-affected ref bp" had the same (smaller) row-conditioning
+bias — computed by dedup over sites *this window's own h1/h2 happened
+to cover*, rather than the true population-wide rate. `_indel_chunk`
+now also returns `(n_deleted, n_founder_sites)` from the already-
+materialized `dist_kt` array (all K founders x all R sites, no extra
+computation cost), and `_print_indel_summary` prints both the corrected
+TRUE genome-wide rate and the old row-conditioned one (relabeled, kept
+as a secondary diagnostic). `simulate()`'s `true_cov_out` return grew
+from a 4-tuple to a 6-tuple accordingly. One new hand-verified exact
+assertion added to `test_indel_chunk_tiny_exact`; 49/49 tests still
+pass.
+
+## Training readiness, reassessed (updated per the addendum)
 
 Previously: hold off, because the model looked nearly indistinguishable
 from the pre-indel simulator on the metrics that mattered. That
 conclusion doesn't hold anymore — the model **is** measurably
 different and much closer to real-data coverage-loss behavior than it
-appeared. Two real gaps remain before training: coverage dispersion is
-still flat (not blotchy), and het individuals still show ~9pp more
-joint coverage than real cassava data. Whether these are worth fixing
-before training, versus training now and treating them as a documented
-limitation, is a real tradeoff — not attempted here; flagged for
-discussion rather than decided unilaterally.
+appeared, especially for maize (this project's actual training target):
+indel-affected ≈35% vs. 39.3%, either-covered ≈65% vs. 71.6%, both
+within ~5–7pp after the default-density fix. Two real gaps remain
+before training on maize-shaped data specifically: coverage dispersion
+is still flat (not blotchy), and maize's either-covered is still ~7pp
+under target. Cassava-shaped (het) data has a materially bigger,
+better-understood gap (the independence-of-homologs issue above) and
+would need the correlated-deletion follow-up before it's a good
+training target regardless of density tuning. Whether the maize-side
+gaps are worth closing before training, versus training now on maize
+data and treating them as a documented limitation, is a real tradeoff
+— not attempted here; flagged for discussion rather than decided
+unilaterally.

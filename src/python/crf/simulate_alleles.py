@@ -752,6 +752,14 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
     2026-09-14 during a calibration sweep: that row-conditioned number
     stayed flat near 97% even as `--indel-density` tripled the realized
     indel-affected fraction).
+
+    Also returns `(n_deleted, n_founder_sites)` -- the population
+    marginal deletion rate over ALL K founders x ALL R sites (from
+    `dist_kt`, already fully materialized here). This is the correct,
+    unconditioned "indel-affected reference bp" measurement; the
+    `_print_indel_summary` QC line of that name is instead computed
+    from emitted rows (dedup by site THIS individual's h1/h2 happened
+    to cover), a smaller instance of the same row-conditioning bias.
     """
     dist_lin = _anchor_distance(del_lin)                     # [n,M,R]
     dist_kt = _gather_by_lineage(dist_lin, lineage)           # [n,K,R]
@@ -767,6 +775,14 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
     pres2 = dist_kt[ii, h2, tt] <= anchor_thresh
     n_either = int((pres1 | pres2).sum())
     n_hemi = int((pres1 != pres2).sum())
+    # Population marginal deletion rate, over ALL K founders x ALL R sites
+    # (dist_kt is already fully materialized here) -- unconditioned on any
+    # one individual's own coverage, unlike the "indel-affected ref bp" QC
+    # line derived from emitted rows (that one dedups by site THIS
+    # individual's h1/h2 happened to cover, a smaller version of the same
+    # row-conditioning bias n_either/n_hemi/n_null were added to fix).
+    n_deleted = int((dist_kt > anchor_thresh).sum())
+    n_founder_sites = dist_kt.size
     n_null = int((~pres1 & ~pres2).sum())
     ins1 = ins_lin[ii, m1, tt]
     ins2 = ins_lin[ii, m2, tt]
@@ -809,7 +825,8 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
         lab2_out[w, r] = h2[w, t].astype(np.int8)
         refpos_out[w, r] = t
 
-    return tern_out, dist_out, lab1_out, lab2_out, refpos_out, short, n_either, n_hemi, n_null
+    return (tern_out, dist_out, lab1_out, lab2_out, refpos_out, short,
+            n_either, n_hemi, n_null, n_deleted, n_founder_sites)
 
 
 def simulate(rng, windows, sites, founders, min_cross, max_cross,
@@ -821,7 +838,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              emit_snp_panel=False, inbreeding_per_window=None,
              breeding_classes=None, class_inbred_frac=0.5,
              constant_pair_frac=0.0, constant_inbred_frac=0.5, chunk=1000,
-             simulate_indels=False, indel_density=2.65e-3, indel_ins_frac=0.5,
+             simulate_indels=False, indel_density=2.3e-3, indel_ins_frac=0.5,
              indel_large_frac=0.027, indel_small_alpha=1.7, indel_small_max=50,
              indel_large_logmean=8.6, indel_large_logsd=1.6,
              indel_max_len=65536, indel_coverage=2.0,
@@ -853,9 +870,10 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
     coordinates instead.
 
     Final return value `true_cov_out` is `None` unless `simulate_indels`,
-    in which case it is `(n_either, n_hemi, n_null, n_total)` int counts,
-    summed over the FULL R-site generation region across every window --
-    the correct genome-wide "either true founder has support" measure
+    in which case it is `(n_either, n_hemi, n_null, n_total, n_deleted,
+    n_founder_sites)` int counts, summed over the FULL R-site generation
+    region across every window -- the correct genome-wide "either true
+    founder has support" and "indel-affected reference bp" measures
     PLAN.md SS2.7 targets, deliberately NOT derivable from the T-row
     output alone (see `_indel_chunk`'s docstring: a site with both
     homologs' founders absent emits zero rows by construction, so it is
@@ -899,6 +917,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
 
     refpos_out = short_out = None
     true_either_sum = true_hemi_sum = true_null_sum = true_total_sum = 0
+    true_deleted_sum = true_founder_sites_sum = 0
     if simulate_indels:
         R = indel_region_mult * T
         ncol = 2 * K + 2
@@ -996,7 +1015,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 theta=sharing_theta, max_lineages=max_lin,
                 lineage=lineage, lineage_M=M, per_gamete=True)
 
-            tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null = _indel_chunk(
+            (tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null,
+             n_deleted, n_founder_sites) = _indel_chunk(
                 rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                 match1, match2, gamete_balance, indel_coverage,
                 indel_ins_read_per_bp, indel_max_stack, indel_anchor_thresh,
@@ -1013,6 +1033,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             true_hemi_sum += n_hemi
             true_null_sum += n_null
             true_total_sum += n * R
+            true_deleted_sum += n_deleted
+            true_founder_sites_sum += n_founder_sites
             continue
 
         # ---- non-indel chunk body: UNCHANGED from before this feature ----
@@ -1113,7 +1135,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 np.rint(rmap), 1, 127).astype(np.int8)
 
     true_cov_out = (None if not simulate_indels else
-                    (true_either_sum, true_hemi_sum, true_null_sum, true_total_sum))
+                    (true_either_sum, true_hemi_sum, true_null_sum, true_total_sum,
+                     true_deleted_sum, true_founder_sites_sum))
     return out, ibd, ind_out, panel, het_tw, cls_w, refpos_out, short_out, true_cov_out
 
 
@@ -1224,12 +1247,19 @@ def parse_args():
                         "structure (mean event ~530bp, bp-dominant class 4-64kb) needs "
                         "a much larger --sites (8192+) to be meaningfully represented "
                         "in a single window.")
-    p.add_argument("--indel-density", type=float, default=2.65e-3,
+    p.add_argument("--indel-density", type=float, default=2.3e-3,
                    help="Indel events per reference bp per lineage (ins+del combined). "
-                        "Calibrated against real maize founder gVCFs to hit the "
-                        "measured ~39%% indel-affected-reference-bp target -- see "
-                        "experiments/simulator-indels/results/indel_biology_notes.md. "
-                        "Re-tune if --indel-ins-frac or the length-mixture params change.")
+                        "Calibrated against BOTH real maize acceptance targets jointly "
+                        "(indel-affected-reference-bp ~39%%, either-founder-covered "
+                        "~71.6%% for inbred/NAM-founder-like individuals -- these two "
+                        "targets pull the fit in opposite directions as density changes, "
+                        "so this value is a deliberate balance, not an exact hit on "
+                        "either one -- see "
+                        "experiments/simulator-indels/results/calibration_sweep_2026-09-14.md "
+                        "and results/indel_biology_notes.md for the maize numbers. "
+                        "Re-tune if --indel-ins-frac or the length-mixture params change, "
+                        "or set independently for a different organism (e.g. cassava's "
+                        "own ~32.7%%/~72.1%% targets).")
     p.add_argument("--indel-ins-frac", type=float, default=0.5,
                    help="Fraction of indel events that are insertions relative to "
                         "reference; 0.5 reproduces the measured ~0.99:1 ins:del symmetry.")
@@ -1341,15 +1371,23 @@ def _print_indel_summary(args, data, refpos, short, out_path, refpos_path, true_
 
     # Deletion state is a pure function of (window, site, founder) -- ANY
     # row at a shared site carries the same deletion truth -- so a plain
-    # first-occurrence dedup is exact, not an approximation.
+    # first-occurrence dedup is exact, not an approximation. NOTE: still
+    # conditioned on THIS individual's h1/h2 having covered the site at
+    # all (a smaller instance of the same row-conditioning bias the old
+    # either-covered stat had) -- see the TRUE genome-wide line below.
     site_tern = flat_tern[first_idx]
     indel_affected = float((site_tern == TERN_DEL).mean())
-    print(f"  indel-affected ref bp: {indel_affected*100:.2f}%  "
-          f"(measured maize target ~39.3%, cassava ~32.7% -- "
-          f"experiments/simulator-indels/results/indel_biology_notes.md)")
+    print(f"  indel-affected ref bp (rows only, see TRUE line below): "
+          f"{indel_affected*100:.2f}%")
 
     if true_cov is not None:
-        n_either, n_hemi, n_null, n_total = true_cov
+        n_either, n_hemi, n_null, n_total, n_deleted, n_founder_sites = true_cov
+        if n_founder_sites > 0:
+            print(f"  indel-affected ref bp TRUE (genome-wide, all K founders "
+                  f"x all {n_total:,} R-site positions): "
+                  f"{n_deleted / n_founder_sites * 100:.2f}%  "
+                  f"(measured maize target ~39.3%, cassava ~32.7% -- "
+                  f"experiments/simulator-indels/results/indel_biology_notes.md)")
         if n_total > 0:
             print(f"  either-founder TRUE covered (genome-wide, all "
                   f"{n_total:,} R-site positions): {n_either / n_total * 100:.2f}%  "

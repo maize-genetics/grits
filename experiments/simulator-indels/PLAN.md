@@ -198,6 +198,25 @@ unaffected by this correction and remains open. Full writeup:
 `results/phase1_validation_2026-09-11.md` with a superseded-finding
 note, without rewriting its history).
 
+### 2026-09-14 — Maize/cassava decoupled; --indel-density default changed to 2.3e-3
+
+Follow-up to the same-day either-covered fix above. The prior
+calibration mixed two different things (organism AND mating structure)
+into one comparison; decoupled per review feedback: maize (inbred,
+this project's actual training target) calibrated against BOTH its
+real targets jointly via a multi-seed density sweep, landing on
+**`--indel-density` default changed 2.65e-3 → 2.3e-3** (joint error
+~4–7pp on each of indel-affected/either-covered, vs. the old default's
+~0pp/~9pp imbalance). Cassava (het) checked separately as the
+generalization check it was meant to be: confirmed the SAME root cause
+(no correlated deletion across IBD-adjacent founders) produces a much
+sharper, cleaner tension there — no density value gets cassava within
+~10pp of both its own targets simultaneously. Also fixed the smaller,
+analogous row-conditioning bias in the "indel-affected ref bp" QC line
+(now has a TRUE genome-wide version too, same pattern as either-covered).
+49/49 tests still pass. Full numbers:
+`results/calibration_sweep_2026-09-14.md`'s "Addendum" section.
+
 ## 1. Why this work exists
 
 Two confirmed root causes from this project's RIL2 founder-path

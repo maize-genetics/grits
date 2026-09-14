@@ -664,7 +664,7 @@ def test_indel_chunk_tiny_exact():
     n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
     T = 8
     rng = np.random.default_rng(0)
-    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null = _indel_chunk(
+    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
         rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
         gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
         anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
@@ -683,13 +683,16 @@ def test_indel_chunk_tiny_exact():
     # present (n_either=R=6); only site2 is hemizygous (h1's founder
     # absent there, h2's present); nothing is nullizygous.
     assert (n_either, n_hemi, n_null) == (6, 1, 0)
+    # Population marginal deletion: K=2 founders x R=6 sites = 12 total
+    # (founder,site) pairs; only founder0 (lineage0) at site2 is deleted.
+    assert (n_deleted, n_founder_sites) == (1, 12)
 
 
 def test_indel_chunk_shape_dtype():
     n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
     T = 5
     rng = np.random.default_rng(1)
-    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null = _indel_chunk(
+    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
         rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
         gamete_balance=0.5, coverage=2.0, ins_read_per_bp=2e-3, max_stack=64,
         anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
@@ -714,7 +717,7 @@ def test_indel_chunk_rare_shortfall_pads_and_flags():
     match2 = np.zeros((n, R, K), dtype=np.int8)
     T = 50
     rng = np.random.default_rng(2)
-    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null = _indel_chunk(
+    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
         rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
         gamete_balance=0.5, coverage=0.0, ins_read_per_bp=0.0, max_stack=1,
         anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
@@ -735,7 +738,7 @@ def test_indel_chunk_ternary_never_one_where_deleted_fuzz():
         h2 = rng.integers(0, K, size=(n, R))
         match1 = (rng.random((n, R, K)) < 0.3).astype(np.int8)
         match2 = (rng.random((n, R, K)) < 0.3).astype(np.int8)
-        tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null = _indel_chunk(
+        tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
             rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
             gamete_balance=0.5, coverage=2.0, ins_read_per_bp=2e-3,
             max_stack=64, anchor_thresh=0, ref_founder=-1,
@@ -752,7 +755,7 @@ def test_indel_chunk_insertion_stacking_appears_with_enough_budget():
     n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
     T = 8
     rng = np.random.default_rng(4)
-    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null = _indel_chunk(
+    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
         rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
         gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
         anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
