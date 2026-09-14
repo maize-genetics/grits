@@ -1,5 +1,20 @@
 # Phase 1 indel model — implementation + real-data validation
 
+> **Superseded finding (2026-09-14, see
+> `calibration_sweep_2026-09-14.md`)**: this report's
+> "either-founder covered" numbers (~97.5–97.7% vs. a 70–75% target)
+> were measured with a QC stat that turned out to be structurally
+> blind to the phenomenon it claimed to measure (row-conditioned
+> dedup, which can't see sites where both homologs are absent — those
+> emit zero rows by construction). The corrected, genome-wide
+> measurement gives 62–81% depending on scenario — much closer to
+> target, in a directionally-explicable way. The "either-founder
+> covered ~97% vs. 70–75%, essentially unchanged from baseline"
+> conclusion below is **not accurate** — see the 2026-09-14 doc for the
+> real numbers and root-cause analysis. Everything else in this report
+> (indel-affected fraction, size distribution, coverage dispersion,
+> padding rate) is unaffected by this correction and still stands.
+
 2026-09-11. Implements `PLAN.md` §5 Phase 1 ("Simulator core") behind
 `--simulate-indels` in `src/python/crf/simulate_alleles.py`. This
 document reports the actual measured numbers from running the new

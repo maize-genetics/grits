@@ -166,6 +166,38 @@ own bar.** §5 item 1 updated accordingly below.
 
 ---
 
+### 2026-09-14 — Calibration sweep found a real bug in the either-covered QC stat
+
+Requested calibration follow-up on the 2026-09-11 report's two failing
+criteria. Found that "either-founder covered" was measured wrong, not
+merely uncalibrated: it deduplicated over *emitted output rows*, but a
+site where both homologs' founders are absent emits zero rows by
+construction (no DNA to sample), so the stat was structurally blind to
+the exact phenomenon it claimed to measure — proved via a
+`--indel-density` sweep that left it flat at ~97% while tripling the
+realized indel-affected fraction. Fixed in `simulate_alleles.py`:
+`_indel_chunk` now also returns true genome-wide `(n_either, n_hemi,
+n_null)` counts (over the full R-site region, not just output rows);
+`simulate()`'s return arity is 8→9 (`simulate_wholegenome.py` updated
+to match); `_print_indel_summary` prints the corrected stat, clearly
+labeled, alongside the old row-conditioned one (kept as a secondary
+diagnostic, relabeled). One new hand-verified exact assertion added to
+`test_indel_chunk_tiny_exact`; 49/49 tests still pass.
+
+Corrected numbers land much closer to target: inbred 62.17% vs. 71.6%
+target, het 80.72% vs. 72.1% target (was reported as ~97% vs. both —
+a ~25pp gap that was actually ~9pp in each direction). Confirmed the
+remaining gap can't be closed by `--indel-density` alone (lowering it
+fixes inbred but pushes het further over target, and undershoots the
+indel-affected-fraction target) — it needs correlated/clustered
+deletion structure across IBD-adjacent founders in `_indel_tracts`
+(currently draws per-lineage independently), a scoped follow-up, not a
+broad recalibration. Coverage dispersion (0.13–0.22 vs. ≫1 target) is
+unaffected by this correction and remains open. Full writeup:
+`results/calibration_sweep_2026-09-14.md` (also annotates
+`results/phase1_validation_2026-09-11.md` with a superseded-finding
+note, without rewriting its history).
+
 ## 1. Why this work exists
 
 Two confirmed root causes from this project's RIL2 founder-path
@@ -508,22 +540,29 @@ layer actually built, not just biological calibration input.
 
 ## 5. Future work (items 2–4 not started — each phase needs its own review/approval)
 
-1. **Simulator core — code complete, acceptance criteria not yet met
-   (2026-09-11).** Indel-tract generator (§2.1, §2.2, §2.4),
-   offset/distance tracking, read-sampling/coverage layer (§2.5), and
-   soft recombination suppression near tracts (§2.6, not hard
-   breakpoint-snapping — see §2.6/§6) implemented in
-   `simulate_alleles.py` behind `--simulate-indels`, with the new
-   `2K+2` layout (§2.3) and existing (flag-off) behavior preserved
-   byte-identically (golden-hash regression test). 49 unit tests pass.
-   **Not yet done by this section's own bar**: a real validation run
-   does not meet the either-founder-covered (~97% vs. 70–75% target) or
-   coverage-dispersion (0.13–0.22 vs. ≫1 target) acceptance criteria —
-   see the dated §0 entry and `results/phase1_validation_2026-09-11.md`
-   for the full numbers and root-cause analysis. Next step for this
-   item, if picked back up: a calibration round targeting those two
-   specific gaps (likely `--indel-coverage`, `--indel-ins-read-per-bp`,
-   and/or correlated deletion structure between IBD-adjacent founders),
+1. **Simulator core — code complete, close to but not yet at
+   acceptance criteria (2026-09-11, corrected 2026-09-14).**
+   Indel-tract generator (§2.1, §2.2, §2.4), offset/distance tracking,
+   read-sampling/coverage layer (§2.5), and soft recombination
+   suppression near tracts (§2.6, not hard breakpoint-snapping — see
+   §2.6/§6) implemented in `simulate_alleles.py` behind
+   `--simulate-indels`, with the new `2K+2` layout (§2.3) and existing
+   (flag-off) behavior preserved byte-identically (golden-hash
+   regression test). 49 unit tests pass. **Not yet done by this
+   section's own bar, but closer than first measured**: the
+   2026-09-11 validation run's either-founder-covered number (~97% vs.
+   70–75% target) turned out to be measuring the wrong thing (see the
+   2026-09-14 §0 entry) — the corrected genome-wide measurement gives
+   62.17% (inbred) / 80.72% (het) vs. a 70–75% target, ~9pp off in
+   each direction, not ~25pp. Coverage dispersion (0.13–0.22 vs. ≫1
+   target) is a real, separate, still-open gap. See
+   `results/calibration_sweep_2026-09-14.md` for the full numbers and
+   root-cause analysis. Next step for this item, if picked back up:
+   add correlated/clustered deletion structure across IBD-adjacent
+   founders to `_indel_tracts` (confirmed this is what's needed —
+   `--indel-density` alone cannot close the either-covered gap without
+   trading off the indel-affected-fraction target), plus a separate
+   pass on coverage dispersion (`--indel-ins-read-per-bp` and friends);
    not a rewrite of the architecture already built.
 2. **Training-side format updates.** Full design now in
    [`TRAINING_PLAN.md`](TRAINING_PLAN.md) — reframed (2026-09-09, see

@@ -711,7 +711,7 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   max_stack, anchor_thresh, ref_founder, dist_scale):
     """Assemble one chunk's indel-mode output:
     `(tern, dist [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T] int32,
-    short [n] bool)`.
+    short [n] bool, n_either int, n_hemi int, n_null int)`.
 
     `h1`/`h2`/`lineage`/`del_lin`/`ins_lin`/`match1`/`match2` are all
     indexed over the R-site GENERATION region; the output arrays are
@@ -737,6 +737,21 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
     real rows is padded with the module's sentinel constants
     (`TERN_PAD`/`DIST_PAD`/`LABEL_PAD`) -- flagged via the returned
     `short` array for the caller's QC reporting, not silently absorbed.
+
+    Also returns `(n_either, n_hemi, n_null)` -- int counts, over the
+    FULL `[n,R]` generation region (not the T-row output), of sites
+    where h1's or h2's own true founder is structurally present/absent.
+    This is the metric PLAN.md SS2.7's real-data "either true founder
+    has a read" target actually refers to. It is DELIBERATELY not
+    derived from the emitted T-row output: a site where BOTH homologs'
+    founders are absent can never produce a row (there is no DNA left
+    to sample a colinear read from), so any row-conditioned measurement
+    -- e.g. dedup-and-check over `refpos`/output rows -- structurally
+    excludes exactly the sites this metric needs to count, and reads a
+    misleadingly high ~97% regardless of the true rate (confirmed
+    2026-09-14 during a calibration sweep: that row-conditioned number
+    stayed flat near 97% even as `--indel-density` tripled the realized
+    indel-affected fraction).
     """
     dist_lin = _anchor_distance(del_lin)                     # [n,M,R]
     dist_kt = _gather_by_lineage(dist_lin, lineage)           # [n,K,R]
@@ -750,6 +765,9 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
     m2 = lineage[ii, h2, tt]
     pres1 = dist_kt[ii, h1, tt] <= anchor_thresh
     pres2 = dist_kt[ii, h2, tt] <= anchor_thresh
+    n_either = int((pres1 | pres2).sum())
+    n_hemi = int((pres1 != pres2).sum())
+    n_null = int((~pres1 & ~pres2).sum())
     ins1 = ins_lin[ii, m1, tt]
     ins2 = ins_lin[ii, m2, tt]
 
@@ -791,7 +809,7 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
         lab2_out[w, r] = h2[w, t].astype(np.int8)
         refpos_out[w, r] = t
 
-    return tern_out, dist_out, lab1_out, lab2_out, refpos_out, short
+    return tern_out, dist_out, lab1_out, lab2_out, refpos_out, short, n_either, n_hemi, n_null
 
 
 def simulate(rng, windows, sites, founders, min_cross, max_cross,
@@ -833,6 +851,15 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
     1:1 with reference sites) -- use the `.refpos.npy`-equivalent
     return value (`refpos_out`) to join rows back to reference
     coordinates instead.
+
+    Final return value `true_cov_out` is `None` unless `simulate_indels`,
+    in which case it is `(n_either, n_hemi, n_null, n_total)` int counts,
+    summed over the FULL R-site generation region across every window --
+    the correct genome-wide "either true founder has support" measure
+    PLAN.md SS2.7 targets, deliberately NOT derivable from the T-row
+    output alone (see `_indel_chunk`'s docstring: a site with both
+    homologs' founders absent emits zero rows by construction, so it is
+    invisible to any row-conditioned measurement).
     """
     K = founders
     T = sites
@@ -871,6 +898,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
     ind_out = ind if (grouped or breeding) else None
 
     refpos_out = short_out = None
+    true_either_sum = true_hemi_sum = true_null_sum = true_total_sum = 0
     if simulate_indels:
         R = indel_region_mult * T
         ncol = 2 * K + 2
@@ -968,7 +996,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 theta=sharing_theta, max_lineages=max_lin,
                 lineage=lineage, lineage_M=M, per_gamete=True)
 
-            tern, dist, lab1, lab2, refpos, short = _indel_chunk(
+            tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null = _indel_chunk(
                 rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                 match1, match2, gamete_balance, indel_coverage,
                 indel_ins_read_per_bp, indel_max_stack, indel_anchor_thresh,
@@ -981,6 +1009,10 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             ibd[sl] = np.transpose(lineage, (0, 2, 1)).astype(np.int8)
             refpos_out[sl] = refpos
             short_out[sl] = short
+            true_either_sum += n_either
+            true_hemi_sum += n_hemi
+            true_null_sum += n_null
+            true_total_sum += n * R
             continue
 
         # ---- non-indel chunk body: UNCHANGED from before this feature ----
@@ -1080,7 +1112,9 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             out[start:start + n, :, K + 2] = np.clip(
                 np.rint(rmap), 1, 127).astype(np.int8)
 
-    return out, ibd, ind_out, panel, het_tw, cls_w, refpos_out, short_out
+    true_cov_out = (None if not simulate_indels else
+                    (true_either_sum, true_hemi_sum, true_null_sum, true_total_sum))
+    return out, ibd, ind_out, panel, het_tw, cls_w, refpos_out, short_out, true_cov_out
 
 
 def parse_args():
@@ -1266,13 +1300,16 @@ def parse_args():
     return p.parse_args()
 
 
-def _print_indel_summary(args, data, refpos, short, out_path, refpos_path):
+def _print_indel_summary(args, data, refpos, short, out_path, refpos_path, true_cov):
     """--simulate-indels verification summary: the real empirical
     validation of PLAN.md SS2.7's acceptance criteria, not just "the code
-    ran". All stats are computed per UNIQUE (window, reference site) --
+    ran". Most stats are computed per UNIQUE (window, reference site) --
     deduplicated across any stacked rows sharing a site -- via a single
     combined-key trick, not a per-window Python loop, so this stays fast
-    even at large --windows.
+    even at large --windows. `true_cov` (from `simulate()`'s return) is
+    the one exception: a genuinely correct "either true founder covered"
+    reading needs the FULL R-site generation region, not just sites that
+    produced an output row -- see `_indel_chunk`'s docstring.
     """
     K = args.founders
     tern = data[:, :, :K]
@@ -1311,9 +1348,34 @@ def _print_indel_summary(args, data, refpos, short, out_path, refpos_path):
           f"(measured maize target ~39.3%, cassava ~32.7% -- "
           f"experiments/simulator-indels/results/indel_biology_notes.md)")
 
-    # "Either true founder covered": per UNIQUE site, was ANY row there
-    # (stacked or not) a real match (ternary==1) to h1's or h2's founder --
-    # a max-reduction over the rows sharing that site, via np.maximum.at.
+    if true_cov is not None:
+        n_either, n_hemi, n_null, n_total = true_cov
+        if n_total > 0:
+            print(f"  either-founder TRUE covered (genome-wide, all "
+                  f"{n_total:,} R-site positions): {n_either / n_total * 100:.2f}%  "
+                  f"(measured target ~70-75% for outbred individuals -- "
+                  f"PLAN.md SS2.7; this is the metric that target refers to, "
+                  f"see 'either-founder covered (rows only)' below for why it "
+                  f"differs from that number)")
+            print(f"  hemizygous / nullizygous ref sites (genome-wide, TRUE): "
+                  f"{n_hemi / n_total * 100:.2f}% / {n_null / n_total * 100:.2f}%  "
+                  f"(one vs. both true homologs structurally absent; hemi is "
+                  f"exactly 0 whenever --inbreeding=1.0 since h1==h2 then by "
+                  f"construction)")
+
+    # "Either true founder covered (rows only)": per UNIQUE OUTPUT-ROW
+    # site, was any row there (stacked or not) a real match (ternary==1)
+    # to h1's or h2's founder -- a max-reduction via np.maximum.at. This
+    # is DELIBERATELY not the SS2.7 target metric -- it's conditioned on
+    # a row existing at all, and a site where both homologs are absent
+    # can never produce a row, so it structurally cannot see that case
+    # and reads a near-tautological ~97% regardless of true coverage
+    # (confirmed 2026-09-14: flat near 97% across a 4x --indel-density
+    # sweep that tripled the true indel-affected fraction). Kept as a
+    # secondary diagnostic -- "of the reads we did sample, how often did
+    # genotyping-error noise corrupt which founder they matched" -- not
+    # as the SS2.7 acceptance check; see the TRUE genome-wide line above
+    # for that.
     row_ids = np.arange(flat_lab1.size)
     m1v = flat_tern[row_ids, flat_lab1] == TERN_MATCH
     m2v = flat_tern[row_ids, flat_lab2] == TERN_MATCH
@@ -1321,37 +1383,8 @@ def _print_indel_summary(args, data, refpos, short, out_path, refpos_path):
     site_covered = np.zeros(uniq_keys.size, dtype=np.int8)
     np.maximum.at(site_covered, inv, covered_row)
     either_covered = float(site_covered.mean())
-    print(f"  either-founder covered: {either_covered*100:.2f}%  "
-          f"(measured target ~70-75% for outbred individuals -- today's "
-          f"non-indel simulator gives ~96%; PLAN.md SS2.7)")
-
-    # Hemizygous/nullizygous, AMONG COVERED (>=1 row) SITES ONLY -- per
-    # unique site, is h1's founder deleted, h2's founder deleted, both, or
-    # neither (using the SAME dedup key, since deletion truth doesn't
-    # depend on which row is sampled). Two real caveats, not bugs:
-    #  (1) at --inbreeding=1.0 (the CLI default) h1==h2 always, so del1
-    #      and del2 are the SAME founder's deletion state at every site
-    #      -> hemi is 0 by construction, not a measurement of anything.
-    #      Pass --inbreeding < 1 for a real hemizygous read.
-    #  (2) a genuinely NULLIZYGOUS site (both true homologs absent) emits
-    #      ZERO rows by construction (no colinear read is possible from
-    #      an absent homolog) -- it can never appear in `refpos`/`valid`,
-    #      so this dedup-over-emitted-rows count structurally CANNOT see
-    #      it and will read ~0% regardless of the true rate. The nearest
-    #      proxy for true genome-wide absence is the coverage-rate line
-    #      below (fraction of the R-site generation region that produced
-    #      any output at all).
-    lab1_site, lab2_site = flat_lab1[first_idx], flat_lab2[first_idx]
-    del1 = site_tern[np.arange(site_tern.shape[0]), lab1_site] == TERN_DEL
-    del2 = site_tern[np.arange(site_tern.shape[0]), lab2_site] == TERN_DEL
-    hemi = (del1 ^ del2).mean()
-    null = (del1 & del2).mean()
-    print(f"  hemizygous / nullizygous ref sites (among COVERED sites only): "
-          f"{hemi*100:.2f}% / {null*100:.2f}%  (one vs. both true homologs "
-          f"structurally absent; hemi is exactly 0 whenever --inbreeding=1.0 "
-          f"since h1==h2 then by construction; null is structurally "
-          f"invisible here -- a nullizygous site emits zero rows so it "
-          f"never enters this dedup -- see coverage-rate line below instead)")
+    print(f"  either-founder covered (rows only, NOT the SS2.7 metric -- "
+          f"see TRUE line above): {either_covered*100:.2f}%")
 
     R = args.sites * args.indel_region_mult
     coverage_rate = float(uniq_keys.size / (data.shape[0] * R))
@@ -1461,7 +1494,7 @@ def main():
                   "class 4-64kb) -- consider --sites 8192 or larger so a window can "
                   "represent more than one indel-affected region.")
 
-    data, ibd, ind, panel, het_tgt, cls, refpos, short = simulate(
+    data, ibd, ind, panel, het_tgt, cls, refpos, short, true_cov = simulate(
         rng, args.windows, args.sites, args.founders,
         args.min_crossovers, args.max_crossovers,
         args.inbreeding, args.allele_sharing, args.bad_frac,
@@ -1535,7 +1568,7 @@ def main():
               f"{frac[0]*100:.0f}/{frac[1]*100:.0f}/{frac[2]*100:.0f}/{frac[3]*100:.0f}%")
 
     if args.simulate_indels:
-        _print_indel_summary(args, data, refpos, short, out_path, refpos_path)
+        _print_indel_summary(args, data, refpos, short, out_path, refpos_path, true_cov)
         return
 
     # Verification summary
