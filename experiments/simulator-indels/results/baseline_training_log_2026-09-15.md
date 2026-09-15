@@ -287,6 +287,132 @@ see whether accuracy actually climbs toward a comparable range with
 enough data, or whether a real optimization gap remains even once data
 volume is no longer a confound.
 
+## A fourth mismatch found the same way: batch size, and the EarlyStopping trap
+
+Systematically diffing every CLI default between `train_diploid.py` and
+`train_diploid_indel.py` (prompted by asking "anything else we should
+change") turned up one more real gap: `--batch-size` defaults to **64**
+in both scripts — the established comparison models were trained at
+batch=64, T=512. This baseline effort had been at batch=4→16→32 the
+whole time, driven purely by the O(T²) memory ceiling, never actually
+matching it. batch=64 already OOMs at T=4096 with a real batch
+(confirmed: 131.9GB, over the ceiling), so added
+`--accumulate-grad-batches` (Lightning's native mechanism) to reach an
+*effective* batch of 64 without the memory cost — `src/python/crf/
+train_diploid_indel.py`, commit `9de94fb`. `--spike-skip`'s gradient-
+norm check (`on_before_optimizer_step`) already fires once per
+effective step under Lightning's own accumulation semantics, no
+changes needed there; its loss-based check reflects only the last
+micro-batch of each accumulation group, a documented, minor reduction
+in that one signal's granularity.
+
+Also hit, and worth recording precisely: **`EarlyStopping(monitor=
+"val_pair_acc", patience=10)` is hardcoded** in this script, and
+`patience` counts consecutive non-improving *validation checks*, not
+epochs. Run 17 (T=4096, batch=32, small 3,000-window dataset) used
+`--val-check-interval 15` for faster feedback — but since `val_pair_acc`
+stayed at literal `0.000` for a long stretch early in training (getting
+*both* haplotypes right is much harder than either one alone, especially
+this early), that frequent checking meant EarlyStopping's patience
+budget (150 steps) burned through long before the model had a real
+chance to show pair-level progress, silently ending the run at
+`exit: 0` with a printed "Best checkpoint" line that looked like normal
+completion, not a crash. Fixed for later runs with a much higher
+`--patience` (60) whenever using a small `--val-check-interval` — the
+deeper fix (changing what's monitored, e.g. to `val_hap_acc` or
+`val_loss`, which show real signal earlier) is a real design decision,
+flagged but not made.
+
+## Regenerating at the established scale (100,000 windows)
+
+Regenerated `maize_indel_baseline_het_t4096_full.npy` at 100,000
+windows (T=4096, `--inbreeding 0`, matching the established recipe's
+scale exactly — up from the 3,000 this baseline effort had used
+throughout). QC held steady at this scale (either-covered 72.78% vs.
+73.56% at 3,000 windows, same target band — the calibration wasn't an
+artifact of the smaller dataset). Generation took ~2 hours on this
+heavily-loaded shared machine (CPU contention with other users' jobs,
+load average consistently ~17-19 throughout).
+
+**Runs 18-19, launched in parallel** (per-GPU, to isolate the data-size
+question from the batch-size question rather than combine them into
+one very long test): `train18.log` ("v14-100k-batch32", real batch=32,
+no accumulation, GPU1) and `train19.log` ("v14-100k-batch64acc", batch=32
++ `--accumulate-grad-batches 2`, effective batch=64, GPU0). Both:
+`--homo-penalty 3 --spike-skip --ema --lr 1e-4 --warmup-steps 500
+--precision bf16-mixed --val-check-interval 250 --patience 60`.
+
+**Immediate, dramatic confirmation that more data was the right fix**:
+run 18's *first* validation checkpoint (13% into epoch 0) already
+showed `val_pair_acc=0.135, val_hap_acc=0.326` — matching what run 15
+(3,000-window dataset) only reached at the very *end* of its full
+5-epoch run. More data accelerated convergence by roughly an order of
+magnitude in wall-clock/step terms, not just marginally.
+
+**Then a real divergence between the two configs.** Run 18 (batch=32,
+no accumulation) climbed to a peak of `pair_acc=0.189, hap_acc=0.416`
+around 32% into epoch 0, then declined for what looked like 4
+consecutive checkpoints (`0.187→0.121→0.081→0.0597`) before I killed
+it on the assumption this was a repeat of the earlier instability
+pattern. **Correction, found only after the fact**: the very next
+checkpoint (not yet visible when the kill decision was made) showed a
+strong recovery to `pair_acc=0.248, hap_acc=0.438`, its best reading
+yet — the trajectory was genuinely noisy/oscillating
+(`0.135→0.189→0.187→0.121→0.081→0.0597→0.248`), not a clean sustained
+decline. The kill wasn't reversed (already sent), and the overall
+decision to prioritize run 19 stands on its own merits, but the
+specific "4 consecutive declines = collapse" read that motivated it
+was wrong — a real instance of exactly the "read the loss curve, don't
+over-interpret a short window of it" lesson this log already has,
+applied insufficiently patiently this time.
+
+Run 19 (batch=32 + accumulate=2, effective batch=64), by contrast,
+climbed cleanly with zero regressions across 4 consecutive checkpoints
+(`0.00013→0.130→0.206→0.216→...`) over the same wall-clock window,
+despite having done roughly a third as many real optimizer steps as
+run 18 at comparable points (accumulation halves the update rate) —
+a genuinely cleaner trajectory even accounting for the run-18 recovery.
+Run 19 (`diploid-indel-baseline-maize-v14-100k-batch64acc`) is the one
+left running.
+
+## Founder-affinity: revisited after checking memory, not assumed away
+
+When asked why founder-affinity wasn't in use, the reasoning given
+(modest ~2-2.5pp `hap_acc` gain on synthetic eval, per
+`diploid_affinity_training.md`) undersold it badly. The user's own
+recollection of a much larger real-data benefit was confirmed by
+searching memory and the repo:
+`grits_workdir/results/tripsacum_affinity_comparison.md` shows
+**+10-42 percentage points `pair_acc`** on real-genome-derived
+(Tripsacum assembly) evaluation, with the file's own stated conclusion
+that the synthetic number "gives a ~10-42 percentage point gain in our
+Tripsacum tests specifically." Two more independent instances
+(NAM founders +15-33pp, cassava +43.5pp mean) point the same direction.
+**Lesson**: a synthetic held-out eval number and a real-data number can
+tell genuinely different stories for the same mechanism — don't let
+the synthetic-eval framing stand in for "how much this matters" without
+checking whether real-data evaluation exists and says something
+different.
+
+`train_diploid_indel.py` already has full founder-affinity support
+built in (`IndelFounderPathEncoder`'s `ext_dim`/`ext_emb`
+conditioning, `IndelDiploidAffinityDataset`, `make_indel_diploid_
+affinity_splits`, `--founder-affinity` CLI flag) — no code needed.
+`IndelDiploidAffinityDataset` derives its per-individual affinity
+signal directly from the data's own ternary MATCH view (no separate
+sidecar required), as long as consecutive blocks of G windows in the
+file are genuine "individuals" sharing a restricted founder subset —
+confirmed `--windows-per-individual`/`--min-founders`/`--max-founders`
+are correctly threaded through `simulate_alleles.py`'s
+`--simulate-indels` branch (both `h1` and `h2` path-building use
+`_build_paths_subset` under `grouped`, verified by reading the code,
+not assumed). Regenerating `maize_indel_baseline_het_t4096_affinity.npy`
+(100,000 windows, `--windows-per-individual 100 --min-founders 2
+--max-founders 24`, otherwise identical to the run 18/19 data) now;
+plan is to launch `--founder-affinity --windows-per-individual 100`
+added to the run-19 (batch=32+accumulate=2) recipe once it lands, with
+run 19 itself (no affinity) continuing as the direct comparison point.
+
 ## Lessons for next time (process, not modeling)
 
 - **A shared, non-worktree checkout is not safe for concurrent agents.**
@@ -341,3 +467,22 @@ volume is no longer a confound.
   question. A single upfront diff against the comparison recipe's full
   command line would have caught all three before spending any GPU
   time, rather than one at a time after the fact.
+- **A run that looks like it's collapsing might just be noisy — don't
+  kill on a short window of checkpoints without checking one more.**
+  Run 18's "4 consecutive declines" read as a clear repeat of the
+  known instability pattern and motivated killing it; the very next
+  checkpoint (landed moments later, not checked before the kill) was
+  its best result yet. The underlying decision to prioritize the
+  cleaner run 19 still held up, but the specific evidence cited for it
+  didn't — worth one more check before treating a short streak as
+  decisive, especially given this exact investigation has already
+  shown real trajectories can be genuinely noisy rather than
+  monotonic in either direction.
+- **A synthetic benchmark number for a mechanism isn't automatically
+  "how much it matters."** Founder-affinity's ~2-2.5pp synthetic-eval
+  gain and its 10-42pp real-genome-data gain are both real, correctly-
+  measured numbers for the same mechanism — they just answer different
+  questions. Defaulting to whichever number is more conveniently on
+  hand (the synthetic one, already read earlier this session) without
+  checking whether a real-data comparison exists understated the case
+  for a mechanism that turned out to matter a great deal.
