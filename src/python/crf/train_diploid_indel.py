@@ -416,6 +416,18 @@ def parse_args():
     p.add_argument("--test-frac", type=float, default=0.10)
     p.add_argument("--limit-n", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--accumulate-grad-batches", type=int, default=1,
+                   help="Accumulate gradients over N micro-batches per optimizer "
+                        "step (Lightning's own mechanism), for an effective batch "
+                        "of --batch-size * N without the memory cost of a larger "
+                        "real batch. --spike-skip's gradient-norm check "
+                        "(on_before_optimizer_step) already fires once per "
+                        "effective step under accumulation, no changes needed "
+                        "there; its loss-based check (per micro-batch, in "
+                        "training_step) reflects only the LAST micro-batch of "
+                        "each group rather than every one -- a minor, accepted "
+                        "reduction in that one signal's granularity, not a "
+                        "correctness issue.")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--d-model", type=int, default=256)
     p.add_argument("--n-heads", type=int, default=8)
@@ -473,7 +485,11 @@ def parse_args():
     p.add_argument("--precision", default="bf16-mixed")
     p.add_argument("--max-epochs", type=int, default=5)
     p.add_argument("--val-check-interval", type=int, default=0,
-                   help="Validate every N training steps (0 = once per epoch).")
+                   help="Validate every N training steps (0 = once per epoch). "
+                        "Counts micro-batches, not effective (post-accumulation) "
+                        "optimizer steps -- with --accumulate-grad-batches > 1, "
+                        "scale this down proportionally to keep the same "
+                        "validation cadence relative to real weight updates.")
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--devices", type=int, default=1)
     p.add_argument("--run-name", default="diploid-indel-pair")
@@ -535,7 +551,8 @@ def main():
         logger=TensorBoardLogger(str(log_dir), name=args.run_name),
         accelerator="auto", devices=args.devices, precision=args.precision,
         val_check_interval=(args.val_check_interval or None),
-        gradient_clip_val=args.grad_clip)
+        gradient_clip_val=args.grad_clip,
+        accumulate_grad_batches=args.accumulate_grad_batches)
     trainer.fit(model, train_loader, val_loader, ckpt_path=args.resume)
     print(f"Best checkpoint: {callbacks[0].best_model_path}")
 
