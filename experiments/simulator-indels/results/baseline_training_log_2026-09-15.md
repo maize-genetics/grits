@@ -564,14 +564,34 @@ this session** — every prior attempt either collapsed, oscillated
 without settling, hit the padding-exploit shortcut, or was killed. A
 legitimate first working baseline, even short of the target accuracy.
 
-**Run 21 (plain, no affinity)**, still running as of this update,
-shows a starkly different trajectory: after the same fast start (its
-first checkpoint also near 0), it plateaued almost immediately around
-`pair_acc≈0.06-0.08` and has stayed there for the majority of its
-checkpoints so far (epochs 0-3), never approaching run 20's climb.
-This is the sharpest real-data-adjacent evidence yet in this log for
-founder-affinity mattering on indel-aware data specifically, not just
-on the plain SNP-only architecture it was originally validated on.
+**Run 21 (plain, no affinity) also completed all 5 epochs, no crash.**
+Best checkpoint: epoch 4, `val_pair_acc≈0.107, val_hap_acc≈0.270`
+(`d-epoch=04-val_pair_acc=0.1066.ckpt`). After the same fast start
+(first checkpoint also near 0), it plateaued almost immediately around
+`pair_acc≈0.06-0.08` for the bulk of training (epochs 0-3) before a
+late, modest climb to its final `0.107` in epoch 4 — never approaching
+run 20's trajectory or peak.
+
+**Final comparison, both runs complete:**
+
+| | best val_pair_acc | best val_hap_acc | epoch reached |
+|---|---|---|---|
+| Run 20 (founder-affinity) | **0.2082** | **0.408** | 3 |
+| Run 21 (plain) | 0.107 | 0.270 | 4 |
+| `diploid-affinity-sim512-h3` (comparison target) | ~0.58-0.62 | ~0.73-0.76 | — |
+
+Founder-affinity roughly **doubles pair_acc and adds ~14pp hap_acc**
+on this properly-restructured indel-aware data — the sharpest
+real-data-adjacent evidence yet in this log that the mechanism matters
+specifically for the indel-aware architecture, not just the plain
+SNP-only one it was originally validated on. Both numbers are well
+below the comparison target, but both runs are now **the first
+fully-completed, non-diverging indel-aware baselines** produced this
+session — every earlier attempt either collapsed, oscillated without
+settling, exploited the padding shortcut, or was killed before
+finishing. Closing the remaining gap to the target (more epochs, more
+data, or hyperparameter tuning) is the natural next step, not yet
+attempted.
 
 **Outstanding**: `slice_contigs.py` lives only in the job's ephemeral
 tmp dir, not the repo — worth moving into `src/`/`scripts/` and
@@ -671,3 +691,13 @@ used again.
   shipped was upstream of any of that: eliminate padding from the
   training data itself by construction (contig-then-slice), leaving
   `_dcrf_nll`/`_accuracy`'s unmasked behavior untouched and irrelevant.
+- **Distinguish real signal from noise with the continuous metric, not
+  the thresholded one.** Run 20's mid-training dip (5 straight
+  declining `val_pair_acc` checkpoints) looked identical in shape to
+  run 18's earlier false-collapse — but checking `val/loss` (which
+  bottomed and rose smoothly, a real if temporary trend) instead of
+  just re-reading the "don't over-react to noise" lesson from memory
+  gave an actual answer either way, rather than a coin flip on which
+  precedent applied. It turned out to be recoverable noise, but that
+  conclusion came from the loss trend, not from assuming the earlier
+  lesson generalized.
