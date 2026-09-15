@@ -413,6 +413,156 @@ plan is to launch `--founder-affinity --windows-per-individual 100`
 added to the run-19 (batch=32+accumulate=2) recipe once it lands, with
 run 19 itself (no affinity) continuing as the direct comparison point.
 
+## The padding problem: root-caused via direct checkpoint diagnostics
+
+Run 19's checkpoint (`diploid-indel-baseline-maize-v14-100k-batch64acc`,
+`pinned-2026-09-15-1552.ckpt`) was loaded directly and probed
+stratified by cell type. `_dcrf_nll` and `_accuracy()` in
+`train_diploid_indel.py` give every T position equal weight, including
+padding cells (`LABEL_PAD=-1`, remapped to founder index K, i.e.
+pair-state 324 = "both haplotypes null"). The bad checkpoint had
+**94.98% accuracy on padding cells vs. 0.07% on real cells** — it had
+learned to detect the padding sentinel's input signature
+(`TERN_PAD`/`DIST_PAD`) rather than the actual task, inflating
+`val_pair_acc` for free. A healthy comparison checkpoint showed the
+opposite (0.00% padding / 22.90% real). This also explains an earlier-
+observed anomaly where `pair_acc≈hap_acc` (both haplotypes trivially
+"agree" on padding) broke the normal `pair_acc≈hap_acc²`
+independence relationship.
+
+Padding itself traced back to `--windows-per-individual` grouping:
+each simulated window draws its own **independent** path
+(`_build_paths`, confirmed by reading the code — `seg[:,0]=
+rng.integers(0,K,nv)` with no continuity mechanism between windows at
+all, even under `--windows-per-individual` grouping, which only shares
+a restricted founder subset, not positional continuity), so a window
+short on real coverage just pads out its remaining T rows with
+sentinels. Rates observed: 1.60% (inbred, T=8192) → 8.70% (het, T=8192)
+→ 12.63-12.69% (het, T=4096) — worse for smaller T (less room to
+absorb coverage variance) and worse for heterozygous data.
+
+I initially proposed just raising `--indel-region-mult` to fix this.
+**The user corrected this**: *"I am not sure scaling up the
+indel_region_mult will have the effect. I think you need to simulate
+the full contig then batch up into windows."* This was right — no
+amount of region-size scaling fixes padding when each window is an
+independently-drawn path with no continuity to its neighbors; the
+region only controls how much material a single independent window can
+draw from, not whether windows connect to each other.
+
+## Verifying what the real pipeline actually does, before redesigning
+
+Before redesigning, a dedicated fork investigation confirmed (with
+file:line citations) what `ropebwt_npy_to_matrix.py` and
+`infer_wholegenome.py` actually do on real data, since the user
+explicitly asked to match that strategy "as much as possible":
+
+- Real `.npy` arrays are dense, bin-indexed 1:1 to the reference
+  (`ropebwt_npy_to_matrix.py:65-67`), architecturally different from
+  this simulator's sparse/coverage-driven row axis.
+- Real windowing (`ropebwt_npy_to_matrix.py:139-146`) is
+  `while start+window_size<=len(idx): window=...; start+=step_size` —
+  **it drops the trailing partial window per contig and never pads.**
+  This directly answered the user's question "can't you just fill with
+  the first few values from the next bin/position?" — no, the real
+  pipeline doesn't do that either; it just discards the remainder.
+- CRF Viterbi decode genuinely runs over the full chromosome
+  (`infer_wholegenome.py::decode_chrom`, 79k-158k real sites per
+  chromosome, 2.9-10.6s each), confirming the "smooth out the edge
+  issues" intuition — but critically, **the Transformer encoder itself
+  is never run on long sequences, even at inference time.** It runs on
+  short 512-row sliding windows (stride 256), stitched via center-crop
+  boundaries (`_ownership`); only the resulting cheap per-position CRF
+  scores get concatenated for one long Viterbi decode. Chromosome-scale
+  smoothing comes entirely from stitching short-window encodings at
+  decode time, not from training the encoder on long sequences — which
+  meant training at T=4096/8192 was solving a problem the real pipeline
+  doesn't actually have, on top of causing the O(T²) memory/instability
+  problems documented above.
+- `simulate_wholegenome.py` already demonstrates the right pattern:
+  `simulate(windows=NC, sites=T)` with NC small (few chromosomes) and T
+  large (one long contig per window) — no core simulator changes
+  needed, just a new post-processing slicing step.
+
+## Runs 20-21: contig-simulate-then-slice redesign, with the padding problem gone
+
+**New data pipeline**, matching the real pipeline's own convention
+exactly: simulate one long, continuous 60,000-site contig per
+individual (`simulate_alleles.py --sites 60000 --windows 1000
+--founders 24 --min-crossovers 2 --max-crossovers 6 --inbreeding 0
+--gamete-balance 0.5 --sharing-model coalescent --sharing-theta 4.0
+--simulate-indels --seed 42 --windows-per-individual 1 --min-founders 2
+--max-founders 24` → `maize_indel_contigs_raw.npy`, shape
+(1000,60000,50), 3.00GB), then slice each individual's contig into
+non-overlapping T=512 windows with a new script
+(`slice_contigs.py`, not yet committed — currently in the job tmp dir),
+discarding each individual's trailing short remainder, exactly matching
+`ropebwt_npy_to_matrix.py`'s own windowing loop. Every individual is
+truncated to the same number of sub-windows G (the minimum across all
+1000 individuals) so `IndelDiploidAffinityDataset`'s
+`len(data) % G == 0` grouping assumption holds and `--windows-per-
+individual G` means exactly what it says, with no accidental
+cross-individual grouping. Verified correct on a hand-built synthetic
+test (3 individuals, 20/22/24 real rows, T=5 → G=4, exact content
+reconstruction) before trusting it on real data.
+
+Result: **padding dropped to 0.10%** (from 8.7-12.7% at the old
+per-window scale) — the redesign fixes the padding problem
+structurally, at the source, with no loss-masking code change needed.
+`maize_indel_sliced_affinity.npy`: shape (94000,512,50), G=94 (limited
+by one individual with only 94 sub-windows' worth of real coverage;
+others ranged up to 117), real rows/individual min=48,370
+max=60,000 mean=59,988.
+
+This also incidentally undid the O(T²) attention-memory problem
+entirely — back at T=512 (the established comparison recipe's own
+sequence length), real batch=64 fits with no
+`--accumulate-grad-batches` workaround needed.
+
+**Two runs launched in parallel** (GPU1/GPU0), both `--num-parents 24
+--batch-size 64 --workdir indel_baseline --time-local-emis --lr 1e-4
+--warmup-steps 500 --precision bf16-mixed --spike-skip --ema
+--homo-penalty 3 --val-check-interval 250 --patience 40 --max-epochs 5`
+against `maize_indel_sliced_affinity.npy` (N=94,000,
+train=75,200/val=9,400/test=9,400, 1175 steps/epoch):
+- **Run 20** (`train20.log`, PID 253611): `diploid-indel-baseline-maize-v15-sliced-affinity`
+  — adds `--founder-affinity --windows-per-individual 94`.
+- **Run 21** (`train21.log`, PID 253728): `diploid-indel-baseline-maize-v15-sliced-plain`
+  — otherwise identical, no affinity.
+
+Both survived their first steps cleanly, no OOM (confirming the
+T=512/batch=64 memory math). **Training speed jumped dramatically**:
+~3.3-3.8 it/s steady-state vs. the T=4096/8192 runs' much slower pace —
+roughly **~5 minutes/epoch instead of ~3 hours**, so a full 5-epoch run
+now finishes in well under an hour instead of most of a day.
+
+First three validation checkpoints (steps 250/500/750, of 5875 total
+over 5 epochs):
+
+| step | run 20 (affinity) pair_acc / hap_acc | run 21 (plain) pair_acc / hap_acc |
+|------|---------------------------------------|-------------------------------------|
+| 250  | 0.000 / 0.00334                       | 0.000 / 0.000                        |
+| 500  | 0.0204 / 0.238                        | 0.0017 / 0.132                       |
+| 750  | 0.145 / 0.384                         | *(pending as of this log update)*    |
+
+Both are climbing fast and cleanly with no oscillation/collapse
+observed so far — qualitatively different from every T=4096/8192 run
+in this log. Run 20 (affinity) is ahead of run 21 (plain) at both
+checkpoints so far, an early echo of the real-data affinity advantage
+documented above, though it's far too early in training (both still in
+epoch 0 of 5) to treat this gap as conclusive. Comparison target
+(`diploid-affinity-sim512-h3`): pair_acc ~0.58-0.62, hap_acc
+~0.73-0.76. Both runs are being monitored to their first checkpoint
+files and beyond; this section will be updated as results land.
+
+**Outstanding**: `slice_contigs.py` lives only in the job's ephemeral
+tmp dir, not the repo — worth moving into `src/`/`scripts/` and
+committing once these runs confirm the approach was worth it. No code-
+level fix was made to `_dcrf_nll`/`_accuracy`'s unmasked-padding
+behavior (found unnecessary given the redesign eliminates padding at
+the source) — a residual, lower-priority item if padded data is ever
+used again.
+
 ## Lessons for next time (process, not modeling)
 
 - **A shared, non-worktree checkout is not safe for concurrent agents.**
@@ -486,3 +636,20 @@ run 19 itself (no affinity) continuing as the direct comparison point.
   hand (the synthetic one, already read earlier this session) without
   checking whether a real-data comparison exists understated the case
   for a mechanism that turned out to matter a great deal.
+- **Match the real pipeline's actual mechanics, not an intuitive guess
+  at them.** My first fix for padding (scale up
+  `--indel-region-mult`) and my first read of "smooth out the edges"
+  (train the encoder on long sequences) were both plausible and both
+  wrong — verified by actually reading `ropebwt_npy_to_matrix.py` and
+  `infer_wholegenome.py` rather than reasoning from the general shape
+  of what a windowed CRF pipeline "should" do. The real fix (simulate
+  one continuous contig per individual, then slice with a drop-not-pad
+  rule, matching the real windowing loop exactly) came from the user's
+  direct correction, not from extending my own analysis further.
+- **A structural fix at the data-generation source can dissolve a bug
+  that looked like it needed a loss-masking code change.** The padding-
+  contamination bug (bad checkpoints exploiting sentinel detection) was
+  fully diagnosed at the model/loss level, but the actual fix that
+  shipped was upstream of any of that: eliminate padding from the
+  training data itself by construction (contig-then-slice), leaving
+  `_dcrf_nll`/`_accuracy`'s unmasked behavior untouched and irrelevant.
