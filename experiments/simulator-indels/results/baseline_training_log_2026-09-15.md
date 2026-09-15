@@ -545,15 +545,33 @@ over 5 epochs):
 | 500  | 0.0204 / 0.238                        | 0.0017 / 0.132                       |
 | 750  | 0.145 / 0.384                         | *(pending as of this log update)*    |
 
-Both are climbing fast and cleanly with no oscillation/collapse
-observed so far — qualitatively different from every T=4096/8192 run
-in this log. Run 20 (affinity) is ahead of run 21 (plain) at both
-checkpoints so far, an early echo of the real-data affinity advantage
-documented above, though it's far too early in training (both still in
-epoch 0 of 5) to treat this gap as conclusive. Comparison target
-(`diploid-affinity-sim512-h3`): pair_acc ~0.58-0.62, hap_acc
-~0.73-0.76. Both runs are being monitored to their first checkpoint
-files and beyond; this section will be updated as results land.
+Comparison target (`diploid-affinity-sim512-h3`): pair_acc ~0.58-0.62,
+hap_acc ~0.73-0.76.
+
+**Run 20 (founder-affinity) completed all 5 epochs, no crash.** Best
+checkpoint: epoch 3, `val_pair_acc=0.2082, val_hap_acc=0.408`
+(`d-epoch=03-val_pair_acc=0.2082.ckpt`). Trajectory across its ~24
+validation checkpoints: a fast initial climb to `pair_acc=0.145` by
+checkpoint 3 (750 steps), then a genuine dip — confirmed via `val/loss`
+(not just the noisier accuracy metric), which bottomed at 224 then rose
+to a 239-240 plateau across 5 straight checkpoints while train/loss
+kept falling, a real early-training wobble, not sustained overfitting —
+before recovering and climbing steadily through epochs 2-3 to its
+`0.2082` peak, then drifting back down slightly (`0.199→0.168`) over
+its final epoch. This is well below the comparison target, but it's
+the **first fully-completed, non-diverging indel-aware training run
+this session** — every prior attempt either collapsed, oscillated
+without settling, hit the padding-exploit shortcut, or was killed. A
+legitimate first working baseline, even short of the target accuracy.
+
+**Run 21 (plain, no affinity)**, still running as of this update,
+shows a starkly different trajectory: after the same fast start (its
+first checkpoint also near 0), it plateaued almost immediately around
+`pair_acc≈0.06-0.08` and has stayed there for the majority of its
+checkpoints so far (epochs 0-3), never approaching run 20's climb.
+This is the sharpest real-data-adjacent evidence yet in this log for
+founder-affinity mattering on indel-aware data specifically, not just
+on the plain SNP-only architecture it was originally validated on.
 
 **Outstanding**: `slice_contigs.py` lives only in the job's ephemeral
 tmp dir, not the repo — worth moving into `src/`/`scripts/` and
