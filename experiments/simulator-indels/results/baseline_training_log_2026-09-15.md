@@ -250,11 +250,42 @@ which is what actually made room for a batch large enough to average
 out per-window variance. Growing batch alone at the original T hit
 that ceiling much sooner.
 
-**Status at time of writing**: run 17 still in progress, being watched
-through epoch 2+ to confirm this doesn't repeat run 5's pattern of
-looking good early and collapsing later. Not yet safe to call this
-solved — only that it's clearly the most promising configuration found
-so far, by a wide margin.
+Run 17 continued cleanly through epoch 2 (20% in: `val/hap_acc` had
+settled to a small plateau around 0.0696–0.0698, loss tightened further
+into a ~400–1300 band, no spikes) — confirms the oscillation problem is
+genuinely fixed, not just delayed past where run 5 collapsed.
+
+## A third, separate gap: training-set size never matched the comparison recipe
+
+**6-7% `val/hap_acc` is low in absolute terms, and the stability fix
+above does not explain that away.** Random guessing across K=24
+founders (+1 null state) gives ~4% — 7% is only ~1.7x above chance,
+nowhere near the established `diploid-affinity-sim512-h3` comparison
+model's `pair_acc=57.6%` by the end of *epoch 0 alone* (final
+`hap_acc` 73-76%). Investigating this surfaced a third real gap, on
+the same level as the `--inbreeding` mismatch and the O(T²) memory
+issue, and — same pattern as both of those — not caught until directly
+asked about rather than checked upfront: **`maize_indel_baseline*.npy`
+was generated with `--windows 3000` the entire time**, picked somewhat
+arbitrarily when first generating data for this baseline effort,
+never checked against what the actual comparison recipe used. The
+established recipe trains on **100,000 windows** (1000 individuals ×
+100 windows each) — over 30x more. Even accounting for the new T=4096
+windows being 8x longer than the old T=512 ones (more sites seen per
+window), total site-exposure is still roughly `2400×4096 ≈ 9.8M`
+(this run's train split) vs. `80,000×512 ≈ 41M` (the comparison
+recipe's) — a real ~4x gap in raw training signal on top of whatever
+optimization gap may remain.
+
+**Regenerating at 100,000 windows** (`maize_indel_baseline_het_t4096_full.npy`,
+same T=4096/`--inbreeding 0`/K=24/density=2.3e-3/seed=42 otherwise) to
+match the established recipe's scale — in progress at time of writing,
+expected ~20GB, likely a long generation given the 33x window-count
+increase. Once it lands, relaunch with the same T=4096/batch=32/
+homo-penalty=3/spike-skip/ema recipe that proved stable in run 17, and
+see whether accuracy actually climbs toward a comparable range with
+enough data, or whether a real optimization gap remains even once data
+volume is no longer a confound.
 
 ## Lessons for next time (process, not modeling)
 
@@ -299,3 +330,14 @@ so far, by a wide margin.
   either extrapolated alone — because they address the same underlying
   O(T²) cost from two directions (shrink it, and spend the savings on
   averaging).
+- **Check every dimension of the comparison baseline upfront, not one
+  at a time as each gets questioned.** Three real mismatches against
+  `diploid-affinity-sim512-h3` surfaced in this investigation —
+  `--inbreeding` composition, the T=8192 sequence length vs. its
+  T=512, and now training-set size (3,000 windows generated here vs.
+  its 100,000) — and none were caught by checking the recipe before
+  generating data; each was found only after a symptom (an unstable
+  run, then a suspiciously low accuracy number) prompted a direct
+  question. A single upfront diff against the comparison recipe's full
+  command line would have caught all three before spending any GPU
+  time, rather than one at a time after the fact.
