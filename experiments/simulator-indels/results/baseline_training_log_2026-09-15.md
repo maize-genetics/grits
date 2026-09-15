@@ -30,6 +30,10 @@ used `src/python/crf/train_diploid_indel.py` against
 | 11 | `train10.log` ("v8-fp32-nopenalty") | `--precision 32-true`, no penalty | 6% into epoch 0 | Killed, same reason as #10 |
 | 12 | `train11.log` ("v9-repeat") | Exact repeat of run 5's config | 6% into epoch 0 | Killed, same reason as #10 |
 | 13 | `train12.log` ("v10-weakpenalty") | `--homo-penalty 0.3` (weak) | 6% into epoch 0 | Killed, same reason as #10 |
+| 14 | `train14.log` ("v11-het") | `--inbreeding 0` data, established recipe restored (homo-penalty=3 back on) | Validation frozen bit-for-bit across 5 checkpoints (500 steps); loss oscillating, zero spike-skip interventions | Killed — data composition fix was necessary but not sufficient, see "Run 14" below |
+| 15 | `train15.log` ("v12-batch16") | `--batch-size 16` (up from 4), same T=8192 het data | Fits (75.5GB); loss band narrower, `val/hap_acc` climbing slowly (0.0042→0.0111) | Left running for comparison, not killed |
+| 16 | `train16.log` ("v13-t4096-batch64") | T halved to 4096, `--batch-size 64` | OOM on first real step (131.9GB) | Too ambitious even with T halved |
+| 17 | `train17.log` ("v13-t4096-batch32") | T=4096, `--batch-size 32` | **Cleanest result so far** — smooth 10-checkpoint climb in `val/hap_acc`, tight/descending loss band | Still running, being watched through later epochs — see "Runs 15–17" below |
 
 ## Run 1–2: environment and memory, before any real training happened
 
@@ -158,22 +162,99 @@ directly by PID) before completing a single epoch, rather than
 continue testing hyperparameters against training data with the wrong
 mating-structure composition.
 
-## Current state (in progress at time of writing)
+## Run 14 ("v11-het"): correct data composition alone is not sufficient
 
-Regenerating the training set with `--inbreeding 0` (matching the
-established comparison recipe) — same K=24/sites=8192/windows=3000/
-`--simulate-indels`/seed=42 otherwise. Once that lands, the plan is to
-relaunch with the *original*, unmodified established recipe
-(`--homo-penalty 3 --spike-skip --ema --lr 1e-4 --warmup-steps 500
---precision bf16-mixed`) — homo-penalty=3 should now be appropriate
-again, since the data will no longer be uniformly homozygous. Whether
-this also resolves the epoch-1 collapse seen in run 5 is still an open
-question; if it recurs even on correctly-composed data, that points at
-something else (the confirmed loss/gradient scaling with the longer
-T=8192 sequence length remains a live, not-yet-ruled-out candidate —
-see the prioritized follow-up list already given in-session for
-sub-window training, fp32, and lower-LR as the next things to test
-cleanly, one variable at a time, once this data lands).
+Data regenerated with `--inbreeding 0` (`maize_indel_baseline_het.npy`;
+QC: either-founder-covered 73.56%, right in the 70–75% target band).
+Relaunched with the untouched established recipe (`--homo-penalty 3
+--spike-skip --ema --lr 1e-4 --warmup-steps 500 --precision bf16-mixed
+--batch-size 4`). Instrumented with `--val-check-interval 100` (and
+later `100`→ finer, see below) instead of the default once-per-epoch,
+specifically to get faster feedback than a full ~17-minute epoch.
+
+**Result: validation was frozen bit-for-bit identical across 5
+checkpoints spanning 500 steps** (`val/pair_acc=0.000148`,
+`val/hap_acc=0.0239`, unchanged every single check). At 500 steps —
+half the EMA's ~1000-step effective window (`--ema-decay 0.999`) — EMA
+lag alone can't explain a completely flat reading. Raw training loss
+confirmed a real problem: oscillating persistently between healthy-
+looking low values (43–350) and large spikes (1.4k–9.7k) from the very
+first steps, never settling — and **`train/skipped` never appeared even
+once** in 156+ steps, despite the obvious swings. Root cause:
+`--spike-skip` flags a step as a spike only if it exceeds
+`loss_spike_mult × a slow-moving EMA of loss` (`train_diploid_indel.py`
+`training_step`) — built for a rare outlier against a stable baseline.
+Here the swings *are* the steady-state behavior, so the EMA-of-loss
+itself gets dragged up by them and the detector goes blind. Fixing the
+`--inbreeding` mismatch was necessary but not sufficient — there is a
+second, independent instability. Killed once this was established with
+enough checkpoints to rule out EMA lag as the explanation.
+
+## The real mechanism: O(T²) self-attention, not O(T) or the 2x format width
+
+Traced directly in `train_crf.py`'s `IndelFounderPathEncoder.forward`:
+`self.fpool` (a `MultiheadAttention` pooling step) attends only across
+the K=24 founders per site — cheap, doesn't scale with T. But
+`self.pos_encoder = nn.TransformerEncoder(...)` (called on `h` shaped
+`[B,T,d_model]`, no mask) is genuine self-attention across the full
+T-length sequence — **O(T²) memory**, not O(T). With this script's
+defaults (`d_model=256, n_heads=8, n_layers=6`), one layer's attention-
+weight tensor alone at T=8192/batch=64 is
+`64 × 8 × 8192 × 8192 × 2 bytes (bf16) ≈ 68.7 GB` — before backward-pass
+storage or the other 5 layers, already explaining most of run 2's OOM.
+Contrast the two scaling factors directly: the ternary+distance format
+width (K+2 → 2K+2) is **2x**; the sequence-length jump (T=512 → T=8192,
+the deployed baseline's window length vs. this project's indel-mode
+window length) is **256x (16²) for this specific component**. The
+format-width increase — the one change that's actually about
+indels — is a rounding error next to the architecture running at 16x
+the sequence length it was ever tuned at. (Caveat: modern PyTorch can
+dispatch to a memory-efficient/flash-attention kernel that avoids
+materializing the full dense matrix; the real number could be smaller
+than this back-of-envelope estimate if that's engaged here — not
+profiled directly. The *order-of-magnitude gap* between the 2x and
+256x factors holds regardless.)
+
+This reframes run 14's oscillation mechanistically: at T=8192, one
+training window is a huge, highly variable unit (either-covered is
+only ~74%, so windows differ a lot in how much real signal they carry),
+and `--batch-size 4` (forced down from 64 by the OOM above) means one
+unlucky window is a quarter of a step's gradient signal with nothing to
+average it out. `--grad-clip` doesn't fix this — it bounds gradient
+*magnitude*, not the fact that the gradient *direction* is a
+different, high-variance sample every step at this batch size.
+
+## Runs 15–17: batch size and window length, tested directly
+
+| # | Run / log | Config | Result |
+|---|---|---|---|
+| 15 | `train15.log` ("v12-batch16") | T=8192 (het data), `--batch-size 16` (up from 4) | Fits (75.5GB, no OOM). Loss band narrower than batch=4 (spikes now ~1.2k–5.2k, not into the tens of thousands), `val/hap_acc` climbing slowly but really (0.0042→0.0111 over 4 checkpoints) — batch size clearly helps, doesn't fully fix it |
+| 16 | `train16.log` ("v13-t4096-batch64") | T=4096 (halved), `--batch-size 64` | **OOM on the first real optimizer step** — 131.9GB, over the ceiling; too ambitious even with T halved |
+| 17 | `train17.log` ("v13-t4096-batch32") | T=4096, `--batch-size 32` | Fits comfortably (77.7GB). **Cleanest result of the whole investigation** — see below |
+
+Run 17's `val/hap_acc` across 10 consecutive checkpoints (spanning
+~150 steps, most of 2 epochs at 75 steps/epoch): `0.0662, 0.0663,
+0.0666, 0.0673, 0.0676, 0.0682, 0.0686, 0.0691, 0.0698, 0.0696` —
+smooth, monotonic, real progress, no oscillation in the metric itself.
+Already 6x higher than run 15's comparable-point reading. Loss band is
+also tighter and trending down (settles into ~1.3k–3.4k after an
+initial ~5.3k, vs. run 15's wider and less-improving swings).
+`val/pair_acc` (both haplotypes correct jointly, the harder target)
+remains 0.000 throughout — expected this early, not itself a red flag.
+
+**Halving T and spending the freed memory on batch size compound
+rather than substitute for each other**: T=4096/batch=32 clearly beats
+T=8192/batch=16 despite using a *smaller* real batch, consistent with
+the O(T²) mechanism above — shrinking T pays down memory quadratically,
+which is what actually made room for a batch large enough to average
+out per-window variance. Growing batch alone at the original T hit
+that ceiling much sooner.
+
+**Status at time of writing**: run 17 still in progress, being watched
+through epoch 2+ to confirm this doesn't repeat run 5's pattern of
+looking good early and collapsing later. Not yet safe to call this
+solved — only that it's clearly the most promising configuration found
+so far, by a wide margin.
 
 ## Lessons for next time (process, not modeling)
 
@@ -193,3 +274,28 @@ cleanly, one variable at a time, once this data lands).
   changed the mating-structure composition too, in a way that broke an
   established, working hyperparameter (`--homo-penalty`) that had
   nothing to do with indels at all.
+- **A "fix" that only removes one confound can still leave a second,
+  independent problem standing.** Correcting `--inbreeding` was
+  necessary and clearly right, but run 14 showed it wasn't sufficient —
+  the frozen-validation/persistent-oscillation pattern was a genuinely
+  different, unrelated issue (self-attention memory/variance at
+  T=8192), not a residual symptom of the same one. Fixing a diagnosed
+  problem is not the same as confirming there's only one problem.
+- **Trace the actual memory-consuming code before estimating scaling
+  factors.** An earlier, vaguer explanation for the original OOM
+  ("CRF forward-backward retains activations across T") wasn't wrong
+  that memory scales with T, but it missed the real, dominant term —
+  `nn.TransformerEncoder`'s O(T²) self-attention, two full orders of
+  magnitude bigger than the 2x width factor from the actual format
+  change. Grepping for the attention modules and reading their call
+  shapes took a few minutes and produced a testable, falsifiable
+  number; reasoning from the general shape of "CRF + long sequence"
+  didn't.
+- **When two independent levers both plausibly help, test whether they
+  compound rather than picking one.** Batch=16 alone (same T) helped
+  partially; T=4096 alone would free memory but do nothing for
+  averaging noise on its own. Combining both (smaller T *freeing room
+  for* a much bigger batch) produced a clearly better result than
+  either extrapolated alone — because they address the same underlying
+  O(T²) cost from two directions (shrink it, and spend the savings on
+  averaging).
