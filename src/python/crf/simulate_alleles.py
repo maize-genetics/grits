@@ -613,20 +613,32 @@ def _indel_suppressed_rate(rate, del_mask, ins_bp, suppress, flank):
 
 
 def _row_counts(rng, pres1, pres2, ins1, ins2, gamete_balance, coverage,
-                 ins_read_per_bp, max_stack):
+                 ins_read_per_bp, max_stack, coverage_model="linear"):
     """Reads emitted per (window, reference site) by source (PLAN.md
     SS2.5). Replaces today's "exactly ONE read per site" convention (this
     module's own docstring, and the `active = np.where(gamete, h1, h2)`
     line in `simulate()`) with a real coverage model:
 
-      * colinear reads, per homolog: `Bernoulli(coverage * gamete_weight)
-        AND structurally present`. `gamete_weight` is `gamete_balance` for
-        H1, `1 - gamete_balance` for H2, so `coverage=1` reproduces
-        today's exactly-one-read density on average. A hemizygous site
-        (one homolog deleted) loses half its expected depth AND every
-        read there comes from the surviving homolog -- this IS the
-        "hemizygous-looking read sharing" SS2.7 acceptance criterion,
-        falling directly out of sampling rather than being special-cased.
+      * colinear reads, per homolog: `Bernoulli(P) AND structurally
+        present`, where `P` depends on `coverage_model`:
+          - "linear" (default): `P = coverage * gamete_weight`.
+            `gamete_weight` is `gamete_balance` for H1, `1 -
+            gamete_balance` for H2, so `coverage=1` reproduces today's
+            exactly-one-read density on average. At this module's own
+            defaults (`coverage=2.0, gamete_balance=0.5`), `P=1.0` --
+            every present site gets a GUARANTEED read, which is why
+            T-row windows span far less reference bp than a real window
+            of the same row count (v4 finding, see --indel-coverage-model
+            help text).
+          - "poisson" (v4): `P = 1 - exp(-coverage * gamete_weight)`, the
+            standard Lander-Waterman coverage-depth relation for a real
+            target sequencing depth `coverage` (e.g. 0.1 for 0.1x) --
+            same Bernoulli structure, properly calibrated probability.
+        A hemizygous site (one homolog deleted) loses half its expected
+        depth AND every read there comes from the surviving homolog --
+        this IS the "hemizygous-looking read sharing" SS2.7 acceptance
+        criterion, falling directly out of sampling rather than being
+        special-cased.
       * insertion reads, per homolog: `Binomial(ins_bp, ins_read_per_bp)`
         capped at `max_stack`. Inserted sequence has no reference span, so
         all of these project to the SINGLE flanking reference anchor ->
@@ -638,8 +650,14 @@ def _row_counts(rng, pres1, pres2, ins1, ins2, gamete_balance, coverage,
     where `cnt = on1 + on2 + c1 + c2`.
     """
     w1, w2 = gamete_balance, 1.0 - gamete_balance
-    on1 = (rng.random(pres1.shape) < coverage * w1) & pres1
-    on2 = (rng.random(pres2.shape) < coverage * w2) & pres2
+    if coverage_model == "linear":
+        p1, p2 = coverage * w1, coverage * w2
+    elif coverage_model == "poisson":
+        p1, p2 = 1.0 - np.exp(-coverage * w1), 1.0 - np.exp(-coverage * w2)
+    else:
+        raise ValueError(f"coverage_model must be 'linear' or 'poisson', got {coverage_model!r}")
+    on1 = (rng.random(pres1.shape) < p1) & pres1
+    on2 = (rng.random(pres2.shape) < p2) & pres2
     p = float(np.clip(ins_read_per_bp, 0.0, 1.0))
     c1 = np.minimum(rng.binomial(ins1, p), max_stack).astype(np.int32)
     c2 = np.minimum(rng.binomial(ins2, p), max_stack).astype(np.int32)
@@ -736,10 +754,58 @@ def _draw_lineages(rng, n, T, K, A, anc_cx, rate, theta, max_lineages):
     return lineage, M
 
 
+def _lineage_substitutions(rng, n, M, T, L, rate, sfs_shape):
+    """v4 "sparse" `--subst-model`: per-lineage mini-haplotype alleles with
+    genuine POSITIONAL persistence, instead of `_coalescent_feats`'s default
+    "dense" behavior of redrawing `f`/`lin_alleles` independently at every
+    single site (`rng.beta(..., size=(n,1,T,L))` / `rng.random(...) < f` at
+    `size=(n,M,T,L)`) -- a fresh coin-flip per site with no memory of where a
+    substitution "happened," so two non-IBD lineages that coincide at one
+    site have no more or less chance of coinciding at the very next site.
+    Real substitutions occur once, at one genomic position, and are visible
+    identically at every site downstream of it; this function reproduces
+    that structure directly.
+
+    Draws substitution SITE positions once per window as a Poisson process
+    along T (a genomic position either has a variant or it doesn't -- shared
+    context for every lineage there, not drawn per lineage), at `rate`
+    events/site (calibrated to the measured ~1/55bp real Oh43/CML103-vs-B73
+    SNP density, experiments/simulator-indels/results/... founder_divergence
+    -- see --subst-rate's help text). At each substitution site, draws one
+    `Beta(sfs_shape,1)` frequency and one `L`-SNP Bernoulli panel per
+    lineage -- IDENTICAL arithmetic to `_coalescent_feats`'s existing dense
+    draw, just restricted to the sparse site set rather than every site, so
+    the already-calibrated within-event match-probability shape is reused
+    unchanged. Every non-substitution site gets a constant (all-zero)
+    allele: every lineage trivially agrees there, matching real biology (no
+    polymorphism between substitution events) and giving `_coalescent_feats`
+    real spatial structure in its match/diverged output for the first time.
+
+    Returns `lin_alleles [n,M,T,L] int8`, the exact same shape/dtype
+    `_coalescent_feats` already produces internally -- a drop-in replacement
+    for its `f`/`lin_alleles` lines, so nothing downstream of that point
+    (`G = lin_alleles[wi, lineage, ti]`, the exact-match logic, `per_gamete`
+    handling) needs to change.
+    """
+    lin_alleles = np.zeros((n, M, T, L), dtype=np.int8)
+    lam = rate * T
+    cnt = rng.poisson(lam, size=n)
+    E = int(cnt.sum())
+    if E == 0:
+        return lin_alleles
+
+    cell = np.repeat(np.arange(n), cnt)
+    site = rng.integers(0, T, E)
+    f_event = rng.beta(sfs_shape, 1.0, size=(E, L))                 # [E,L]
+    alleles_event = (rng.random((E, M, L)) < f_event[:, None, :]).astype(np.int8)  # [E,M,L]
+    lin_alleles[cell, :, site, :] = alleles_event
+    return lin_alleles
+
+
 def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
                       h1, h2, rate, good, gamete, theta=None, max_lineages=None,
                       emit_panel=False, lineage=None, lineage_M=None,
-                      per_gamete=False):
+                      per_gamete=False, subst_model="dense", subst_rate=0.018):
     """Mini-haplotype match features [n, T, K] + IBD lineage labels [n, K, T].
 
     Each founder is a piecewise-constant mosaic over ancestral lineages (same
@@ -771,6 +837,14 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
     independently, since real coverage/stacking is sampled per homolog.
     `gamete` is unused in this mode. If False (default), behavior is
     bit-for-bit unchanged from before this addition.
+
+    `subst_model`: "dense" (default) draws `f`/`lin_alleles` fresh at every
+    site, exactly as before this parameter existed -- byte-identical output.
+    "sparse" (v4) instead calls `_lineage_substitutions`, giving divergence
+    real positional persistence (a substitution happens once, at one site,
+    not a fresh coin-flip every site) -- see that function's docstring.
+    `subst_rate` is `_lineage_substitutions`'s events/site Poisson rate,
+    unused when `subst_model="dense"`.
     """
     L = read_snps
     if lineage is None:
@@ -780,8 +854,13 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
             raise ValueError("lineage_M must be given alongside a precomputed lineage array")
         M = lineage_M
 
-    f = rng.beta(sfs_shape, 1.0, size=(n, 1, T, L))     # per-SNP derived freq
-    lin_alleles = (rng.random((n, M, T, L)) < f).astype(np.int8)  # [n,M,T,L]
+    if subst_model == "dense":
+        f = rng.beta(sfs_shape, 1.0, size=(n, 1, T, L))     # per-SNP derived freq
+        lin_alleles = (rng.random((n, M, T, L)) < f).astype(np.int8)  # [n,M,T,L]
+    elif subst_model == "sparse":
+        lin_alleles = _lineage_substitutions(rng, n, M, T, L, subst_rate, sfs_shape)
+    else:
+        raise ValueError(f"subst_model must be 'dense' or 'sparse', got {subst_model!r}")
 
     wi = np.arange(n)[:, None, None]
     ti = np.arange(T)[None, None, :]
@@ -821,7 +900,8 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
 
 def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   match1, match2, gamete_balance, coverage, ins_read_per_bp,
-                  max_stack, anchor_thresh, ref_founder, dist_scale):
+                  max_stack, anchor_thresh, ref_founder, dist_scale,
+                  coverage_model="linear"):
     """Assemble one chunk's indel-mode output:
     `(tern, dist [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T] int32,
     short [n] bool, n_either int, n_hemi int, n_null int)`.
@@ -902,7 +982,8 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
 
     on1, on2, c1, c2, cnt = _row_counts(rng, pres1, pres2, ins1, ins2,
                                          gamete_balance, coverage,
-                                         ins_read_per_bp, max_stack)
+                                         ins_read_per_bp, max_stack,
+                                         coverage_model)
     w, t, r, o, short = _sample_rows(cnt, T)
 
     tern_out = np.full((n, T, K), TERN_PAD, dtype=np.int8)
@@ -961,7 +1042,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              indel_recomb_flank=32, indel_anchor_thresh=0,
              indel_ref_founder=-1, indel_lineage_frac=0.15,
              indel_overlay_rate=2.3e-3, indel_overlay_mean_len=300.0,
-             indel_overlay_founder_freq=1.0):
+             indel_overlay_founder_freq=1.0, subst_model="dense",
+             subst_rate=0.018, coverage_model="linear"):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
     (default) behavior, including rng draw order, is byte-for-byte
@@ -1011,6 +1093,10 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
     if indel_model not in ("tracts", "lineage", "overlay"):
         raise ValueError(f"indel_model must be one of tracts/lineage/overlay, "
                           f"got {indel_model!r}")
+    if subst_model not in ("dense", "sparse"):
+        raise ValueError(f"subst_model must be 'dense' or 'sparse', got {subst_model!r}")
+    if coverage_model not in ("linear", "poisson"):
+        raise ValueError(f"coverage_model must be 'linear' or 'poisson', got {coverage_model!r}")
     if not coalescent:
         q = (allele_sharing * K - 1.0) / (K - 1)   # match rate for non-true founders
         if q < 0:
@@ -1146,14 +1232,15 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 rng, n, R, K, ancestors, ancestor_crossovers, derived_sfs,
                 read_snps, h1, h2, None, good, gamete=None,
                 theta=sharing_theta, max_lineages=max_lin,
-                lineage=lineage, lineage_M=M, per_gamete=True)
+                lineage=lineage, lineage_M=M, per_gamete=True,
+                subst_model=subst_model, subst_rate=subst_rate)
 
             (tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null,
              n_deleted, n_founder_sites) = _indel_chunk(
                 rng, n, R, T, K, h1, h2, lineage_indel, del_lin, ins_lin,
                 match1, match2, gamete_balance, indel_coverage,
                 indel_ins_read_per_bp, indel_max_stack, indel_anchor_thresh,
-                indel_ref_founder, DIST_LOG_SCALE)
+                indel_ref_founder, DIST_LOG_SCALE, coverage_model)
 
             out[sl, :, :K] = tern
             out[sl, :, K] = lab1
@@ -1408,6 +1495,34 @@ def parse_args():
     p.add_argument("--indel-overlay-founder-freq", type=float, default=1.0,
                    help="'overlay' --indel-model only: fraction of founders that "
                         "participate in indel generation at all (1.0 = all K).")
+    p.add_argument("--subst-model", choices=["dense", "sparse"], default="dense",
+                   help="v4: how founder divergence (match vs diverged) is generated. "
+                        "'dense' (default): today's exact behavior -- match probability "
+                        "is redrawn independently at EVERY site, no positional memory. "
+                        "'sparse': substitutions happen at sparse Poisson-selected SITE "
+                        "positions (--subst-rate), giving divergence genuine positional "
+                        "persistence -- a substitution is visible at the same site for "
+                        "every lineage, not re-rolled every site. Same within-event "
+                        "match-probability arithmetic as 'dense' (--derived-sfs, "
+                        "--read-snps), just restricted to the sparse site set.")
+    p.add_argument("--subst-rate", type=float, default=0.018,
+                   help="'sparse' --subst-model only: substitution events per reference "
+                        "bp. Default ~1/55bp, from founder_divergence_from_b73.py's "
+                        "measured Oh43/CML103-vs-B73 SNP density (16.5-18.8 SNPs/kb, "
+                        "experiments/ril2-error-regions/results/ril2_error_regions/"
+                        "DIAGNOSTICS.md) -- only two founders measured, re-tune if a "
+                        "panel-wide number becomes available.")
+    p.add_argument("--indel-coverage-model", choices=["linear", "poisson"], default="linear",
+                   help="v4: how --indel-coverage maps to a per-site read probability in "
+                        "_row_counts. 'linear' (default): today's exact behavior, "
+                        "P=coverage*gamete_weight -- at the default coverage=2.0/"
+                        "gamete-balance=0.5 this is P=1.0, a GUARANTEED read at every "
+                        "present site, which is why simulated T-row windows span far "
+                        "less reference bp than a real window of equal row count. "
+                        "'poisson': P=1-exp(-coverage*gamete_weight), the standard "
+                        "Lander-Waterman depth relation -- pass a REAL target coverage "
+                        "(e.g. 0.1 for 0.1x, matching this project's other coverage "
+                        "rungs) via --indel-coverage when using this mode.")
     p.add_argument("--indel-density", type=float, default=2.3e-3,
                    help="Indel events per reference bp per lineage (ins+del combined). "
                         "Calibrated against BOTH real maize acceptance targets jointly "
@@ -1712,6 +1827,8 @@ def main():
         indel_overlay_rate=args.indel_overlay_rate,
         indel_overlay_mean_len=args.indel_overlay_mean_len,
         indel_overlay_founder_freq=args.indel_overlay_founder_freq,
+        subst_model=args.subst_model, subst_rate=args.subst_rate,
+        coverage_model=args.indel_coverage_model,
         indel_density=args.indel_density, indel_ins_frac=args.indel_ins_frac,
         indel_large_frac=args.indel_large_frac,
         indel_small_alpha=args.indel_small_alpha,

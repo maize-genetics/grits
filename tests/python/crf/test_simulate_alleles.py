@@ -13,7 +13,7 @@ from python.crf.simulate_alleles import (
     _indel_lengths, _encode_dist, _anchor_distance, _gather_by_lineage,
     _indel_tracts, _draw_lineages, _coalescent_feats, _good_mask, simulate,
     _indel_suppressed_rate, _row_counts, _sample_rows, _indel_chunk,
-    _lineage_indels, _overlay_indels,
+    _lineage_indels, _overlay_indels, _lineage_substitutions,
 )
 
 # --- golden hashes: pre-change simulate() output on fixed args/seed, ------
@@ -911,3 +911,127 @@ def test_simulate_bad_indel_model_raises():
                  min_cross=1, max_cross=2, inbreeding=0.0, allele_sharing=0.6,
                  bad_frac=0.0, sharing_model="coalescent",
                  simulate_indels=True, indel_model="bogus")
+
+
+# --- v4: _lineage_substitutions / --subst-model / --indel-coverage-model ---
+
+def test_lineage_substitutions_shape_dtype():
+    rng = np.random.default_rng(5)
+    n, M, T, L = 3, 6, 400, 8
+    lin_alleles = _lineage_substitutions(rng, n, M, T, L, rate=0.05, sfs_shape=0.3)
+    assert lin_alleles.shape == (n, M, T, L)
+    assert lin_alleles.dtype == np.int8
+
+
+def test_lineage_substitutions_nonsubstitution_sites_are_constant_zero():
+    """Sites with no substitution event must show every lineage trivially
+    agreeing (all-zero) -- the core positional-persistence claim: divergence
+    only exists at the sparse substitution sites, not everywhere."""
+    rng = np.random.default_rng(5)
+    n, M, T, L = 2, 4, 2000, 8
+    lin_alleles = _lineage_substitutions(rng, n, M, T, L, rate=0.02, sfs_shape=0.3)
+    any_nonzero_per_site = (lin_alleles != 0).any(axis=(1, 3))  # [n,T]
+    n_subst_sites = int(any_nonzero_per_site.sum())
+    expected = 0.02 * T * n
+    assert 0 < n_subst_sites < 0.5 * T * n           # sparse, not dense
+    assert abs(n_subst_sites - expected) < 5 * (expected ** 0.5 + 1)  # loose Poisson band
+    # every site NOT flagged as a substitution site must be all-zero across the board
+    const_sites = ~any_nonzero_per_site
+    for i in range(n):
+        assert (lin_alleles[i, :, const_sites[i], :] == 0).all()
+
+
+def test_lineage_substitutions_rate_zero_is_a_no_op():
+    rng = np.random.default_rng(5)
+    lin_alleles = _lineage_substitutions(rng, 2, 4, 500, 8, rate=0.0, sfs_shape=0.3)
+    assert not lin_alleles.any()
+
+
+def test_coalescent_feats_subst_model_dense_matches_pre_change_call_signature():
+    """subst_model='dense' (default) must reproduce _coalescent_feats' output
+    exactly -- the golden-hash regression test already pins simulate()'s
+    overall output for the flag-off path; this checks the function directly
+    stays byte-identical when called with the same rng seed twice, once with
+    subst_model passed explicitly and once relying on the default."""
+    rng1 = np.random.default_rng(3)
+    rng2 = np.random.default_rng(3)
+    n, T, K, A, anc_cx = 2, 100, 6, 4, 3
+    h1 = rng1.integers(0, K, size=(n, T))
+    h2 = rng1.integers(0, K, size=(n, T))
+    rng1 = np.random.default_rng(3)  # reset after drawing h1/h2 identically for both calls
+    rng2 = np.random.default_rng(3)
+    h1b = rng2.integers(0, K, size=(n, T))
+    h2b = rng2.integers(0, K, size=(n, T))
+    good = np.ones((n, T), dtype=bool)
+    out1 = _coalescent_feats(np.random.default_rng(7), n, T, K, A, anc_cx, 0.3, 8,
+                              h1, h2, None, good, gamete=None)
+    out2 = _coalescent_feats(np.random.default_rng(7), n, T, K, A, anc_cx, 0.3, 8,
+                              h1b, h2b, None, good, gamete=None, subst_model="dense")
+    assert np.array_equal(out1[0], out2[0])  # match features identical
+
+
+def test_coalescent_feats_bad_subst_model_raises():
+    n, T, K, A, anc_cx = 1, 20, 4, 2, 2
+    h1 = np.zeros((n, T), dtype=np.int64)
+    h2 = np.zeros((n, T), dtype=np.int64)
+    good = np.ones((n, T), dtype=bool)
+    with pytest.raises(ValueError):
+        _coalescent_feats(np.random.default_rng(1), n, T, K, A, anc_cx, 0.3, 8,
+                           h1, h2, None, good, gamete=None, subst_model="bogus")
+
+
+def test_row_counts_coverage_model_poisson_matches_formula():
+    rng = np.random.default_rng(2)
+    n, R = 1, 200_000
+    pres1 = np.ones((n, R), dtype=bool)
+    pres2 = np.ones((n, R), dtype=bool)
+    ins1 = np.zeros((n, R), dtype=np.int32)
+    ins2 = np.zeros((n, R), dtype=np.int32)
+    X, w = 0.1, 0.5
+    on1, on2, c1, c2, cnt = _row_counts(rng, pres1, pres2, ins1, ins2, w, X,
+                                         0.0, 64, coverage_model="poisson")
+    expected_p = 1.0 - np.exp(-X * w)
+    assert abs(on1.mean() - expected_p) < 0.01
+    assert abs(on2.mean() - expected_p) < 0.01
+
+
+def test_row_counts_coverage_model_linear_unchanged():
+    rng1 = np.random.default_rng(2)
+    rng2 = np.random.default_rng(2)
+    n, R = 1, 50_000
+    pres1 = np.ones((n, R), dtype=bool)
+    pres2 = np.ones((n, R), dtype=bool)
+    ins1 = np.zeros((n, R), dtype=np.int32)
+    ins2 = np.zeros((n, R), dtype=np.int32)
+    out_default = _row_counts(rng1, pres1, pres2, ins1, ins2, 0.5, 2.0, 0.0, 64)
+    out_explicit = _row_counts(rng2, pres1, pres2, ins1, ins2, 0.5, 2.0, 0.0, 64,
+                                coverage_model="linear")
+    for a, b in zip(out_default, out_explicit):
+        assert np.array_equal(a, b)
+
+
+def test_row_counts_bad_coverage_model_raises():
+    rng = np.random.default_rng(1)
+    pres1 = np.ones((1, 10), dtype=bool)
+    with pytest.raises(ValueError):
+        _row_counts(rng, pres1, pres1, np.zeros((1, 10), dtype=np.int32),
+                    np.zeros((1, 10), dtype=np.int32), 0.5, 1.0, 0.0, 64,
+                    coverage_model="bogus")
+
+
+@pytest.mark.parametrize("subst_model,coverage_model", [
+    ("dense", "linear"), ("sparse", "linear"), ("dense", "poisson"), ("sparse", "poisson"),
+])
+def test_simulate_v4_flags_end_to_end(subst_model, coverage_model):
+    """All four combinations of the new v4 flags run end to end without
+    crashing and produce the same [windows,T,2K+2] output contract."""
+    K, T = 8, 200
+    out = simulate(
+        np.random.default_rng(5), windows=2, sites=T, founders=K,
+        min_cross=1, max_cross=3, inbreeding=0.0, allele_sharing=0.6,
+        bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+        sharing_theta=4.0, simulate_indels=True, indel_model="overlay",
+        indel_region_mult=8, indel_coverage=0.1 if coverage_model == "poisson" else 2.0,
+        subst_model=subst_model, subst_rate=0.02, coverage_model=coverage_model)[0]
+    assert out.shape == (2, T, 2 * K + 2)
+    assert out.dtype == np.int8
