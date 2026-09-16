@@ -524,7 +524,13 @@ def _lineage_indels(rng, n, K, M, R, lineage, frac, ins_frac, max_len):
     run_len_full = (next_end_idx - last_start_idx + 1).clip(1, max_len)
     run_len = np.take_along_axis(run_len_full, gather_idx, axis=-1)
 
-    del_mask = promote & ~is_ins
+    # A run longer than max_len must not delete more than max_len sites from
+    # its own start -- without this, a single very-long-lived lineage (real
+    # possibility under the Ewens/GEM SFS) can wipe out most of an
+    # individual's coverage in one promoted run. Matches _indel_tracts's own
+    # convention of capping an individual event's span at max_len.
+    within_cap = (pos - gather_idx) < max_len
+    del_mask = promote & ~is_ins & within_cap
     ins_bp = np.zeros((n, M, R), dtype=np.int32)
     ins_event = promote & is_ins & run_start
     ins_bp[ins_event] = run_len[ins_event]

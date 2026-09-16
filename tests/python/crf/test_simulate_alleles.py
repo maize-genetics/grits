@@ -822,6 +822,22 @@ def test_lineage_indels_promoted_run_uses_its_own_full_length():
     assert not ins_bp.any()
 
 
+def test_lineage_indels_deletion_capped_at_max_len_from_run_start():
+    """A run much longer than max_len must not have its deletion extend
+    past max_len sites from the run's own start (regression: earlier
+    version capped only the reported ins_bp/run_len VALUE, not del_mask's
+    spatial extent, so one very-long-lived lineage could delete far more
+    than max_len sites for any founder on it)."""
+    rng = np.random.default_rng(11)
+    n, K, M, R = 1, 2, 1, 5000
+    lineage = np.zeros((n, K, R), dtype=np.int32)   # both founders on lineage 0, entire region
+    max_len = 100
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=1.0,
+                                        ins_frac=0.0, max_len=max_len)
+    assert del_mask[:, 0, :max_len].all()
+    assert not del_mask[:, 0, max_len:].any()
+
+
 def test_lineage_indels_zero_frac_is_a_no_op():
     rng, lineage, n, K, M, R = _shared_lineage_fixture()
     del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=0.0,
