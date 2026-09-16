@@ -18,15 +18,64 @@ import os
 import unittest
 
 import numpy as np
+import pandas as pd
 import torch
 
 from python.crf.train_diploid import (
-    _founder_affinity, estimate_inbreeding_coef, homo_scale_from_affinity)
+    _founder_affinity, estimate_inbreeding_coef, homo_scale_from_affinity,
+    per_window_homo_scale)
 
 REALDIR = "/workdir/zrm22/HackathonJun2026/grits_workdir/data/real"
 CKPT = ("/workdir/zrm22/HackathonJun2026/grits_workdir/indel_baseline/checkpoints/"
         "diploid-indel-v3-overlay-affinity/d-epoch=04-val_pair_acc=0.6799.ckpt")
 K = 24
+
+# RIL2: real corpus FASTQs carry no per-read truth label (error_autocorrelation.py's
+# documented reason), and this session found run_one_sample.sh's --label-bed was a
+# "B73" placeholder for every sample -- NOT genuine per-region truth. Real per-bin
+# truth for RIL2 must come from the oracle mosaic reconstructor
+# (simval_oracle_bed.build_ril_mosaics, delegated to by simval_truth_labels.py's
+# bin_truth_labels/write_truth_labels, "oracle max identity error 0.0235%"),
+# already materialized as truth_labels.npy next to the cached raw.npy for these
+# 5 pairs by this session.
+RIL2_SCRATCH = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/simval_eval_fixed"
+RIL2_PAIRS = ["B73xCML103", "B73xOh43", "B97xCML103", "Il14HxB97", "Oh43xIl14H"]
+K_SOURCE, DROP_IDX, TARGET = 25, 23, 24
+
+
+def _ril2_outdir(pair):
+    return os.path.join(RIL2_SCRATCH, f"IDX-RIL2__{pair}__0.1x")
+
+
+def _have_ril2_truth():
+    return all(
+        os.path.exists(_ril2_outdir(p) + "/truth_labels.npy")
+        and os.path.exists(_ril2_outdir(p) + "/raw.npy.bins.tsv")
+        for p in RIL2_PAIRS)
+
+
+def _ril2_truth_windows(pair, window_size=512):
+    """[N,T,2] true (h1,h2) founder indices in K=24 (post drop-idx-23) space,
+    windowed with the EXACT same per-contig, non-overlapping window_size
+    chunking ropebwt_npy_to_matrix.py --window-size uses (so row N aligns
+    1:1 with the corresponding real *_ternary_k24.npy window)."""
+    outdir = _ril2_outdir(pair)
+    bins_df = pd.read_csv(f"{outdir}/raw.npy.bins.tsv", sep="\t")
+    truth = np.load(f"{outdir}/truth_labels.npy").copy()
+    truth[truth < 0] = K_SOURCE
+    keep_idx = np.array([i for i in range(K_SOURCE) if i != DROP_IDX])
+    remap = np.full(K_SOURCE + 1, TARGET, dtype=np.int64)
+    remap[keep_idx] = np.arange(TARGET)
+    truth_k24 = remap[truth]
+
+    windows = []
+    for _contig, idx in bins_df.groupby("contig", sort=False).indices.items():
+        idx = np.sort(idx)
+        start = 0
+        while start + window_size <= len(idx):
+            windows.append(truth_k24[idx[start:start + window_size]])
+            start += window_size
+    return np.stack(windows, axis=0)
 
 # (dataset, individual-file-stem, (true founder 1, true founder 2))
 SAMPLES = [
@@ -166,6 +215,124 @@ class TestRealDataEndToEndPairAccuracy(unittest.TestCase):
             with self.subTest(sample=f"{ds}/{ind}"):
                 acc = self._pair_acc(ds, ind, p1, p2)
                 self.assertGreater(acc, 0.9, f"{ds}/{ind}: pair_acc={acc:.3f}, expected >0.9")
+
+
+@unittest.skipUnless(_have_ril2_truth(), f"RIL2 oracle truth_labels.npy not found under {RIL2_SCRATCH}")
+class TestRealRIL2AffinityAndTruth(unittest.TestCase):
+    """RIL2 individuals are locally homozygous (mosaic of homozygous-founder-A
+    / homozygous-founder-B blocks), unlike INBRED (single genome-wide
+    founder) or HYB (constant heterozygous pair). Genome-wide affinity
+    can't tell that apart from a true hybrid -- both true parents read as
+    comparably elevated. This class checks the affinity signal reproduces
+    that structure against real oracle-reconstructed truth
+    (simval_oracle_bed.build_ril_mosaics), not the corpus's broken
+    per-sample "B73"-for-everyone labels.bed placeholder."""
+
+    def test_true_ril2_individuals_are_locally_homozygous(self):
+        for pair in RIL2_PAIRS:
+            with self.subTest(pair=pair):
+                truth_w = _ril2_truth_windows(pair)
+                h1, h2 = truth_w[:, :, 0], truth_w[:, :, 1]
+                valid = (h1 < K) & (h2 < K)
+                self.assertGreater(valid.mean(), 0.99, f"{pair}: too many unresolved truth sites")
+                self.assertGreater((h1 == h2)[valid].mean(), 0.999,
+                                    f"{pair}: RIL2 truth should be ~100% homozygous per site")
+
+    def test_true_ril2_switch_count_is_realistic(self):
+        """~30 switches genome-wide is the domain expectation (RIL2 breeding
+        design); a labeling bug that collapses truth to a single constant
+        founder (0 switches) or one that's pure noise (hundreds) should fail
+        this."""
+        for pair in RIL2_PAIRS:
+            with self.subTest(pair=pair):
+                truth_w = _ril2_truth_windows(pair)
+                h1 = truth_w[:, :, 0].reshape(-1)
+                valid = h1 < K
+                seq = h1[valid]
+                switches = int((seq[1:] != seq[:-1]).sum())
+                self.assertGreater(switches, 10, f"{pair}: only {switches} switches, truth looks degenerate")
+                self.assertLess(switches, 200, f"{pair}: {switches} switches, truth looks like noise")
+
+    def test_genome_wide_affinity_cannot_see_local_homozygosity(self):
+        """Documents the real limitation, doesn't just assert a number:
+        genome-wide est_F must read as "outbred" (both true parents
+        comparably elevated) even though the individual actually IS
+        homozygous everywhere -- this is why per_window_homo_scale exists."""
+        for pair in RIL2_PAIRS:
+            with self.subTest(pair=pair):
+                data = np.load(_sample_path("IDX-RIL2", pair))
+                tern = data[:, :, :K].astype(np.float32)
+                M = (tern == 1).astype(np.float32)
+                genome_rate = _founder_affinity(M.reshape(-1, K))[:, 0]
+                est_F = estimate_inbreeding_coef(genome_rate)
+                self.assertLess(est_F, 0.5,
+                                 f"{pair}: genome-wide est_F={est_F:.3f}, expected <0.5 (looks outbred)")
+
+
+@unittest.skipUnless(_have_ril2_truth() and _have_ckpt(),
+                      "RIL2 oracle truth or diploid-indel-v3-overlay-affinity checkpoint not found")
+class TestRealRIL2EndToEndPairAccuracy(unittest.TestCase):
+    """Gate for per_window_homo_scale: against real oracle truth (not the
+    broken labels.bed), it must beat both the fixed penalty and the
+    genome-wide adaptive fix by a wide margin, even though it doesn't reach
+    INBRED/HYB's ~100% (per-window real-coverage noise, see
+    per_window_homo_scale's docstring)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from python.crf.train_diploid_indel import GRITSCRFDiploidIndel
+        from python.crf.crf_kernels import _dcrf_viterbi
+        cls._dcrf_viterbi = staticmethod(_dcrf_viterbi)
+        cls.device = "cuda" if torch.cuda.is_available() else "cpu"
+        cls.model = GRITSCRFDiploidIndel.load_from_checkpoint(
+            CKPT, map_location=cls.device).eval().to(cls.device)
+
+    def _pair_acc(self, pair, homo_scale_arr):
+        data = np.load(_sample_path("IDX-RIL2", pair))
+        truth_w = _ril2_truth_windows(pair)
+        N, T, W = data.shape
+        tern = data[:, :, :K].astype(np.float32)
+        dist = data[:, :, K + 2:2 * K + 2].astype(np.float32)
+        feats = torch.tensor(np.stack([tern, dist], axis=-1), dtype=torch.float32)
+        M = (tern == 1).astype(np.float32)
+        affinity = _founder_affinity(M.reshape(-1, K))
+        ext_emb = torch.tensor(affinity, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
+
+        true_h1, true_h2 = truth_w[:, :, 0], truth_w[:, :, 1]
+        valid = (true_h1 < K) & (true_h2 < K)
+        true_lo, true_hi = np.minimum(true_h1, true_h2), np.maximum(true_h1, true_h2)
+
+        preds_lo, preds_hi = [], []
+        with torch.no_grad():
+            for s in range(0, N, 64):
+                xb = feats[s:s + 64].to(self.device)
+                eb = ext_emb[s:s + 64].to(self.device)
+                hs = torch.tensor(homo_scale_arr[s:s + 64], device=self.device, dtype=torch.float32)
+                emis_p, g, c = self.model(xb, ext_emb=eb, homo_scale=hs)
+                pred = self._dcrf_viterbi(emis_p, c, self.model.nsw_pair, self.model.stay_bonus)
+                preds_lo.append(self.model.pi[pred].cpu().numpy())
+                preds_hi.append(self.model.pj[pred].cpu().numpy())
+        pred_lo, pred_hi = np.concatenate(preds_lo), np.concatenate(preds_hi)
+        return ((pred_lo == true_lo) & (pred_hi == true_hi))[valid].mean()
+
+    def test_per_window_homo_scale_beats_genome_wide_on_ril2(self):
+        for pair in RIL2_PAIRS:
+            with self.subTest(pair=pair):
+                data = np.load(_sample_path("IDX-RIL2", pair))
+                N = data.shape[0]
+                tern = data[:, :, :K].astype(np.float32)
+                M = (tern == 1).astype(np.float32)
+
+                genome_rate = _founder_affinity(M.reshape(-1, K))[:, 0]
+                genome_scale = np.full(N, homo_scale_from_affinity(genome_rate), dtype=np.float32)
+                window_scale = per_window_homo_scale(M, neighbor_windows=15)
+
+                genome_acc = self._pair_acc(pair, genome_scale)
+                window_acc = self._pair_acc(pair, window_scale)
+                self.assertGreater(window_acc, genome_acc + 0.2,
+                                    f"{pair}: per-window ({window_acc:.3f}) should beat "
+                                    f"genome-wide ({genome_acc:.3f}) by >20pp on real RIL2")
+                self.assertGreater(window_acc, 0.3, f"{pair}: per-window pair_acc={window_acc:.3f}")
 
 
 if __name__ == "__main__":

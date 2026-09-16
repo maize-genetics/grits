@@ -186,6 +186,37 @@ def homo_scale_from_affinity(affinity_rate, inbred_thresh=0.5):
     return 0.0 if estimate_inbreeding_coef(affinity_rate) > inbred_thresh else 1.0
 
 
+def per_window_homo_scale(M, neighbor_windows=15, inbred_thresh=0.5):
+    """[N] homo_scale array, one value per window, for individuals whose true
+    zygosity VARIES along the genome (e.g. a RIL2: a mosaic of homozygous-
+    founder-A and homozygous-founder-B blocks, not a single genome-wide
+    state). homo_scale_from_affinity's genome-wide affinity pools both RIL
+    parents together and always reads as "outbred" (est_F~0.1-0.3, same
+    shape as a true F1 hybrid) -- it cannot see that each block is LOCALLY
+    homozygous. A single window (T~512 real 0.1x sites) is too noisy on its
+    own (~40% of truly-homozygous windows still read est_F<=0.5); pooling
+    the match-rate over a small window neighborhood before estimating F
+    trades resolution for signal -- real RIL2 blocks span ~50-90 windows on
+    average (see tests/python/crf/test_real_data_affinity.py), so a
+    neighborhood well under that recovers most of the local signal without
+    blurring across true breakpoints. Verified on real IDX-RIL2 data against
+    oracle-reconstructed truth (simval_oracle_bed.build_ril_mosaics):
+    neighbor_windows=1 gives ~42% mean pair_acc, =15 gives ~73%, matching
+    genome_wide's 0.95%.
+
+    M: [N,T,K] binary match indicator (feats_block from _founder_affinity's
+    caller, NOT pre-aggregated -- pooling happens here, per-window)."""
+    N = M.shape[0]
+    win_rate = M.mean(axis=1)                                     # [N,K]
+    half = neighbor_windows // 2
+    hscale = np.empty(N, dtype=np.float32)
+    for w in range(N):
+        lo, hi = max(0, w - half), min(N, w + half + 1)
+        pooled_rate = win_rate[lo:hi].mean(axis=0)
+        hscale[w] = 0.0 if estimate_inbreeding_coef(pooled_rate) > inbred_thresh else 1.0
+    return hscale
+
+
 class DiploidAffinityDataset(PreWindowedDiploidDataset):
     """Diploid dataset + a per-individual founder-affinity ext_emb [K,2], attached
     to every window of the individual (windows grouped in blocks of G). Conditions
