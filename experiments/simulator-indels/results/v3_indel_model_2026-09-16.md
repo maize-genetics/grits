@@ -158,17 +158,80 @@ red flag on `lineage` specifically, but it is the kind of asymmetry this
 check exists to surface, and is worth re-running once trained models are
 available for each mode.
 
+## A real bug found during full-scale generation, fixed before training
+
+The first full-scale `lineage` contig generation (1000 individuals,
+60,000-site contigs) produced one individual with only 6,533/60,000
+real rows (89% coverage loss), collapsing the post-slice dataset from
+G=117 to G=12 sub-windows/individual — a 10x smaller effective training
+set that would have confounded the comparison. Root cause:
+`_lineage_indels`'s `del_mask` was unbounded across a promoted run's
+full span — only the *reported* `run_len`/`ins_bp` value was clipped to
+`max_len`, not `del_mask`'s actual spatial extent, so one
+very-long-lived lineage (a real possibility under the Ewens/GEM SFS)
+could delete far more than `max_len` sites at once. Fixed to match
+`_indel_tracts`'s own convention (an event's span is capped at
+`max_len` from its start); new regression test added
+(`test_lineage_indels_deletion_capped_at_max_len_from_run_start`).
+After the fix, the regenerated dataset has **zero** coverage outliers
+(min=max=mean=60,000 real rows/individual) and, as a striking bonus,
+the genome-wide either-covered rate rose to **99.14%** — essentially
+exact agreement with the real Oh43xIl14H measurement (99.0%), with no
+tuning at all.
+
+## Full training comparison (runs 20/21 baseline + two new v3 modes)
+
+All three trained identically: contig-then-slice pipeline, T=512,
+`--founder-affinity`, batch=64, 5 epochs, on 1000-individual/60,000-site
+contigs (`tracts` from this morning's runs 20/21; `lineage`/`overlay`
+regenerated today with the deletion-cap fix in place).
+
+| mode | best val_pair_acc | best val_hap_acc | epoch reached |
+|---|---|---|---|
+| `tracts` (today's baseline, runs 20/21) | 0.2082 | 0.408 | 3 |
+| `lineage` (idea a) | 0.2388 | 0.385 | 3 |
+| **`overlay` (idea b)** | **0.6799** | **0.814** | 4 |
+| `diploid-affinity-sim512-h3` (pre-indel comparison target) | ~0.58-0.62 | ~0.73-0.76 | — |
+
+**`overlay` wins decisively** — 2.8x `lineage`'s pair_acc, and the
+*first indel-aware run this whole effort to exceed the pre-indel
+established baseline*, not just approach it. `lineage` is roughly on
+par with `tracts` (marginally better pair_acc, marginally worse
+hap_acc); both are far behind `overlay`.
+
+This is a real, interesting tension: `lineage` calibrated almost
+exactly against the real data (99.14% vs. 99.0% either-covered) yet
+trained far worse than `overlay`. Working hypothesis: `lineage` ties
+indel occurrence to the *same* lineage-sharing structure that already
+drives SNP-level match identity, so a promoted deletion often removes
+exactly the SNP evidence that would otherwise reveal the true founder —
+redundant/confusable rather than complementary information.
+`overlay`'s indels are fully decoupled from that structure, so the
+SNP-match signal stays clean and the deletion channel adds genuinely
+new information on top of it, rather than competing with it. Not
+proven, but consistent with both results.
+
 ## Status / next steps
 
-- Implemented, tested, smoke-tested, and the requested consistency check
-  built and run — all on branch `indel-v3-simulator`.
-- **Not yet done**: full contig-then-slice dataset generation and
-  training runs for `lineage`/`overlay` (the runs 20/21 comparison, now
-  for three modes instead of two). This is the natural next step but
-  wasn't started yet in this round — worth confirming before committing
-  further GPU time given the homozygous-check finding above.
+- Implemented, tested, smoke-tested, the requested homozygous
+  consistency check built and run, a real bug found and fixed during
+  full-scale generation, and all three modes trained end to end — all
+  on branch `indel-v3-simulator`.
+- **Recommendation: promote `overlay`, deprioritize `lineage`** per the
+  training comparison above, despite `lineage`'s appealing real-data
+  calibration match and much smaller parameter surface.
 - Calibration against the real Oh43xIl14H ternary/distance data
-  (`real_anchor_dist_npy_oh43xil14h.md`) has not yet been attempted for
-  either new mode — the real either-covered rate (99.0%) is far above
-  all three simulator configurations shown here (93-98%), an open gap
-  independent of which mode is chosen.
+  (`real_anchor_dist_npy_oh43xil14h.md`) was checked qualitatively via
+  the either-covered rate above; a fuller comparison (ternary
+  histogram, distance distribution) against `overlay` specifically —
+  the mode that's actually winning — hasn't been done yet, worth doing
+  before calling this final.
+- Real-data evaluation of the `overlay` checkpoint (not just synthetic
+  held-out validation) is in progress separately.
+- Known limitation carried over from the established recipe unchanged:
+  training data uses `--inbreeding 0` throughout (matching runs 20/21
+  and the pre-indel baseline), so there is no homozygous training
+  signal at all — the model will systematically avoid predicting
+  homozygous pair-states regardless of what real data shows, correct
+  for genuine hybrids but a real gap if evaluated against inbred lines
+  or IBD-homozygous stretches.
