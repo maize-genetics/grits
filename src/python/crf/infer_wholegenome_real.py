@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # .../src/python/c
 
 import python.crf.infer_wholegenome as iwg  # noqa: E402
 from python.crf.train_diploid import (  # noqa: E402
-    GRITSCRFDiploid, _founder_affinity, estimate_inbreeding_coef, homo_scale_from_affinity)
+    GRITSCRFDiploid, _founder_affinity, homo_scale_from_affinity)
 from python.bed_io.bed import output_collapse_bed  # noqa: E402
 
 SOURCE_K = 25
@@ -140,11 +140,17 @@ def main():
     ap.add_argument("--sample", required=True)
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--homo-scale", type=float, default=None,
-                     help="0.0 inbred / 0.5 ril / 1.0 hybrid -- passed straight to the model, "
-                          "unlike infer_wholegenome.py's hardcoded None (=full fixed penalty). "
-                          "Omit to auto-derive from this individual's genome-wide founder "
-                          "affinity via homo_scale_from_affinity (train_diploid.py) -- a smooth "
-                          "0/1 threshold on the background-corrected top1/top2 affinity gap.")
+                     help="0.0 for selfing-type (inbred/RIL, truly homozygous at every site) / "
+                          "1.0 for a true outbred hybrid -- passed straight to the model, unlike "
+                          "infer_wholegenome.py's hardcoded None (=full fixed penalty). A fixed "
+                          "0.5 for 'ril' (this file's old convention) is WRONG -- see "
+                          "[[ril2_labels_bug_and_perwindow_fix]] / train_diploid.py's "
+                          "homo_scale_from_affinity docstring: real RIL is homozygous EVERYWHERE, "
+                          "just for a varying founder, so it needs 0.0 like true inbred, not a "
+                          "compromise value. Omit to auto-derive via homo_scale_from_affinity "
+                          "(train_diploid.py) -- the 90th percentile of this individual's "
+                          "per-window inbreeding estimate, which cleanly separates selfing-type "
+                          "from hybrid even though genome-wide affinity can't.")
     ap.add_argument("--drop-idx", type=int, default=23, help="SOURCE_K index dropped (P39=23)")
     ap.add_argument("--win", type=int, default=512,
                      help="encoder window length -- match the checkpoint's training T "
@@ -175,9 +181,11 @@ def main():
     ext = torch.tensor(aff, dtype=torch.float32, device=device).unsqueeze(0)
 
     if args.homo_scale is None:
-        homo_scale = homo_scale_from_affinity(aff[:, 0])
+        n_win = all_feats.shape[0] // args.win
+        M_windowed = all_feats[:n_win * args.win].reshape(n_win, args.win, -1)
+        homo_scale = homo_scale_from_affinity(M_windowed)
         print(f"[{args.sample}] homo_scale not given -- auto-derived {homo_scale} "
-              f"(estimated inbreeding coef={estimate_inbreeding_coef(aff[:, 0]):.3f})")
+              f"from {n_win} windows (selfing-type: INBRED/RIL -> 0.0, hybrid -> 1.0)")
     else:
         homo_scale = args.homo_scale
 

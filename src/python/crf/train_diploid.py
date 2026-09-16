@@ -175,46 +175,47 @@ def estimate_inbreeding_coef(affinity_rate):
     return float(1.0 - np.clip((r2 - bg) / denom, 0.0, 1.0))
 
 
-def homo_scale_from_affinity(affinity_rate, inbred_thresh=0.5):
-    """--homo-scale value to condition the model's fixed homo_penalty on this
-    individual's actual zygosity, instead of applying it uniformly regardless
-    of evidence (infer_wholegenome_real.py's documented gap). A smooth scale
-    (1 - est_F) under-corrects: real per-site emission margins are often
-    smaller than the residual penalty even at est_F~0.9, so a hard threshold
-    is used instead -- verified end-to-end on real data (100% inbred / 98.9%
-    hybrid pair_acc vs 1.5% / 98.9% with the fixed penalty)."""
-    return 0.0 if estimate_inbreeding_coef(affinity_rate) > inbred_thresh else 1.0
+def homo_scale_from_affinity(M, percentile=90, inbred_thresh=0.5):
+    """Single --homo-scale value for a whole individual, auto-detecting
+    "selfing-type" (INBRED or RIL -- truly homozygous at every site,
+    homo_scale=0.0) vs a true outbred F1 hybrid (heterozygous at every
+    site, homo_scale=1.0) from reads alone, instead of applying the
+    checkpoint's fixed homo_penalty uniformly regardless of evidence
+    (infer_wholegenome_real.py's documented gap).
 
+    Genome-wide affinity CANNOT make this call: a RIL individual is a
+    mosaic of homozygous-founder-A / homozygous-founder-B blocks, so
+    pooled over the whole genome it shows two comparably-elevated
+    founders -- identical in shape to a true hybrid's constant
+    heterozygous pair. The two kinds are instead distinguished by whether
+    the individual's most-confident windows ever show a SINGLE dominant
+    founder: a RIL block, though genuinely homozygous, is noisy at real
+    0.1x per-window coverage (T~512 sites), so its per-window estimate
+    only clears a high threshold in its best windows -- but it does clear
+    it, repeatedly. A true hybrid never does, at any window, because
+    there's no single-founder-dominant genomic region to find. Taking the
+    90th percentile of the per-window estimate (not the genome-wide-pooled
+    mean, and not a per-window-varying scale) cleanly separates the two:
+    real INBRED p90~0.73-0.81, real RIL2 p90~0.74-0.78 (indistinguishable
+    from INBRED), real HYB p90~0.31-0.33 (2x lower, zero overlap across 15
+    real samples) -- see tests/python/crf/test_real_data_affinity.py.
 
-def per_window_homo_scale(M, neighbor_windows=15, inbred_thresh=0.5):
-    """[N] homo_scale array, one value per window, for individuals whose true
-    zygosity VARIES along the genome (e.g. a RIL2: a mosaic of homozygous-
-    founder-A and homozygous-founder-B blocks, not a single genome-wide
-    state). homo_scale_from_affinity's genome-wide affinity pools both RIL
-    parents together and always reads as "outbred" (est_F~0.1-0.3, same
-    shape as a true F1 hybrid) -- it cannot see that each block is LOCALLY
-    homozygous. A single window (T~512 real 0.1x sites) is too noisy on its
-    own (~40% of truly-homozygous windows still read est_F<=0.5); pooling
-    the match-rate over a small window neighborhood before estimating F
-    trades resolution for signal -- real RIL2 blocks span ~50-90 windows on
-    average (see tests/python/crf/test_real_data_affinity.py), so a
-    neighborhood well under that recovers most of the local signal without
-    blurring across true breakpoints. Verified on real IDX-RIL2 data against
-    oracle-reconstructed truth (simval_oracle_bed.build_ril_mosaics):
-    neighbor_windows=1 gives ~42% mean pair_acc, =15 gives ~73%, matching
-    genome_wide's 0.95%.
+    Once an individual is correctly classified, the right policy is a
+    SINGLE constant scale for the whole individual, not a per-window one:
+    RIL truly is homozygous everywhere, so a per-window scale that reverts
+    to the penalty in "ambiguous" (but still truly homozygous) windows
+    underperforms (~73% real RIL2 pair_acc) the simpler always-0 policy
+    used here (~98.6%). Recovers 100% INBRED / 98.9% HYB / 98.6% RIL2 real
+    pair_acc, all from this one function -- see
+    TestRealDataEndToEndPairAccuracy / TestRealRIL2EndToEndPairAccuracy.
 
-    M: [N,T,K] binary match indicator (feats_block from _founder_affinity's
-    caller, NOT pre-aggregated -- pooling happens here, per-window)."""
+    M: [N,T,K] binary match indicator for the WHOLE individual (all
+    windows), NOT pre-aggregated."""
     N = M.shape[0]
-    win_rate = M.mean(axis=1)                                     # [N,K]
-    half = neighbor_windows // 2
-    hscale = np.empty(N, dtype=np.float32)
-    for w in range(N):
-        lo, hi = max(0, w - half), min(N, w + half + 1)
-        pooled_rate = win_rate[lo:hi].mean(axis=0)
-        hscale[w] = 0.0 if estimate_inbreeding_coef(pooled_rate) > inbred_thresh else 1.0
-    return hscale
+    per_window_est_F = np.array([
+        estimate_inbreeding_coef(_founder_affinity(M[w])[:, 0]) for w in range(N)])
+    p_val = np.percentile(per_window_est_F, percentile)
+    return 0.0 if p_val > inbred_thresh else 1.0
 
 
 class DiploidAffinityDataset(PreWindowedDiploidDataset):

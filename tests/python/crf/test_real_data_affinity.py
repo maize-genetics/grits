@@ -1,11 +1,11 @@
 """
 Real-data gate for the founder-affinity mechanism (_founder_affinity,
 estimate_inbreeding_coef, homo_scale_from_affinity in train_diploid.py):
-real IDX-INBRED/IDX-HYB samples with known true founders, not simulated
-data. This is the check the model-comparison work in this session's
-checkpoints depends on -- if it fails, the affinity signal itself (or the
-checkpoint's use of it) is broken and no downstream accuracy comparison
-against that checkpoint is trustworthy.
+real IDX-INBRED/IDX-HYB/IDX-RIL2 samples with known true founders, not
+simulated data. This is the check the model-comparison work in this
+session's checkpoints depends on -- if it fails, the affinity signal
+itself (or the checkpoint's use of it) is broken and no downstream
+accuracy comparison against that checkpoint is trustworthy.
 
 Skips entirely if the real converted-npy corpus isn't present on this
 machine (it lives under the grits_workdir, not the repo).
@@ -22,8 +22,7 @@ import pandas as pd
 import torch
 
 from python.crf.train_diploid import (
-    _founder_affinity, estimate_inbreeding_coef, homo_scale_from_affinity,
-    per_window_homo_scale)
+    _founder_affinity, estimate_inbreeding_coef, homo_scale_from_affinity)
 
 REALDIR = "/workdir/zrm22/HackathonJun2026/grits_workdir/data/real"
 CKPT = ("/workdir/zrm22/HackathonJun2026/grits_workdir/indel_baseline/checkpoints/"
@@ -107,11 +106,16 @@ def _have_ckpt():
     return os.path.exists(CKPT)
 
 
-def _load_affinity_rate(ds, ind):
+def _load_match(ds, ind):
+    """[N,T,K] binary match indicator, windowed (NOT flattened) -- the shape
+    homo_scale_from_affinity needs to compute its per-window statistic."""
     data = np.load(_sample_path(ds, ind))
     tern = data[:, :, :K].astype(np.float32)
-    M = (tern == 1).astype(np.float32).reshape(-1, K)
-    return _founder_affinity(M)[:, 0]
+    return (tern == 1).astype(np.float32)
+
+
+def _load_affinity_rate(ds, ind):
+    return _founder_affinity(_load_match(ds, ind).reshape(-1, K))[:, 0]
 
 
 @unittest.skipUnless(_have_real_data(), f"real converted npy corpus not found under {REALDIR}")
@@ -182,8 +186,8 @@ class TestRealDataEndToEndPairAccuracy(unittest.TestCase):
         dist = data[:, :, K + 2:2 * K + 2].astype(np.float32)
         feats = torch.tensor(np.stack([tern, dist], axis=-1), dtype=torch.float32)
         M = (tern == 1).astype(np.float32)
-        affinity = _founder_affinity(M)
-        homo_scale = homo_scale_from_affinity(affinity[:, 0])
+        affinity = _founder_affinity(M.reshape(-1, K))
+        homo_scale = homo_scale_from_affinity(M)
         ext_emb = torch.tensor(affinity, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
         true_lo, true_hi = min(IDX[p1], IDX[p2]), max(IDX[p1], IDX[p2])
 
@@ -255,28 +259,39 @@ class TestRealRIL2AffinityAndTruth(unittest.TestCase):
 
     def test_genome_wide_affinity_cannot_see_local_homozygosity(self):
         """Documents the real limitation, doesn't just assert a number:
-        genome-wide est_F must read as "outbred" (both true parents
+        genome-wide-MEAN est_F must read as "outbred" (both true parents
         comparably elevated) even though the individual actually IS
-        homozygous everywhere -- this is why per_window_homo_scale exists."""
+        homozygous everywhere -- this is why homo_scale_from_affinity uses
+        the per-window PERCENTILE instead of the genome-wide mean."""
         for pair in RIL2_PAIRS:
             with self.subTest(pair=pair):
-                data = np.load(_sample_path("IDX-RIL2", pair))
-                tern = data[:, :, :K].astype(np.float32)
-                M = (tern == 1).astype(np.float32)
-                genome_rate = _founder_affinity(M.reshape(-1, K))[:, 0]
-                est_F = estimate_inbreeding_coef(genome_rate)
+                rate = _load_affinity_rate("IDX-RIL2", pair)
+                est_F = estimate_inbreeding_coef(rate)
                 self.assertLess(est_F, 0.5,
-                                 f"{pair}: genome-wide est_F={est_F:.3f}, expected <0.5 (looks outbred)")
+                                 f"{pair}: genome-wide-mean est_F={est_F:.3f}, expected <0.5 (looks outbred)")
+
+    def test_p90_per_window_estimate_separates_selfing_from_hybrid(self):
+        """The mechanism homo_scale_from_affinity actually relies on: the
+        90th percentile of the per-window inbreeding estimate must read as
+        selfing-type (>0.5) for RIL2 -- same as true INBRED -- even though
+        RIL2's genome-wide-mean reads as outbred (previous test)."""
+        for pair in RIL2_PAIRS:
+            with self.subTest(pair=pair):
+                M = _load_match("IDX-RIL2", pair)
+                per_window = np.array([
+                    estimate_inbreeding_coef(_founder_affinity(M[w])[:, 0]) for w in range(M.shape[0])])
+                p90 = np.percentile(per_window, 90)
+                self.assertGreater(p90, 0.5, f"{pair}: p90 per-window est_F={p90:.3f}, expected >0.5")
 
 
 @unittest.skipUnless(_have_ril2_truth() and _have_ckpt(),
                       "RIL2 oracle truth or diploid-indel-v3-overlay-affinity checkpoint not found")
 class TestRealRIL2EndToEndPairAccuracy(unittest.TestCase):
-    """Gate for per_window_homo_scale: against real oracle truth (not the
-    broken labels.bed), it must beat both the fixed penalty and the
-    genome-wide adaptive fix by a wide margin, even though it doesn't reach
-    INBRED/HYB's ~100% (per-window real-coverage noise, see
-    per_window_homo_scale's docstring)."""
+    """Gate for homo_scale_from_affinity on RIL2: against real oracle truth
+    (not the broken labels.bed), it must reach the same ~100% bar as
+    INBRED/HYB -- unlike the earlier genome-wide-mean-only version of this
+    function, which scored ~1% on real RIL2 (see git history / superseded
+    per_window_homo_scale docstring for that failed attempt)."""
 
     @classmethod
     def setUpClass(cls):
@@ -287,7 +302,7 @@ class TestRealRIL2EndToEndPairAccuracy(unittest.TestCase):
         cls.model = GRITSCRFDiploidIndel.load_from_checkpoint(
             CKPT, map_location=cls.device).eval().to(cls.device)
 
-    def _pair_acc(self, pair, homo_scale_arr):
+    def _pair_acc(self, pair):
         data = np.load(_sample_path("IDX-RIL2", pair))
         truth_w = _ril2_truth_windows(pair)
         N, T, W = data.shape
@@ -296,6 +311,7 @@ class TestRealRIL2EndToEndPairAccuracy(unittest.TestCase):
         feats = torch.tensor(np.stack([tern, dist], axis=-1), dtype=torch.float32)
         M = (tern == 1).astype(np.float32)
         affinity = _founder_affinity(M.reshape(-1, K))
+        homo_scale = homo_scale_from_affinity(M)
         ext_emb = torch.tensor(affinity, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
 
         true_h1, true_h2 = truth_w[:, :, 0], truth_w[:, :, 1]
@@ -307,7 +323,7 @@ class TestRealRIL2EndToEndPairAccuracy(unittest.TestCase):
             for s in range(0, N, 64):
                 xb = feats[s:s + 64].to(self.device)
                 eb = ext_emb[s:s + 64].to(self.device)
-                hs = torch.tensor(homo_scale_arr[s:s + 64], device=self.device, dtype=torch.float32)
+                hs = torch.full((xb.shape[0],), homo_scale, device=self.device)
                 emis_p, g, c = self.model(xb, ext_emb=eb, homo_scale=hs)
                 pred = self._dcrf_viterbi(emis_p, c, self.model.nsw_pair, self.model.stay_bonus)
                 preds_lo.append(self.model.pi[pred].cpu().numpy())
@@ -315,24 +331,11 @@ class TestRealRIL2EndToEndPairAccuracy(unittest.TestCase):
         pred_lo, pred_hi = np.concatenate(preds_lo), np.concatenate(preds_hi)
         return ((pred_lo == true_lo) & (pred_hi == true_hi))[valid].mean()
 
-    def test_per_window_homo_scale_beats_genome_wide_on_ril2(self):
+    def test_real_ril2_pair_accuracy_with_adaptive_homo_scale(self):
         for pair in RIL2_PAIRS:
             with self.subTest(pair=pair):
-                data = np.load(_sample_path("IDX-RIL2", pair))
-                N = data.shape[0]
-                tern = data[:, :, :K].astype(np.float32)
-                M = (tern == 1).astype(np.float32)
-
-                genome_rate = _founder_affinity(M.reshape(-1, K))[:, 0]
-                genome_scale = np.full(N, homo_scale_from_affinity(genome_rate), dtype=np.float32)
-                window_scale = per_window_homo_scale(M, neighbor_windows=15)
-
-                genome_acc = self._pair_acc(pair, genome_scale)
-                window_acc = self._pair_acc(pair, window_scale)
-                self.assertGreater(window_acc, genome_acc + 0.2,
-                                    f"{pair}: per-window ({window_acc:.3f}) should beat "
-                                    f"genome-wide ({genome_acc:.3f}) by >20pp on real RIL2")
-                self.assertGreater(window_acc, 0.3, f"{pair}: per-window pair_acc={window_acc:.3f}")
+                acc = self._pair_acc(pair)
+                self.assertGreater(acc, 0.9, f"{pair}: pair_acc={acc:.3f}, expected >0.9")
 
 
 if __name__ == "__main__":
