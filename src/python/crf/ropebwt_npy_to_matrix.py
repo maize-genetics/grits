@@ -96,7 +96,17 @@ def parse_args():
                    help="If given and < the source panel size, drop the least-covered "
                         "founder(s) genome-wide (fewest rows with any nonzero read support) "
                         "until the panel reaches this size. Labels pointing at a dropped "
-                        "founder become unknown. Default: off, panel size unchanged.")
+                        "founder become unknown. Not supported with --anchor-dist-npy -- use "
+                        "--drop-idx there instead (see below). Default: off, panel size unchanged.")
+    p.add_argument("--drop-idx", type=int, default=None,
+                   help="--anchor-dist-npy only: drop this ONE fixed founder index from all "
+                        "three blocks (ternary/distance/counts) and remap labels, matching "
+                        "the established real-eval convention of a fixed drop index (not a "
+                        "per-sample dynamically-recomputed least-covered founder, which would "
+                        "misalign founder identity across different real samples). Matches "
+                        "simval_paths.FIXED_DROP_IDX=23 (P39) for the real 25-founder maize "
+                        "panel trimmed to the simulator's K=24. Default: off, panel size "
+                        "unchanged (K stays at the source panel size).")
     p.add_argument("--out", required=True, help="Output .npy path.")
     p.add_argument("--anchor-dist-npy", action="store_true",
                    help="Source .npy is a `refmap --anchor-dist-npy` export "
@@ -159,6 +169,24 @@ def main():
         code = np.rint(args.dist_log_scale * np.log2(1.0 + np.maximum(dist_bp, 0).astype(np.float64)))
         code = np.clip(code, 0, DIST_SAT - 1).astype(np.int8)
         dist = np.where(has_anchor, code, DIST_PAD).astype(np.int8)
+
+        if args.drop_idx is not None:
+            drop_idx = args.drop_idx
+            if not (0 <= drop_idx < K):
+                raise ValueError(f"--drop-idx {drop_idx} out of range for K={K}")
+            keep_idx = np.setdiff1d(np.arange(K), [drop_idx])  # sorted ascending, length K-1
+            target = K - 1
+            remap = np.full(K + 1, target, dtype=np.int64)     # dropped + old unknown -> new unknown
+            remap[keep_idx] = np.arange(target)
+            name = (gametes.sort_values("gameteIndex")["sampleName"].to_numpy()[drop_idx]
+                    if gametes is not None else str(drop_idx))
+            print(f"Dropping fixed founder idx={drop_idx} ({name}) from all three blocks "
+                  f"(K={K} -> {target})")
+            tern = tern[:, keep_idx]
+            dist = dist[:, keep_idx]
+            gA = remap[gA]
+            gB = remap[gB]
+            K = target
 
         labels = np.stack([gA, gB], axis=1).astype(np.int8)    # [n_rows, 2]
         rows = np.concatenate([tern, labels, dist], axis=1)    # [n_rows, 2K+2] int8, matches

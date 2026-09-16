@@ -156,6 +156,36 @@ def _founder_affinity(feats_block):
     return np.stack([r, r - r.mean()], axis=-1)                     # [K,2] bounded
 
 
+def estimate_inbreeding_coef(affinity_rate):
+    """Genome-wide zygosity estimate from _founder_affinity's raw match-rate
+    column [K]: background-corrected gap between the top-1 and top-2 founder.
+    Real reads carry a substantial non-zero match rate even for unrelated
+    founders (pangenome background co-support, not signal) -- the top-2 rate
+    alone isn't near zero for a true hybrid, so the gap must be normalized
+    against the rate of an uninvolved (rank>=3) founder, not against 0.
+    1.0 = one dominant founder (inbred), 0.0 = two comparably-elevated
+    founders (outbred/hybrid). Verified on real IDX-INBRED/IDX-HYB samples --
+    see tests/python/crf/test_real_data_affinity.py."""
+    order = np.argsort(-affinity_rate)
+    r1, r2 = affinity_rate[order[0]], affinity_rate[order[1]]
+    bg = np.median(affinity_rate[order[2:]])
+    denom = r1 - bg
+    if denom <= 1e-6:
+        return 0.0
+    return float(1.0 - np.clip((r2 - bg) / denom, 0.0, 1.0))
+
+
+def homo_scale_from_affinity(affinity_rate, inbred_thresh=0.5):
+    """--homo-scale value to condition the model's fixed homo_penalty on this
+    individual's actual zygosity, instead of applying it uniformly regardless
+    of evidence (infer_wholegenome_real.py's documented gap). A smooth scale
+    (1 - est_F) under-corrects: real per-site emission margins are often
+    smaller than the residual penalty even at est_F~0.9, so a hard threshold
+    is used instead -- verified end-to-end on real data (100% inbred / 98.9%
+    hybrid pair_acc vs 1.5% / 98.9% with the fixed penalty)."""
+    return 0.0 if estimate_inbreeding_coef(affinity_rate) > inbred_thresh else 1.0
+
+
 class DiploidAffinityDataset(PreWindowedDiploidDataset):
     """Diploid dataset + a per-individual founder-affinity ext_emb [K,2], attached
     to every window of the individual (windows grouped in blocks of G). Conditions

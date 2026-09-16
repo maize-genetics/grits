@@ -43,7 +43,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # .../src/python/crf/<file> -> repo root
 
 import python.crf.infer_wholegenome as iwg  # noqa: E402
-from python.crf.train_diploid import GRITSCRFDiploid, _founder_affinity  # noqa: E402
+from python.crf.train_diploid import (  # noqa: E402
+    GRITSCRFDiploid, _founder_affinity, estimate_inbreeding_coef, homo_scale_from_affinity)
 from python.bed_io.bed import output_collapse_bed  # noqa: E402
 
 SOURCE_K = 25
@@ -138,9 +139,12 @@ def main():
     ap.add_argument("--row-dir", required=True, help="scratch/simval_eval/<ROW_ID> directory")
     ap.add_argument("--sample", required=True)
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--homo-scale", type=float, required=True,
+    ap.add_argument("--homo-scale", type=float, default=None,
                      help="0.0 inbred / 0.5 ril / 1.0 hybrid -- passed straight to the model, "
-                          "unlike infer_wholegenome.py's hardcoded None (=full fixed penalty)")
+                          "unlike infer_wholegenome.py's hardcoded None (=full fixed penalty). "
+                          "Omit to auto-derive from this individual's genome-wide founder "
+                          "affinity via homo_scale_from_affinity (train_diploid.py) -- a smooth "
+                          "0/1 threshold on the background-corrected top1/top2 affinity gap.")
     ap.add_argument("--drop-idx", type=int, default=23, help="SOURCE_K index dropped (P39=23)")
     ap.add_argument("--win", type=int, default=512,
                      help="encoder window length -- match the checkpoint's training T "
@@ -163,10 +167,6 @@ def main():
         raise ValueError(f"expected {SOURCE_K} gametes, got {len(gamete_names)}")
 
     contigs = load_real_contigs(row_dir, args.drop_idx)
-    print(f"[{args.sample}] loaded {len(contigs)} contigs, homo_scale={args.homo_scale}, "
-          f"win={args.win} stride={args.stride} decode={args.decode}")
-    for c, (feats, bp) in contigs.items():
-        print(f"  {c}: {feats.shape[0]:,} real bins  bp=[{bp.min():,}-{bp.max():,}]")
 
     # genome-wide founder affinity, over ALL real contigs concatenated (matches
     # simval_eval_one.run_inference_diploid's own genome-wide-pooled convention)
@@ -174,7 +174,19 @@ def main():
     aff = _founder_affinity(all_feats)                              # [TARGET_K,2]
     ext = torch.tensor(aff, dtype=torch.float32, device=device).unsqueeze(0)
 
-    iwg._encode = make_encode_real(args.homo_scale)                 # module-global monkey-patch
+    if args.homo_scale is None:
+        homo_scale = homo_scale_from_affinity(aff[:, 0])
+        print(f"[{args.sample}] homo_scale not given -- auto-derived {homo_scale} "
+              f"(estimated inbreeding coef={estimate_inbreeding_coef(aff[:, 0]):.3f})")
+    else:
+        homo_scale = args.homo_scale
+
+    print(f"[{args.sample}] loaded {len(contigs)} contigs, homo_scale={homo_scale}, "
+          f"win={args.win} stride={args.stride} decode={args.decode}")
+    for c, (feats, bp) in contigs.items():
+        print(f"  {c}: {feats.shape[0]:,} real bins  bp=[{bp.min():,}-{bp.max():,}]")
+
+    iwg._encode = make_encode_real(homo_scale)                      # module-global monkey-patch
 
     contig_preds = {}
     for contig, (feats, bp) in contigs.items():
