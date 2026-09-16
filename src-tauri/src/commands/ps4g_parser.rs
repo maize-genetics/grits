@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, State};
 
 /// Tauri-level cache that wraps `CachedPS4GData` with filesystem metadata
@@ -16,7 +16,10 @@ pub struct CachedPS4GFile {
 }
 
 pub struct PS4GCache {
-    pub cache: Mutex<FxHashMap<String, CachedPS4GFile>>,
+    // `Arc` so a cache hit clones a reference rather than the whole parsed
+    // file (tens of MB of row/gamete data on a real file) — this fires on
+    // every chromosome load and every column-mode toggle.
+    pub cache: Mutex<FxHashMap<String, Arc<CachedPS4GFile>>>,
 }
 
 impl PS4GCache {
@@ -26,14 +29,14 @@ impl PS4GCache {
         }
     }
 
-    pub fn get_cached(&self, file_path: &str) -> Option<CachedPS4GFile> {
+    pub fn get_cached(&self, file_path: &str) -> Option<Arc<CachedPS4GFile>> {
         let cache = self.cache.lock().ok()?;
         let cached = cache.get(file_path)?;
 
         if let Ok(metadata) = std::fs::metadata(file_path) {
             if let Ok(modified) = metadata.modified() {
                 if modified == cached.modified_time {
-                    return Some(cached.clone());
+                    return Some(Arc::clone(cached));
                 }
             }
         }
@@ -42,7 +45,7 @@ impl PS4GCache {
 
     pub fn store(&self, data: CachedPS4GFile) {
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(data.file_path.clone(), data);
+            cache.insert(data.file_path.clone(), Arc::new(data));
         }
     }
 
@@ -100,9 +103,11 @@ pub async fn parse_ps4g_file(
 pub async fn get_chromosome_matrix(
     file_path: String,
     chromosome: String,
+    column_mode: Option<String>,
     cache: State<'_, PS4GCache>,
     window: tauri::Window,
 ) -> Result<ChromosomeMatrixResult, String> {
+    let mode = ColumnMode::from_wire(column_mode.as_deref());
     let path = Path::new(&file_path);
 
     if !path.exists() {
@@ -115,6 +120,8 @@ pub async fn get_chromosome_matrix(
             num_gametes: 0,
             num_positions: 0,
             position_range: (0, 0),
+            column_mode: mode,
+            source_rows: vec![],
             error: Some(format!("File not found: {}", file_path)),
         });
     }
@@ -128,7 +135,7 @@ pub async fn get_chromosome_matrix(
                 percent: 100.0,
             },
         );
-        return parser_core::build_chromosome_matrix(&cached.data, &chromosome);
+        return parser_core::build_chromosome_matrix(&cached.data, &chromosome, mode);
     }
 
     // No cache -- full parse then build matrix
@@ -155,7 +162,7 @@ pub async fn get_chromosome_matrix(
         );
     })?;
 
-    let result = parser_core::build_chromosome_matrix(&cached_data, &chromosome);
+    let result = parser_core::build_chromosome_matrix(&cached_data, &chromosome, mode);
 
     cache.store(CachedPS4GFile {
         file_path,
@@ -170,9 +177,10 @@ pub async fn get_chromosome_matrix(
 pub async fn get_chromosome_matrix_binary(
     file_path: String,
     chromosome: String,
+    column_mode: Option<String>,
     cache: State<'_, PS4GCache>,
     window: tauri::Window,
 ) -> Result<ChromosomeMatrixBinaryResult, String> {
-    let result = get_chromosome_matrix(file_path, chromosome, cache, window).await?;
+    let result = get_chromosome_matrix(file_path, chromosome, column_mode, cache, window).await?;
     Ok(parser_core::encode_matrix_binary(&result))
 }

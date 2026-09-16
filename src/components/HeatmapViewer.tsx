@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Icon from '@mdi/react';
 import { getBackend } from '../platform';
-import type { FileHandle, FileInput, ChromosomeMatrixResult, ChromosomeMatrixProgress, NpyOverlayResult } from '../platform';
+import type { FileHandle, FileInput, ChromosomeMatrixResult, ChromosomeMatrixProgress, NpyOverlayResult, ColumnMode } from '../platform';
 import { mdiChartTimeline, mdiAlertCircle, mdiChevronDown, mdiDownload, mdiPlay, mdiPause, mdiHelpCircleOutline, mdiEye, mdiEyeOff, mdiArrowExpandVertical, mdiKeyboard, mdiClose } from '@mdi/js';
 import HeatmapCanvas, { VisibleRange, HeatmapCanvasHandle, PathOverlay } from './HeatmapCanvas';
 import HeatmapControls from './HeatmapControls';
@@ -105,6 +105,19 @@ const HeatmapViewer: React.FC<HeatmapViewerProps> = ({
   const [showGridLines, setShowGridLines] = useState<boolean>(true);
   const [colorScheme, setColorScheme] = useState<'binary' | 'intensity'>('intensity');
   const [showShortcuts, setShowShortcuts] = useState<boolean>(false);
+
+  // Column model: 'binned' collapses same-bin PS4G rows into one column
+  // (historical/default behavior); 'row' gives one column per PS4G data
+  // row. Tracks the chromosome a load actually landed on, so a toggle that
+  // reloads the SAME chromosome (mode change) can be told apart from an
+  // actual chromosome change -- only the latter should reset zoom/scroll.
+  const [columnMode, setColumnMode] = useState<ColumnMode>('binned');
+  const loadedChromosomeRef = useRef<string | null>(null);
+  // Genomic position to re-center on after a mode toggle lands, in place of
+  // carrying over scrollOffset directly -- scrollOffset is a fraction of a
+  // total width that shifts with the column count, so reusing it verbatim
+  // would drift by however much the toggle changed that count.
+  const pendingAnchorPosRef = useRef<number | null>(null);
   
   // Auto-scroll state
   const [isAutoScrolling, setIsAutoScrolling] = useState<boolean>(false);
@@ -152,8 +165,8 @@ const HeatmapViewer: React.FC<HeatmapViewerProps> = ({
     return () => observer.disconnect();
   }, []);
 
-  // Load chromosome data when selection changes
-  const loadChromosomeData = useCallback(async (chromosome: string) => {
+  // Load chromosome data when selection or column mode changes
+  const loadChromosomeData = useCallback(async (chromosome: string, mode: ColumnMode) => {
     if (!chromosome || !fileHandle) return;
 
     setIsLoading(true);
@@ -162,14 +175,23 @@ const HeatmapViewer: React.FC<HeatmapViewerProps> = ({
 
     try {
       const backend = await getBackend();
-      const result = await backend.getChromosomeMatrix(fileHandle, chromosome, (p) => {
+      const result = await backend.getChromosomeMatrix(fileHandle, chromosome, mode, (p) => {
         setLoadProgress(p);
       });
 
       if (result.success) {
+        const isChromosomeChange = loadedChromosomeRef.current !== chromosome;
+        loadedChromosomeRef.current = chromosome;
         setMatrixData(result);
-        setZoomLevel(1);
-        setScrollOffset(0);
+        if (isChromosomeChange) {
+          // A real chromosome change: reset the view. A mode-only reload
+          // preserves zoom/scroll (see the anchor-restore effect below for
+          // scroll, which needs the new column count first).
+          setZoomLevel(1);
+          setScrollOffset(0);
+        }
+        // The column count differs across modes (and always across
+        // chromosomes), so any loaded overlay no longer lines up either way.
         setOverlayData(null);
         setOverlayError(null);
       } else {
@@ -186,12 +208,33 @@ const HeatmapViewer: React.FC<HeatmapViewerProps> = ({
     }
   }, [fileHandle]);
 
-  // Load data when chromosome selection changes
+  // Load data when chromosome selection or column mode changes
   useEffect(() => {
     if (selectedChromosome) {
-      loadChromosomeData(selectedChromosome);
+      loadChromosomeData(selectedChromosome, columnMode);
     }
-  }, [selectedChromosome, loadChromosomeData]);
+  }, [selectedChromosome, columnMode, loadChromosomeData]);
+
+  // Restore an anchor position across a mode toggle (see
+  // pendingAnchorPosRef) once the new matrix -- and its column count --
+  // has landed.
+  useEffect(() => {
+    if (!matrixData || pendingAnchorPosRef.current == null) return;
+    const anchor = pendingAnchorPosRef.current;
+    pendingAnchorPosRef.current = null;
+    if (matrixData.positions.length === 0) return;
+    const idx = findNearestColumnIndex(anchor, (i) => matrixData.positions[i], matrixData.positions.length);
+    if (idx < 0) return;
+    const offset = calculateScrollOffset(idx, matrixData.num_positions, zoomLevel, cellWidthMultiplier, containerWidth);
+    if (offset !== null) setScrollOffset(offset);
+  }, [matrixData, zoomLevel, cellWidthMultiplier, containerWidth]);
+
+  // Toggle the column model, remembering the currently-visible start
+  // position so the anchor-restore effect above can re-center on it.
+  const handleToggleColumnMode = useCallback(() => {
+    pendingAnchorPosRef.current = visibleRange?.startPos ?? null;
+    setColumnMode(prev => (prev === 'binned' ? 'row' : 'binned'));
+  }, [visibleRange]);
 
   // Auto-scroll effect
   useEffect(() => {
@@ -244,7 +287,9 @@ const HeatmapViewer: React.FC<HeatmapViewerProps> = ({
     setSelectedChromosome(e.target.value);
   }, []);
 
-  // Reset view to defaults
+  // Reset view to defaults. Deliberately leaves columnMode untouched: it
+  // selects a data model (and triggers a reload), not a view setting, so a
+  // "reset view" click shouldn't stall on a refetch.
   const handleResetView = useCallback(() => {
     setZoomLevel(1);
     setScrollOffset(0);
@@ -465,6 +510,11 @@ const HeatmapViewer: React.FC<HeatmapViewerProps> = ({
         predictionsNpyFileRef.current,
         matrixData.num_positions,
         matrixData.num_gametes,
+        // Lets a genome-wide .npy (one row per PS4G data row, across every
+        // chromosome) align to this chromosome's columns, in addition to a
+        // chromosome-sized .npy matching num_positions directly.
+        matrixData.source_rows,
+        summary.total_rows,
       );
 
       if (result.success) {
@@ -480,7 +530,7 @@ const HeatmapViewer: React.FC<HeatmapViewerProps> = ({
     } finally {
       setOverlayLoading(false);
     }
-  }, [matrixData]);
+  }, [matrixData, summary.total_rows]);
 
   const clearOverlay = useCallback(() => {
     setOverlayData(null);
@@ -534,7 +584,8 @@ const HeatmapViewer: React.FC<HeatmapViewerProps> = ({
               </span>
               <span className="info-divider">×</span>
               <span className="info-item">
-                <strong>{formatNumber(matrixData.num_positions)}</strong> positions
+                <strong>{formatNumber(matrixData.num_positions)}</strong>{' '}
+                {matrixData.column_mode === 'row' ? 'columns (1 per PS4G row)' : 'columns (1 per bin)'}
               </span>
               <span className="info-item position-range">
                 ({formatNumber(matrixData.position_range[0])} - {formatNumber(matrixData.position_range[1])} rpb)
@@ -571,7 +622,7 @@ const HeatmapViewer: React.FC<HeatmapViewerProps> = ({
         <div className="heatmap-error">
           <Icon path={mdiAlertCircle} size={1.5} />
           <span>{error}</span>
-          <button onClick={() => loadChromosomeData(selectedChromosome)}>Retry</button>
+          <button onClick={() => loadChromosomeData(selectedChromosome, columnMode)}>Retry</button>
         </div>
       )}
 
@@ -591,6 +642,8 @@ const HeatmapViewer: React.FC<HeatmapViewerProps> = ({
                 onToggleGridLines={() => setShowGridLines(prev => !prev)}
                 colorScheme={colorScheme}
                 onToggleColorScheme={() => setColorScheme(prev => prev === 'binary' ? 'intensity' : 'binary')}
+                columnMode={columnMode}
+                onToggleColumnMode={handleToggleColumnMode}
                 onResetView={handleResetView}
               />
               <div className="ps4g-auto-fit">

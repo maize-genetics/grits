@@ -13,6 +13,7 @@ import type {
   PS4GParseResult,
   ChromosomeMatrixResult,
   ChromosomeMatrixProgress,
+  ColumnMode,
   BEDProgress,
   BEDParseResult,
   BEDChromosomeMatrixResult,
@@ -45,6 +46,7 @@ const tauriBackend: PlatformBackend = {
   async getChromosomeMatrix(
     handle: FileHandle,
     chromosome: string,
+    columnMode: ColumnMode,
     onProgress?: ProgressCallback<ChromosomeMatrixProgress>,
   ) {
     const filePath = handle as string;
@@ -61,6 +63,7 @@ const tauriBackend: PlatformBackend = {
       return await invoke<ChromosomeMatrixResult>('get_chromosome_matrix', {
         filePath,
         chromosome,
+        columnMode,
       });
     } finally {
       unlisten?.();
@@ -118,12 +121,16 @@ const tauriBackend: PlatformBackend = {
     predictions: FileInput | null,
     expectedNumPositions: number,
     expectedNumGametes: number,
+    sourceRows: number[] | null,
+    totalRows: number,
   ) {
     return invoke<NpyOverlayResult>('load_npy_overlay', {
       observedPath: observed as string | null,
       predictionsPath: predictions as string | null,
       expectedNumPositions,
       expectedNumGametes,
+      sourceRows,
+      totalRows,
     });
   },
 

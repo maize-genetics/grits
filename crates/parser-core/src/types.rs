@@ -69,6 +69,30 @@ pub struct PS4GParseResult {
     pub error: Option<String>,
 }
 
+/// Which axis a chromosome matrix's columns run over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColumnMode {
+    /// One column per distinct `refPosBinned` value; rows sharing a bin are
+    /// summed together. This is the historical/default behavior.
+    #[default]
+    Binned,
+    /// One column per PS4G data row, matching the file's own layout.
+    Row,
+}
+
+impl ColumnMode {
+    /// Parse from the wire representation used at the JS boundary
+    /// (`"binned"` / `"row"`), defaulting to `Binned` for anything else so a
+    /// stale or missing frontend value degrades safely.
+    pub fn from_wire(value: Option<&str>) -> Self {
+        match value {
+            Some("row") => ColumnMode::Row,
+            _ => ColumnMode::Binned,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChromosomeMatrixResult {
     pub success: bool,
@@ -79,6 +103,14 @@ pub struct ChromosomeMatrixResult {
     pub num_gametes: usize,
     pub num_positions: usize,
     pub position_range: (u64, u64),
+    /// Column model used to build this matrix.
+    pub column_mode: ColumnMode,
+    /// The global PS4G data-row index (0-based, across the whole file) each
+    /// column was built from. In `Row` mode this is exact, one entry per
+    /// column. In `Binned` mode it names the lowest-indexed row that fell
+    /// into that bin — a representative, not an aggregate — which is enough
+    /// to align a genome-wide per-row `.npy` overlay in either mode.
+    pub source_rows: Vec<u32>,
     pub error: Option<String>,
 }
 
@@ -102,11 +134,38 @@ pub struct ChromosomeMatrixBinaryResult {
     pub error: Option<String>,
 }
 
+/// One PS4G data row's position/gamete-set/count, plus its index among all
+/// data rows in the file (`global_row_index`) — needed to align a
+/// genome-wide `.npy` overlay to a per-chromosome matrix. `gamete_start` /
+/// `gamete_len` slice into the owning `ChromosomeRowData::gamete_flat` arena
+/// rather than each row owning its own `Vec<u32>`, since a real file has on
+/// the order of a million rows and per-row heap allocations dominate.
+/// Exactly 24 bytes (align 8): `u64` + four `u32`s, no padding.
+#[derive(Debug, Clone, Copy)]
+pub struct PS4GRowEntry {
+    pub ref_pos_binned: u64,
+    pub global_row_index: u32,
+    pub gamete_start: u32,
+    pub gamete_len: u32,
+    pub count: u32,
+}
+
+/// Per-chromosome PS4G data rows, preserved in file order. Same-bin
+/// aggregation (the historical `Binned` behavior) and per-row layout
+/// (`Row` mode) are both derived from this at matrix-build time — see
+/// `build_chromosome_matrix` — rather than one being computed at parse time
+/// and the other being unrecoverable.
+#[derive(Debug, Clone, Default)]
+pub struct ChromosomeRowData {
+    pub rows: Vec<PS4GRowEntry>,
+    pub gamete_flat: Vec<u32>,
+}
+
 /// Platform-agnostic cached PS4G data (no filesystem types)
 #[derive(Debug, Clone)]
 pub struct CachedPS4GData {
     pub metadata: PS4GMetadata,
-    pub chromosome_data: FxHashMap<String, FxHashMap<u64, FxHashMap<u32, u32>>>,
+    pub chromosome_data: FxHashMap<String, ChromosomeRowData>,
     pub chromosomes: Vec<String>,
     pub chromosome_counts: FxHashMap<String, usize>,
     pub position_ranges: FxHashMap<String, (u64, u64)>,
@@ -202,8 +261,10 @@ pub struct BEDChromosomeMatrixResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NpyOverlayResult {
     pub success: bool,
-    pub true_paths: Vec<Vec<usize>>,
-    pub predicted_paths: Vec<Vec<usize>>,
+    /// Row index per column, or `-1` for an unlabeled/missing position
+    /// (round-tripped from the source `.npy`, not saturated to `0`).
+    pub true_paths: Vec<Vec<i64>>,
+    pub predicted_paths: Vec<Vec<i64>>,
     pub num_positions: usize,
     pub is_diploid_true: bool,
     pub is_diploid_predicted: bool,

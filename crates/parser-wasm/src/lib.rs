@@ -24,16 +24,28 @@ pub struct PS4GFileHandle {
 
 #[wasm_bindgen]
 impl PS4GFileHandle {
-    /// Build a chromosome matrix from the cached data.
-    pub fn get_chromosome_matrix(&self, chromosome: &str) -> Result<JsValue, JsValue> {
-        let result = parser_core::build_chromosome_matrix(&self.cached, chromosome)
+    /// Build a chromosome matrix from the cached data. `column_mode` is
+    /// `"binned"` or `"row"`; anything else (including omission) defaults to
+    /// `"binned"`.
+    pub fn get_chromosome_matrix(
+        &self,
+        chromosome: &str,
+        column_mode: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        let mode = ColumnMode::from_wire(column_mode.as_deref());
+        let result = parser_core::build_chromosome_matrix(&self.cached, chromosome, mode)
             .map_err(|e| JsValue::from_str(&e))?;
         to_js_value(&result)
     }
 
     /// Encode a chromosome matrix as a compact base64 binary payload.
-    pub fn get_chromosome_matrix_binary(&self, chromosome: &str) -> Result<JsValue, JsValue> {
-        let matrix = parser_core::build_chromosome_matrix(&self.cached, chromosome)
+    pub fn get_chromosome_matrix_binary(
+        &self,
+        chromosome: &str,
+        column_mode: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        let mode = ColumnMode::from_wire(column_mode.as_deref());
+        let matrix = parser_core::build_chromosome_matrix(&self.cached, chromosome, mode)
             .map_err(|e| JsValue::from_str(&e))?;
         let binary = parser_core::encode_matrix_binary(&matrix);
         to_js_value(&binary)
@@ -189,12 +201,20 @@ pub fn parse_bed_to_handle(
 
 /// Load NPY overlay data from raw bytes.
 /// Pass empty `Uint8Array` (length 0) for files that should be skipped.
+/// `source_rows` + `total_rows` optionally let a genome-wide `.npy` (one row
+/// per PS4G data row, across every chromosome) align to the current
+/// chromosome's columns — see `NpyRowMapping`. Pass an empty `source_rows`
+/// (length 0) to skip that and rely on direct row-count alignment only,
+/// mirroring the empty-buffer-means-skip convention used for the file data
+/// above.
 #[wasm_bindgen]
 pub fn load_npy_overlay(
     observed_data: &[u8],
     predictions_data: &[u8],
     expected_num_positions: usize,
     expected_num_gametes: usize,
+    source_rows: Vec<u32>,
+    total_rows: usize,
 ) -> Result<JsValue, JsValue> {
     let observed_reader: Option<Cursor<&[u8]>> = if observed_data.is_empty() {
         None
@@ -208,11 +228,21 @@ pub fn load_npy_overlay(
         Some(Cursor::new(predictions_data))
     };
 
+    let row_mapping = if source_rows.is_empty() {
+        None
+    } else {
+        Some(parser_core::NpyRowMapping {
+            source_rows: &source_rows,
+            total_rows,
+        })
+    };
+
     let result = parser_core::load_npy_overlay_from_readers(
         observed_reader,
         predictions_reader,
         expected_num_positions,
         expected_num_gametes,
+        row_mapping,
     )
     .map_err(|e| JsValue::from_str(&e))?;
 

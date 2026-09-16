@@ -15,6 +15,7 @@ export type {
   GameteInfo,
   ChromosomeMatrixResult,
   ChromosomeMatrixProgress,
+  ColumnMode,
   BEDProgress,
   BEDParseResult,
   BEDSummary,

@@ -1,4 +1,5 @@
 use parser_core::types::NpyOverlayResult;
+use parser_core::NpyRowMapping;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -9,6 +10,8 @@ pub async fn load_npy_overlay(
     predictions_path: Option<String>,
     expected_num_positions: usize,
     expected_num_gametes: usize,
+    source_rows: Option<Vec<u32>>,
+    total_rows: usize,
 ) -> Result<NpyOverlayResult, String> {
     if observed_path.is_none() && predictions_path.is_none() {
         return Ok(NpyOverlayResult::error(
@@ -48,10 +51,15 @@ pub async fn load_npy_overlay(
         None => None,
     };
 
+    let row_mapping = source_rows
+        .as_deref()
+        .map(|source_rows| NpyRowMapping { source_rows, total_rows });
+
     parser_core::load_npy_overlay_from_readers(
         observed_reader,
         predictions_reader,
         expected_num_positions,
         expected_num_gametes,
+        row_mapping,
     )
 }

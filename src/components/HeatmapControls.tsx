@@ -1,12 +1,15 @@
 import React, { useCallback } from 'react';
 import Icon from '@mdi/react';
-import { 
-  mdiMagnifyPlus, 
-  mdiMagnifyMinus, 
+import {
+  mdiMagnifyPlus,
+  mdiMagnifyMinus,
   mdiRefresh,
   mdiViewGrid,
-  mdiViewGridOutline
+  mdiViewGridOutline,
+  mdiArrowCollapseHorizontal,
+  mdiArrowExpandHorizontal
 } from '@mdi/js';
+import type { ColumnMode } from '../platform';
 
 interface HeatmapControlsProps {
   /** Current zoom level (0.25 - 4) */
@@ -29,6 +32,10 @@ interface HeatmapControlsProps {
   colorScheme?: 'binary' | 'intensity';
   /** Toggle color scheme */
   onToggleColorScheme?: () => void;
+  /** Column model (omit to hide the toggle) */
+  columnMode?: ColumnMode;
+  /** Toggle column model */
+  onToggleColumnMode?: () => void;
   /** Reset view to defaults */
   onResetView: () => void;
 }
@@ -46,6 +53,8 @@ const HeatmapControls: React.FC<HeatmapControlsProps> = ({
   onToggleGridLines,
   colorScheme,
   onToggleColorScheme,
+  columnMode,
+  onToggleColumnMode,
   onResetView,
 }) => {
   // Handle zoom in/out buttons
@@ -73,7 +82,7 @@ const HeatmapControls: React.FC<HeatmapControlsProps> = ({
         </button>
         
         {colorScheme && onToggleColorScheme && (
-          <button 
+          <button
             className={`control-button color-scheme-toggle ${colorScheme === 'intensity' ? 'active' : ''}`}
             onClick={onToggleColorScheme}
             title={colorScheme === 'binary' ? 'Switch to intensity colors' : 'Switch to binary colors'}
@@ -83,8 +92,23 @@ const HeatmapControls: React.FC<HeatmapControlsProps> = ({
             </span>
           </button>
         )}
-        
-        <button 
+
+        {columnMode && onToggleColumnMode && (
+          <button
+            className={`control-button column-mode-toggle ${columnMode === 'row' ? 'active' : ''}`}
+            onClick={onToggleColumnMode}
+            title={columnMode === 'binned'
+              ? 'Switch to one column per PS4G row'
+              : 'Switch to one column per bin position'}
+          >
+            <Icon path={columnMode === 'binned' ? mdiArrowCollapseHorizontal : mdiArrowExpandHorizontal} size={0.6} />
+            <span className="button-label">
+              {columnMode === 'binned' ? 'Col: Bin' : 'Col: Row'}
+            </span>
+          </button>
+        )}
+
+        <button
           className="control-button reset-button" 
           onClick={onResetView}
           title="Reset view"

@@ -9,6 +9,7 @@ import type {
   PS4GParseResult,
   ChromosomeMatrixResult,
   ChromosomeMatrixProgress,
+  ColumnMode,
   BEDProgress,
   BEDParseResult,
   BEDChromosomeMatrixResult,
@@ -118,6 +119,7 @@ const webBackend: PlatformBackend = {
   async getChromosomeMatrix(
     handle: FileHandle,
     chromosome: string,
+    columnMode: ColumnMode,
     onProgress?: ProgressCallback<ChromosomeMatrixProgress>,
   ) {
     const wfh = handle as unknown as WorkerFileHandle;
@@ -127,6 +129,7 @@ const webBackend: PlatformBackend = {
         type: 'getChromosomeMatrix',
         handleId: wfh.__workerHandleId,
         chromosome,
+        columnMode,
       },
       onProgress as ((p: unknown) => void) | undefined,
     );
@@ -179,6 +182,8 @@ const webBackend: PlatformBackend = {
     predictions: FileInput | null,
     expectedNumPositions: number,
     expectedNumGametes: number,
+    sourceRows: number[] | null,
+    totalRows: number,
   ) {
     let observedBuf = new ArrayBuffer(0);
     let predictionsBuf = new ArrayBuffer(0);
@@ -201,6 +206,8 @@ const webBackend: PlatformBackend = {
         predictionsData: predictionsBuf,
         expectedNumPositions,
         expectedNumGametes,
+        sourceRows: sourceRows ?? [],
+        totalRows,
       },
       undefined,
       transfer,

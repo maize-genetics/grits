@@ -16,8 +16,9 @@ export interface ExportSettings {
   includePathLegend: boolean;
   includeCellValueLegend: boolean;
   pathVisibility: Record<string, boolean>;
-  startPosition: number;
-  endPosition: number;
+  /** Custom export range, or null to use the currently visible range. */
+  startPosition: number | null;
+  endPosition: number | null;
 }
 
 interface ExportModalProps {
@@ -87,8 +88,11 @@ const ExportModal: React.FC<ExportModalProps> = ({
   }, []);
 
   const handleExport = useCallback(() => {
-    const effectiveStart = useCustomPositionRange ? startPos : visibleStartPos;
-    const effectiveEnd = useCustomPositionRange ? endPos : visibleEndPos;
+    // null (rather than the visible range's own bounds) tells the canvas to
+    // use whatever is currently on screen at export time -- passing the
+    // visible bounds explicitly here is indistinguishable, downstream, from
+    // an intentional custom range, and can snap the export to the wrong
+    // columns when positions repeat (row column mode).
     onExport({
       title,
       width,
@@ -97,10 +101,10 @@ const ExportModal: React.FC<ExportModalProps> = ({
       includePathLegend,
       includeCellValueLegend,
       pathVisibility,
-      startPosition: effectiveStart,
-      endPosition: effectiveEnd,
+      startPosition: useCustomPositionRange ? startPos : null,
+      endPosition: useCustomPositionRange ? endPos : null,
     });
-  }, [title, width, height, scale, includePathLegend, includeCellValueLegend, pathVisibility, useCustomPositionRange, startPos, endPos, visibleStartPos, visibleEndPos, onExport]);
+  }, [title, width, height, scale, includePathLegend, includeCellValueLegend, pathVisibility, useCustomPositionRange, startPos, endPos, onExport]);
 
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {

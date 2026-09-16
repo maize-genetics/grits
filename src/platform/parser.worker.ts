@@ -82,7 +82,10 @@ async function handleMessage(msg: MessageEvent) {
         let result;
 
         if (kind === 'ps4g') {
-          result = (handle as PS4GFileHandle).get_chromosome_matrix(data.chromosome);
+          result = (handle as PS4GFileHandle).get_chromosome_matrix(
+            data.chromosome,
+            data.columnMode,
+          );
         } else {
           result = (handle as BEDFileHandle).get_chromosome_matrix(
             data.chromosome,
@@ -97,12 +100,15 @@ async function handleMessage(msg: MessageEvent) {
       case 'loadNpyOverlay': {
         const observed = new Uint8Array(data.observedData as ArrayBuffer);
         const predictions = new Uint8Array(data.predictionsData as ArrayBuffer);
+        const sourceRows = new Uint32Array((data.sourceRows as number[] | undefined) ?? []);
 
         const result = load_npy_overlay(
           observed,
           predictions,
           data.expectedNumPositions,
           data.expectedNumGametes,
+          sourceRows,
+          data.totalRows ?? 0,
         );
 
         self.postMessage({ type: 'result', id, result });

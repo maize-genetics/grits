@@ -34,7 +34,7 @@ pub fn parse_ps4g(
 
     let mut chromosome_counts: Vec<usize> = Vec::new();
     let mut position_ranges: Vec<(u64, u64)> = Vec::new();
-    let mut chromosome_position_data: Vec<FxHashMap<u64, FxHashMap<u32, u32>>> = Vec::new();
+    let mut chromosome_row_data: Vec<ChromosomeRowData> = Vec::new();
 
     // `in_header` tracks the leading run of `#`-prefixed (and blank) lines,
     // which is the only place metadata and gamete records are recognized.
@@ -109,8 +109,13 @@ pub fn parse_ps4g(
                 &mut index_to_chromosome,
                 &mut chromosome_counts,
                 &mut position_ranges,
-                &mut chromosome_position_data,
+                &mut chromosome_row_data,
             );
+
+            // Captured before `total_rows` is incremented below, so this is
+            // the 0-based index of this row among all data rows in the file
+            // — the identity a genome-wide `.npy` overlay is keyed on.
+            let global_row_index = total_rows as u32;
 
             total_read_count += row.count as u64;
 
@@ -131,11 +136,16 @@ pub fn parse_ps4g(
                 range.1 = row.ref_pos_binned;
             }
 
-            let chr_data = &mut chromosome_position_data[chr_idx as usize];
-            let pos_entry = chr_data.entry(row.ref_pos_binned).or_default();
-            for gamete_idx in &row.gamete_set {
-                *pos_entry.entry(*gamete_idx).or_insert(0) += row.count;
-            }
+            let chr_data = &mut chromosome_row_data[chr_idx as usize];
+            let gamete_start = chr_data.gamete_flat.len() as u32;
+            chr_data.gamete_flat.extend_from_slice(&row.gamete_set);
+            chr_data.rows.push(PS4GRowEntry {
+                ref_pos_binned: row.ref_pos_binned,
+                global_row_index,
+                gamete_start,
+                gamete_len: row.gamete_set.len() as u32,
+                count: row.count,
+            });
 
             if data_preview.len() < PREVIEW_ROW_LIMIT {
                 data_preview.push(PS4GDataRow {
@@ -164,16 +174,17 @@ pub fn parse_ps4g(
         }
     }
 
-    let mut chromosome_data_map: FxHashMap<String, FxHashMap<u64, FxHashMap<u32, u32>>> =
-        FxHashMap::default();
+    let mut chromosome_data_map: FxHashMap<String, ChromosomeRowData> = FxHashMap::default();
     let mut chromosome_counts_fx: FxHashMap<String, usize> = FxHashMap::default();
     let mut position_range_fx: FxHashMap<String, (u64, u64)> = FxHashMap::default();
 
     for (idx, chr_name) in index_to_chromosome.iter().enumerate() {
-        chromosome_data_map.insert(
-            chr_name.clone(),
-            std::mem::take(&mut chromosome_position_data[idx]),
-        );
+        let mut chr_data = std::mem::take(&mut chromosome_row_data[idx]);
+        // `Vec` growth can leave up to 2x slack; this cache is held for the
+        // life of the file, so reclaim it rather than carry the slack.
+        chr_data.rows.shrink_to_fit();
+        chr_data.gamete_flat.shrink_to_fit();
+        chromosome_data_map.insert(chr_name.clone(), chr_data);
         chromosome_counts_fx.insert(chr_name.clone(), chromosome_counts[idx]);
         position_range_fx.insert(chr_name.clone(), position_ranges[idx]);
     }
@@ -257,12 +268,19 @@ pub fn parse_ps4g(
 }
 
 /// Build a chromosome matrix from previously cached PS4G data.
+///
+/// `mode` selects the column model: [`ColumnMode::Binned`] (the historical
+/// behavior — one column per distinct `refPosBinned`, same-bin rows summed)
+/// or [`ColumnMode::Row`] (one column per PS4G data row, matching the file's
+/// own layout). Both are derived here from the same per-row cache rather
+/// than one being computed at parse time and the other being unrecoverable.
 pub fn build_chromosome_matrix(
     cached: &CachedPS4GData,
     chromosome: &str,
+    mode: ColumnMode,
 ) -> Result<ChromosomeMatrixResult, String> {
-    let position_data = match cached.chromosome_data.get(chromosome) {
-        Some(data) if !data.is_empty() => data,
+    let chr_data = match cached.chromosome_data.get(chromosome) {
+        Some(data) if !data.rows.is_empty() => data,
         _ => {
             return Ok(ChromosomeMatrixResult {
                 success: false,
@@ -273,6 +291,8 @@ pub fn build_chromosome_matrix(
                 num_gametes: 0,
                 num_positions: 0,
                 position_range: (0, 0),
+                column_mode: mode,
+                source_rows: vec![],
                 error: Some(format!("No data found for chromosome: {}", chromosome)),
             });
         }
@@ -287,29 +307,82 @@ pub fn build_chromosome_matrix(
         .map(|(row, g)| (g.gamete_index, row))
         .collect();
 
-    let mut positions: Vec<u64> = position_data.keys().copied().collect();
-    positions.sort();
-
-    let pos_to_col: FxHashMap<u64, usize> = positions
-        .iter()
-        .enumerate()
-        .map(|(col, &pos)| (pos, col))
-        .collect();
-
     let num_gametes = gametes.len();
-    let num_positions = positions.len();
 
-    let mut matrix: Vec<Vec<u32>> = vec![vec![0; num_positions]; num_gametes];
+    let (positions, source_rows, matrix) = match mode {
+        ColumnMode::Binned => {
+            // Same-bin rows are summed together. Rows arrive in file order,
+            // so the first row seen for a given position is already its
+            // lowest global index — no need to track a running minimum.
+            let mut position_first_row: FxHashMap<u64, u32> = FxHashMap::default();
+            let mut position_gamete_counts: FxHashMap<u64, FxHashMap<u32, u32>> =
+                FxHashMap::default();
 
-    for (&pos, gamete_counts) in position_data {
-        if let Some(&col) = pos_to_col.get(&pos) {
-            for (&gamete_idx, &count) in gamete_counts {
-                if let Some(&row) = gamete_idx_to_row.get(&gamete_idx) {
-                    matrix[row][col] = count;
+            for row in &chr_data.rows {
+                position_first_row
+                    .entry(row.ref_pos_binned)
+                    .or_insert(row.global_row_index);
+                let gamete_counts = position_gamete_counts.entry(row.ref_pos_binned).or_default();
+                let gamete_slice = &chr_data.gamete_flat
+                    [row.gamete_start as usize..(row.gamete_start + row.gamete_len) as usize];
+                for &gamete_idx in gamete_slice {
+                    *gamete_counts.entry(gamete_idx).or_insert(0) += row.count;
                 }
             }
+
+            let mut positions: Vec<u64> = position_gamete_counts.keys().copied().collect();
+            positions.sort_unstable();
+
+            let mut matrix: Vec<Vec<u32>> = vec![vec![0; positions.len()]; num_gametes];
+            let mut source_rows: Vec<u32> = Vec::with_capacity(positions.len());
+            for (col, &pos) in positions.iter().enumerate() {
+                source_rows.push(position_first_row[&pos]);
+                for (&gamete_idx, &count) in &position_gamete_counts[&pos] {
+                    if let Some(&row) = gamete_idx_to_row.get(&gamete_idx) {
+                        matrix[row][col] = count;
+                    }
+                }
+            }
+
+            (positions, source_rows, matrix)
         }
-    }
+        ColumnMode::Row => {
+            // Sort (position, original-index) pairs rather than the rows
+            // themselves: the original index is unique, so this is a total
+            // order that ties-break to file order without depending on a
+            // stable-sort guarantee, and it's cache-friendlier than sorting
+            // the 24-byte `PS4GRowEntry`s directly.
+            let mut order: Vec<(u64, usize)> = chr_data
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (r.ref_pos_binned, i))
+                .collect();
+            order.sort_unstable();
+
+            let num_cols = order.len();
+            let mut positions: Vec<u64> = Vec::with_capacity(num_cols);
+            let mut source_rows: Vec<u32> = Vec::with_capacity(num_cols);
+            let mut matrix: Vec<Vec<u32>> = vec![vec![0; num_cols]; num_gametes];
+
+            for (col, &(pos, seq_idx)) in order.iter().enumerate() {
+                let row = &chr_data.rows[seq_idx];
+                positions.push(pos);
+                source_rows.push(row.global_row_index);
+                let gamete_slice = &chr_data.gamete_flat
+                    [row.gamete_start as usize..(row.gamete_start + row.gamete_len) as usize];
+                for &gamete_idx in gamete_slice {
+                    if let Some(&r) = gamete_idx_to_row.get(&gamete_idx) {
+                        matrix[r][col] += row.count;
+                    }
+                }
+            }
+
+            (positions, source_rows, matrix)
+        }
+    };
+
+    let num_positions = positions.len();
 
     let position_range = if !positions.is_empty() {
         (*positions.first().unwrap(), *positions.last().unwrap())
@@ -344,6 +417,8 @@ pub fn build_chromosome_matrix(
         num_gametes,
         num_positions,
         position_range,
+        column_mode: mode,
+        source_rows,
         error: None,
     })
 }
@@ -521,7 +596,7 @@ fn get_or_create_chromosome_index(
     index_to_chromosome: &mut Vec<String>,
     chromosome_counts: &mut Vec<usize>,
     position_ranges: &mut Vec<(u64, u64)>,
-    chromosome_position_data: &mut Vec<FxHashMap<u64, FxHashMap<u32, u32>>>,
+    chromosome_row_data: &mut Vec<ChromosomeRowData>,
 ) -> u16 {
     if let Some(&idx) = chromosome_to_index.get(chr_name) {
         idx
@@ -531,7 +606,7 @@ fn get_or_create_chromosome_index(
         index_to_chromosome.push(chr_name.to_string());
         chromosome_counts.push(0);
         position_ranges.push((u64::MAX, 0));
-        chromosome_position_data.push(FxHashMap::default());
+        chromosome_row_data.push(ChromosomeRowData::default());
         idx
     }
 }
@@ -846,5 +921,184 @@ mod tests {
         let (result, _cached) = parse_ps4g(Cursor::new(&bytes[..]), None, |_| {}).unwrap();
 
         assert_eq!(result.summary.gamete_count, 2);
+    }
+
+    // ========================================================================
+    // build_chromosome_matrix / ColumnMode tests
+    // ========================================================================
+
+    #[test]
+    fn binned_matrix_matches_pre_refactor_values() {
+        // Golden values for sample_ps4g_bytes(), matching the collapsed
+        // (position -> summed-gamete-counts) behavior the old
+        // FxHashMap<u64, FxHashMap<u32,u32>> cache produced directly.
+        let (_result, cached) = parse_ps4g(Cursor::new(sample_ps4g_bytes()), None, |_| {}).unwrap();
+        let matrix = build_chromosome_matrix(&cached, "chr1", ColumnMode::Binned).unwrap();
+
+        assert!(matrix.success);
+        assert_eq!(matrix.column_mode, ColumnMode::Binned);
+        assert_eq!(matrix.positions, vec![1000, 2000]);
+        assert_eq!(matrix.gamete_names, vec!["B73", "CML247", "W22"]);
+        assert_eq!(
+            matrix.matrix,
+            vec![
+                vec![2, 2], // B73:  hit by every row
+                vec![1, 1], // CML247: rows 2 and 4
+                vec![0, 1], // W22: row 4 only
+            ]
+        );
+        // Lowest global row index landing in each bin: row 0 for bin 1000,
+        // row 2 for bin 2000 (0-based, file order).
+        assert_eq!(matrix.source_rows, vec![0, 2]);
+    }
+
+    #[test]
+    fn row_mode_matches_expected_per_row_columns() {
+        let (_result, cached) = parse_ps4g(Cursor::new(sample_ps4g_bytes()), None, |_| {}).unwrap();
+        let matrix = build_chromosome_matrix(&cached, "chr1", ColumnMode::Row).unwrap();
+
+        assert!(matrix.success);
+        assert_eq!(matrix.column_mode, ColumnMode::Row);
+        assert_eq!(matrix.positions, vec![1000, 1000, 2000, 2000]);
+        assert_eq!(matrix.source_rows, vec![0, 1, 2, 3]);
+        assert_eq!(
+            matrix.matrix,
+            vec![
+                vec![1, 1, 1, 1], // B73: every row
+                vec![0, 1, 0, 1], // CML247: rows 1 and 3 (0-indexed)
+                vec![0, 0, 0, 1], // W22: row 3 only
+            ]
+        );
+    }
+
+    #[test]
+    fn row_mode_column_count_equals_chromosome_row_count() {
+        let (_result, cached) = parse_ps4g(Cursor::new(sample_ps4g_bytes()), None, |_| {}).unwrap();
+        let matrix = build_chromosome_matrix(&cached, "chr1", ColumnMode::Row).unwrap();
+        assert_eq!(matrix.num_positions, cached.chromosome_counts["chr1"]);
+        assert_eq!(matrix.num_positions, 4);
+    }
+
+    /// A fixture with two gametes, three chromosomes interleaved in file
+    /// order, and out-of-order positions within chr1 (500 before 100) --
+    /// deliberately hostile to any implementation that assumes sortedness
+    /// or per-chromosome row contiguity.
+    fn interleaved_ps4g_bytes() -> &'static [u8] {
+        b"#gamete\tgameteIndex\tcount\n\
+          #B73:0\t0\t3\n\
+          #CML247:0\t1\t2\n\
+          gameteSet\trefContig\trefPosBinned\tcount\n\
+          0\tchr1\t500\t1\n\
+          0\tchr2\t10\t1\n\
+          0\tchr1\t100\t1\n\
+          1\tchr2\t5\t1\n\
+          0,1\tchr1\t100\t1\n\
+          0\tchr3\t777\t1\n"
+    }
+
+    #[test]
+    fn row_mode_source_rows_are_global_indices() {
+        // chr1's data rows are global indices 0, 2, 4 -- not contiguous --
+        // so an implementation keyed on a per-chromosome row offset (rather
+        // than each row's own recorded global_row_index) would fail this.
+        let (_result, cached) =
+            parse_ps4g(Cursor::new(interleaved_ps4g_bytes()), None, |_| {}).unwrap();
+        let matrix = build_chromosome_matrix(&cached, "chr1", ColumnMode::Row).unwrap();
+
+        assert_eq!(matrix.positions, vec![100, 100, 500]);
+        assert_eq!(matrix.source_rows, vec![2, 4, 0]);
+    }
+
+    #[test]
+    fn row_mode_ties_preserve_file_order() {
+        // Rows 2 (global) and 4 (global) both land on refPosBinned=100 for
+        // chr1; row 2 appears earlier in the file and must sort first.
+        let (_result, cached) =
+            parse_ps4g(Cursor::new(interleaved_ps4g_bytes()), None, |_| {}).unwrap();
+        let matrix = build_chromosome_matrix(&cached, "chr1", ColumnMode::Row).unwrap();
+
+        let tied: Vec<u32> = matrix
+            .positions
+            .iter()
+            .zip(&matrix.source_rows)
+            .filter(|(&pos, _)| pos == 100)
+            .map(|(_, &row)| row)
+            .collect();
+        assert_eq!(tied, vec![2, 4]);
+    }
+
+    #[test]
+    fn row_mode_positions_are_non_decreasing_with_duplicates() {
+        let (_result, cached) =
+            parse_ps4g(Cursor::new(interleaved_ps4g_bytes()), None, |_| {}).unwrap();
+        let matrix = build_chromosome_matrix(&cached, "chr1", ColumnMode::Row).unwrap();
+        assert!(matrix.positions.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn unsorted_input_produces_sorted_columns() {
+        // chr2's rows appear in the file as pos 10 then pos 5 (descending);
+        // both column models must still emit ascending positions.
+        let (_result, cached) =
+            parse_ps4g(Cursor::new(interleaved_ps4g_bytes()), None, |_| {}).unwrap();
+
+        let row_matrix = build_chromosome_matrix(&cached, "chr2", ColumnMode::Row).unwrap();
+        assert_eq!(row_matrix.positions, vec![5, 10]);
+        assert_eq!(row_matrix.source_rows, vec![3, 1]); // global indices
+
+        let binned_matrix = build_chromosome_matrix(&cached, "chr2", ColumnMode::Binned).unwrap();
+        assert_eq!(binned_matrix.positions, vec![5, 10]);
+    }
+
+    #[test]
+    fn binned_source_rows_pick_lowest_row_per_bin() {
+        let (_result, cached) =
+            parse_ps4g(Cursor::new(interleaved_ps4g_bytes()), None, |_| {}).unwrap();
+        let matrix = build_chromosome_matrix(&cached, "chr1", ColumnMode::Binned).unwrap();
+
+        assert_eq!(matrix.positions, vec![100, 500]);
+        // Bin 100 first appears at global row 2; bin 500 is global row 0.
+        assert_eq!(matrix.source_rows, vec![2, 0]);
+    }
+
+    #[test]
+    fn both_modes_agree_on_position_range_and_gamete_names() {
+        let (_result, cached) =
+            parse_ps4g(Cursor::new(interleaved_ps4g_bytes()), None, |_| {}).unwrap();
+        let binned = build_chromosome_matrix(&cached, "chr1", ColumnMode::Binned).unwrap();
+        let row = build_chromosome_matrix(&cached, "chr1", ColumnMode::Row).unwrap();
+
+        assert_eq!(binned.position_range, row.position_range);
+        assert_eq!(binned.gamete_names, row.gamete_names);
+        assert_eq!(binned.num_gametes, row.num_gametes);
+    }
+
+    #[test]
+    fn empty_chromosome_returns_error_result_in_both_modes() {
+        let (_result, cached) =
+            parse_ps4g(Cursor::new(interleaved_ps4g_bytes()), None, |_| {}).unwrap();
+
+        for mode in [ColumnMode::Binned, ColumnMode::Row] {
+            let matrix = build_chromosome_matrix(&cached, "chrNope", mode).unwrap();
+            assert!(!matrix.success);
+            assert!(matrix.error.is_some());
+            assert_eq!(matrix.column_mode, mode);
+            assert!(matrix.source_rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn single_row_chromosome() {
+        // chr3 has exactly one data row (the Pt/Mt case in real files).
+        let (_result, cached) =
+            parse_ps4g(Cursor::new(interleaved_ps4g_bytes()), None, |_| {}).unwrap();
+
+        for mode in [ColumnMode::Binned, ColumnMode::Row] {
+            let matrix = build_chromosome_matrix(&cached, "chr3", mode).unwrap();
+            assert!(matrix.success);
+            assert_eq!(matrix.num_positions, 1);
+            assert_eq!(matrix.positions, vec![777]);
+            assert_eq!(matrix.source_rows, vec![5]);
+        }
     }
 }

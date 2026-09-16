@@ -29,10 +29,10 @@ export interface ExportOptions {
   includePathLegend?: boolean;
   /** Per-path visibility overrides keyed by label */
   pathVisibility?: Record<string, boolean>;
-  /** Start position for the exported range */
-  startPosition?: number;
-  /** End position for the exported range */
-  endPosition?: number;
+  /** Start position for the exported range, or null/omitted for the current viewport */
+  startPosition?: number | null;
+  /** End position for the exported range, or null/omitted for the current viewport */
+  endPosition?: number | null;
 }
 
 /** Methods exposed by HeatmapCanvas via ref */

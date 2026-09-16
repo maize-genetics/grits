@@ -55,6 +55,9 @@ export interface PS4GParseResult {
   error: string | null;
 }
 
+/** Which axis a chromosome matrix's columns run over. */
+export type ColumnMode = 'binned' | 'row';
+
 export interface ChromosomeMatrixResult {
   success: boolean;
   chromosome: string;
@@ -64,6 +67,16 @@ export interface ChromosomeMatrixResult {
   num_gametes: number;
   num_positions: number;
   position_range: [number, number];
+  /** Column model used to build this matrix. */
+  column_mode: ColumnMode;
+  /**
+   * The global PS4G data-row index (0-based, across the whole file) each
+   * column was built from. In 'row' mode this is exact, one entry per
+   * column. In 'binned' mode it names the lowest-indexed row that fell into
+   * that bin -- enough to align a genome-wide per-row .npy overlay in
+   * either mode.
+   */
+  source_rows: number[];
   error: string | null;
 }
 
@@ -186,6 +199,7 @@ export interface PlatformBackend {
   getChromosomeMatrix(
     handle: FileHandle,
     chromosome: string,
+    columnMode: ColumnMode,
     onProgress?: ProgressCallback<ChromosomeMatrixProgress>,
   ): Promise<ChromosomeMatrixResult>;
 
@@ -205,6 +219,15 @@ export interface PlatformBackend {
     predictions: FileInput | null,
     expectedNumPositions: number,
     expectedNumGametes: number,
+    /**
+     * Optional genome-wide row mapping: `sourceRows[col]` names which row of
+     * a genome-wide (all-chromosome) .npy corresponds to matrix column
+     * `col` (see `ChromosomeMatrixResult.source_rows`), and `totalRows` is
+     * the row count that mapping applies to (the PS4G file's total row
+     * count). Pass `null`/`0` to accept only a chromosome-sized .npy.
+     */
+    sourceRows: number[] | null,
+    totalRows: number,
   ): Promise<NpyOverlayResult>;
 
   openFile(options?: OpenFileOptions): Promise<FileInput | null>;
