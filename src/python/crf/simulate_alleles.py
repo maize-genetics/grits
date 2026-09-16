@@ -612,8 +612,45 @@ def _indel_suppressed_rate(rate, del_mask, ins_bp, suppress, flank):
     return base * np.clip(1.0 - suppress * f, 1e-3, 1.0)
 
 
+def _read_fragment_coverage(rng, n, R, target_x, gamete_weight, read_len):
+    """Boolean [n,R] "does a real read fragment cover this site" mask, for
+    `coverage_model="reads"` -- the v4 fix for a gap `coverage_model=
+    "poisson"` didn't close: matching the AGGREGATE per-site probability to
+    a real depth target still leaves every site an INDEPENDENT Bernoulli
+    trial, with no memory of its neighbors, so a 256bp bin gets 256
+    independent chances to come up covered and ends up covered almost
+    always -- real reads are literal `read_len`-bp CONTIGUOUS fragments
+    with sparse, spatially clustered starts, so a real bin's coverage
+    depends on whether ONE rare read happened to land nearby at all, not
+    256 independent coin flips.
+
+    Draws read START positions as a Poisson process along R at rate
+    `target_x * gamete_weight / read_len` per bp (so the resulting mean
+    per-site depth still equals the requested real target X), same
+    "+1/-1 scatter, extended start range, cumsum interval union" trick
+    `_indel_tracts` already uses for indel spans -- each start expands to
+    a `read_len`-bp contiguous covered block, giving real reads' spatial
+    clustering instead of `coverage_model="poisson"`'s per-site
+    independence.
+    """
+    rate = target_x * gamete_weight / read_len
+    lam = rate * R
+    cnt = rng.poisson(lam, size=n)
+    depth = np.zeros((n, R + 1), dtype=np.int32)
+    E = int(cnt.sum())
+    if E == 0:
+        return np.zeros((n, R), dtype=bool)
+    cell = np.repeat(np.arange(n), cnt)
+    start = rng.integers(-read_len, R, E)   # extended range: a read starting just
+    s = np.clip(start, 0, R)                # before the region can still cover its
+    e = np.clip(start + read_len, 0, R)     # first few real sites
+    np.add.at(depth, (cell, s), 1)
+    np.add.at(depth, (cell, e), -1)
+    return np.cumsum(depth, axis=1)[:, :R] > 0
+
+
 def _row_counts(rng, pres1, pres2, ins1, ins2, gamete_balance, coverage,
-                 ins_read_per_bp, max_stack, coverage_model="linear"):
+                 ins_read_per_bp, max_stack, coverage_model="linear", read_len=150):
     """Reads emitted per (window, reference site) by source (PLAN.md
     SS2.5). Replaces today's "exactly ONE read per site" convention (this
     module's own docstring, and the `active = np.where(gamete, h1, h2)`
@@ -633,7 +670,17 @@ def _row_counts(rng, pres1, pres2, ins1, ins2, gamete_balance, coverage,
           - "poisson" (v4): `P = 1 - exp(-coverage * gamete_weight)`, the
             standard Lander-Waterman coverage-depth relation for a real
             target sequencing depth `coverage` (e.g. 0.1 for 0.1x) --
-            same Bernoulli structure, properly calibrated probability.
+            same Bernoulli structure, properly calibrated probability,
+            but every site is still an INDEPENDENT trial: matches the
+            real MEAN depth but not real reads' spatial clustering (a
+            256bp bin gets 256 independent chances to come up covered,
+            so it almost always does, unlike a real bin whose coverage
+            depends on one sparse read happening to land nearby).
+          - "reads" (v4): real `read_len`-bp CONTIGUOUS fragments via
+            `_read_fragment_coverage`, Poisson-distributed START
+            positions at rate `coverage*gamete_weight/read_len` per bp
+            (same mean depth as "poisson", genuine spatial clustering) --
+            the actual fix for the gap above.
         A hemizygous site (one homolog deleted) loses half its expected
         depth AND every read there comes from the surviving homolog --
         this IS the "hemizygous-looking read sharing" SS2.7 acceptance
@@ -650,14 +697,20 @@ def _row_counts(rng, pres1, pres2, ins1, ins2, gamete_balance, coverage,
     where `cnt = on1 + on2 + c1 + c2`.
     """
     w1, w2 = gamete_balance, 1.0 - gamete_balance
-    if coverage_model == "linear":
-        p1, p2 = coverage * w1, coverage * w2
-    elif coverage_model == "poisson":
-        p1, p2 = 1.0 - np.exp(-coverage * w1), 1.0 - np.exp(-coverage * w2)
+    if coverage_model == "reads":
+        n, R = pres1.shape
+        on1 = _read_fragment_coverage(rng, n, R, coverage, w1, read_len) & pres1
+        on2 = _read_fragment_coverage(rng, n, R, coverage, w2, read_len) & pres2
     else:
-        raise ValueError(f"coverage_model must be 'linear' or 'poisson', got {coverage_model!r}")
-    on1 = (rng.random(pres1.shape) < p1) & pres1
-    on2 = (rng.random(pres2.shape) < p2) & pres2
+        if coverage_model == "linear":
+            p1, p2 = coverage * w1, coverage * w2
+        elif coverage_model == "poisson":
+            p1, p2 = 1.0 - np.exp(-coverage * w1), 1.0 - np.exp(-coverage * w2)
+        else:
+            raise ValueError(f"coverage_model must be 'linear', 'poisson', or "
+                              f"'reads', got {coverage_model!r}")
+        on1 = (rng.random(pres1.shape) < p1) & pres1
+        on2 = (rng.random(pres2.shape) < p2) & pres2
     p = float(np.clip(ins_read_per_bp, 0.0, 1.0))
     c1 = np.minimum(rng.binomial(ins1, p), max_stack).astype(np.int32)
     c2 = np.minimum(rng.binomial(ins2, p), max_stack).astype(np.int32)
@@ -901,7 +954,7 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
 def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   match1, match2, gamete_balance, coverage, ins_read_per_bp,
                   max_stack, anchor_thresh, ref_founder, dist_scale,
-                  coverage_model="linear"):
+                  coverage_model="linear", read_len=150):
     """Assemble one chunk's indel-mode output:
     `(tern, dist [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T] int32,
     short [n] bool, n_either int, n_hemi int, n_null int)`.
@@ -983,7 +1036,7 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
     on1, on2, c1, c2, cnt = _row_counts(rng, pres1, pres2, ins1, ins2,
                                          gamete_balance, coverage,
                                          ins_read_per_bp, max_stack,
-                                         coverage_model)
+                                         coverage_model, read_len)
     w, t, r, o, short = _sample_rows(cnt, T)
 
     tern_out = np.full((n, T, K), TERN_PAD, dtype=np.int8)
@@ -1043,7 +1096,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              indel_ref_founder=-1, indel_lineage_frac=0.15,
              indel_overlay_rate=2.3e-3, indel_overlay_mean_len=300.0,
              indel_overlay_founder_freq=1.0, subst_model="dense",
-             subst_rate=0.018, coverage_model="linear"):
+             subst_rate=0.018, coverage_model="linear", read_len=150):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
     (default) behavior, including rng draw order, is byte-for-byte
@@ -1095,8 +1148,9 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                           f"got {indel_model!r}")
     if subst_model not in ("dense", "sparse"):
         raise ValueError(f"subst_model must be 'dense' or 'sparse', got {subst_model!r}")
-    if coverage_model not in ("linear", "poisson"):
-        raise ValueError(f"coverage_model must be 'linear' or 'poisson', got {coverage_model!r}")
+    if coverage_model not in ("linear", "poisson", "reads"):
+        raise ValueError(f"coverage_model must be 'linear', 'poisson', or "
+                          f"'reads', got {coverage_model!r}")
     if not coalescent:
         q = (allele_sharing * K - 1.0) / (K - 1)   # match rate for non-true founders
         if q < 0:
@@ -1240,7 +1294,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 rng, n, R, T, K, h1, h2, lineage_indel, del_lin, ins_lin,
                 match1, match2, gamete_balance, indel_coverage,
                 indel_ins_read_per_bp, indel_max_stack, indel_anchor_thresh,
-                indel_ref_founder, DIST_LOG_SCALE, coverage_model)
+                indel_ref_founder, DIST_LOG_SCALE, coverage_model, read_len)
 
             out[sl, :, :K] = tern
             out[sl, :, K] = lab1
@@ -1512,17 +1566,29 @@ def parse_args():
                         "experiments/ril2-error-regions/results/ril2_error_regions/"
                         "DIAGNOSTICS.md) -- only two founders measured, re-tune if a "
                         "panel-wide number becomes available.")
-    p.add_argument("--indel-coverage-model", choices=["linear", "poisson"], default="linear",
-                   help="v4: how --indel-coverage maps to a per-site read probability in "
-                        "_row_counts. 'linear' (default): today's exact behavior, "
+    p.add_argument("--indel-coverage-model", choices=["linear", "poisson", "reads"],
+                   default="linear",
+                   help="v4: how --indel-coverage maps to read presence in _row_counts. "
+                        "'linear' (default): today's exact behavior, "
                         "P=coverage*gamete_weight -- at the default coverage=2.0/"
                         "gamete-balance=0.5 this is P=1.0, a GUARANTEED read at every "
                         "present site, which is why simulated T-row windows span far "
                         "less reference bp than a real window of equal row count. "
                         "'poisson': P=1-exp(-coverage*gamete_weight), the standard "
-                        "Lander-Waterman depth relation -- pass a REAL target coverage "
-                        "(e.g. 0.1 for 0.1x, matching this project's other coverage "
-                        "rungs) via --indel-coverage when using this mode.")
+                        "Lander-Waterman depth relation for a REAL target coverage (e.g. "
+                        "0.1 for 0.1x) -- matches the real MEAN depth, but every site is "
+                        "still an independent trial, so it doesn't reproduce real reads' "
+                        "spatial clustering (a 256bp bin gets 256 independent chances to "
+                        "come up covered, so it almost always does). 'reads': real "
+                        "--indel-read-len-bp CONTIGUOUS fragments with Poisson-distributed "
+                        "start positions -- same mean depth as 'poisson', genuine spatial "
+                        "clustering, the actual real-coverage model. Pass a REAL target "
+                        "coverage (e.g. 0.1 for 0.1x) via --indel-coverage for 'poisson' "
+                        "or 'reads'.")
+    p.add_argument("--indel-read-len-bp", type=int, default=150,
+                   help="'reads' --indel-coverage-model only: read fragment length in bp, "
+                        "matching this project's established wgsim convention "
+                        "(config.py READ_LEN=150).")
     p.add_argument("--indel-density", type=float, default=2.3e-3,
                    help="Indel events per reference bp per lineage (ins+del combined). "
                         "Calibrated against BOTH real maize acceptance targets jointly "
@@ -1828,7 +1894,7 @@ def main():
         indel_overlay_mean_len=args.indel_overlay_mean_len,
         indel_overlay_founder_freq=args.indel_overlay_founder_freq,
         subst_model=args.subst_model, subst_rate=args.subst_rate,
-        coverage_model=args.indel_coverage_model,
+        coverage_model=args.indel_coverage_model, read_len=args.indel_read_len_bp,
         indel_density=args.indel_density, indel_ins_frac=args.indel_ins_frac,
         indel_large_frac=args.indel_large_frac,
         indel_small_alpha=args.indel_small_alpha,

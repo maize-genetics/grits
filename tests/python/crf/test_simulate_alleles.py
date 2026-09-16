@@ -1010,6 +1010,51 @@ def test_row_counts_coverage_model_linear_unchanged():
         assert np.array_equal(a, b)
 
 
+def test_row_counts_coverage_model_reads_matches_mean_depth():
+    rng = np.random.default_rng(4)
+    n, R = 1, 500_000
+    pres1 = np.ones((n, R), dtype=bool)
+    pres2 = np.ones((n, R), dtype=bool)
+    ins1 = np.zeros((n, R), dtype=np.int32)
+    ins2 = np.zeros((n, R), dtype=np.int32)
+    X, w = 0.1, 0.5
+    on1, on2, c1, c2, cnt = _row_counts(rng, pres1, pres2, ins1, ins2, w, X,
+                                         0.0, 64, coverage_model="reads", read_len=150)
+    expected_p = 1.0 - np.exp(-X * w)   # same mean depth as "poisson", different spatial structure
+    assert abs(on1.mean() - expected_p) < 0.01
+    assert abs(on2.mean() - expected_p) < 0.01
+
+
+def test_row_counts_reads_gives_contiguous_blocks_not_independent_sites():
+    """The whole point of "reads": a covered site's neighbors are far more
+    likely to ALSO be covered than under "poisson" (independent per-site),
+    since real coverage comes from a single read_len-bp fragment."""
+    rng_reads = np.random.default_rng(9)
+    rng_poisson = np.random.default_rng(9)
+    n, R = 1, 200_000
+    pres1 = np.ones((n, R), dtype=bool)
+    pres2 = np.zeros((n, R), dtype=bool)  # isolate homolog 1 only
+    ins1 = np.zeros((n, R), dtype=np.int32)
+    ins2 = np.zeros((n, R), dtype=np.int32)
+    X, w = 0.1, 1.0
+    on1_reads, *_ = _row_counts(rng_reads, pres1, pres2, ins1, ins2, w, X,
+                                 0.0, 64, coverage_model="reads", read_len=150)
+    on1_poisson, *_ = _row_counts(rng_poisson, pres1, pres2, ins1, ins2, w, X,
+                                   0.0, 64, coverage_model="poisson")
+
+    def frac_bins_any_covered(on, bin_size=256):
+        n_bins = on.shape[1] // bin_size
+        trimmed = on[0, :n_bins * bin_size].reshape(n_bins, bin_size)
+        return trimmed.any(axis=1).mean()
+
+    frac_reads = frac_bins_any_covered(on1_reads)
+    frac_poisson = frac_bins_any_covered(on1_poisson)
+    # same mean per-site depth, but "reads" must leave far more EMPTY bins
+    # (clustered coverage) than "poisson" (independent sites, ~always some
+    # hit in a 256-site bin at this depth)
+    assert frac_reads < 0.6 * frac_poisson
+
+
 def test_row_counts_bad_coverage_model_raises():
     rng = np.random.default_rng(1)
     pres1 = np.ones((1, 10), dtype=bool)
