@@ -462,6 +462,113 @@ def _indel_tracts(rng, n, M, R, density, ins_frac, large_frac, small_alpha,
     return del_mask, ins_bp
 
 
+def _lineage_indels(rng, n, K, M, R, lineage, frac, ins_frac, max_len):
+    """v3 "lineage" `--indel-model`: derive indel structure directly from
+    the EXISTING coalescent lineage mosaic instead of drawing a separate
+    Poisson/length-mixture process (`_indel_tracts`'s "tracts" mode).
+
+    For each (window, lineage m), a maximal contiguous run of sites where
+    >=1 founder currently occupies lineage m is a candidate: with
+    probability `frac` the WHOLE run is promoted to an indel (deletion,
+    or with probability `ins_frac` an insertion anchored at the run's own
+    start), using the run's OWN natural length -- no separate length-
+    mixture knob, `max_len` only caps pathologically long runs for
+    numeric/log-code sanity. Two founders sharing a lineage over the same
+    interval are on the same run and so always get an identical decision,
+    which is exactly how `_indel_tracts` + `_gather_by_lineage` already
+    make IBD founders share indel content -- correlation here falls
+    straight out of the SAME lineage structure that already drives SNP-
+    level sharing, not a second stacked stochastic layer (contrast with
+    `_indel_tracts`'s `--indel-shared-frac`/`--indel-cluster-theta`,
+    which was added on top specifically to fake this).
+
+    Implementation: `occ[n,m,r]` (any founder on lineage m at site r) is
+    segmented into runs the same way `_anchor_distance` finds nearest
+    anchors -- a "last run-start seen so far" / "next run-end seen from
+    here" running accumulate along the site axis (`np.maximum.accumulate`
+    / `np.minimum.accumulate`), not a per-run Python loop. One Bernoulli
+    draw per (n,m,r) decides promotion/ins-vs-del; only the draw AT each
+    run's own start position is used, gathered onto every other position
+    in that run via the accumulated start index -- so only two full-size
+    `[n,M,R]` draws are needed regardless of how many runs exist.
+
+    Returns `(del_mask[n,M,R] bool, ins_bp[n,M,R] int32)`, the exact
+    `_indel_tracts` output contract -- drop-in compatible with
+    `_indel_suppressed_rate`/`_indel_chunk`, no other `simulate()` change
+    needed for this mode's downstream handling.
+    """
+    occ = np.zeros((n, M, R), dtype=bool)
+    ii = np.arange(n)[:, None]
+    rr = np.arange(R)[None, :]
+    for k in range(K):
+        occ[ii, lineage[:, k, :], rr] = True
+
+    pos = np.arange(R)[None, None, :]
+    occ_prev = np.concatenate([np.zeros((n, M, 1), dtype=bool), occ[:, :, :-1]], axis=-1)
+    occ_next = np.concatenate([occ[:, :, 1:], np.zeros((n, M, 1), dtype=bool)], axis=-1)
+    run_start = occ & ~occ_prev
+    run_end = occ & ~occ_next
+
+    last_start_idx = np.maximum.accumulate(np.where(run_start, pos, -1), axis=-1)
+    end_idx_at_pos = np.where(run_end, pos, R)
+    next_end_idx = np.minimum.accumulate(end_idx_at_pos[:, :, ::-1], axis=-1)[:, :, ::-1]
+
+    valid = occ & (last_start_idx >= 0)
+    gather_idx = np.clip(last_start_idx, 0, R - 1)
+
+    promote_draw = rng.random((n, M, R)) < frac
+    ins_draw = rng.random((n, M, R)) < ins_frac
+    promote = np.take_along_axis(promote_draw, gather_idx, axis=-1) & valid
+    is_ins = np.take_along_axis(ins_draw, gather_idx, axis=-1)
+
+    run_len_full = (next_end_idx - last_start_idx + 1).clip(1, max_len)
+    run_len = np.take_along_axis(run_len_full, gather_idx, axis=-1)
+
+    del_mask = promote & ~is_ins
+    ins_bp = np.zeros((n, M, R), dtype=np.int32)
+    ins_event = promote & is_ins & run_start
+    ins_bp[ins_event] = run_len[ins_event]
+    return del_mask, ins_bp
+
+
+def _overlay_indels(rng, n, K, R, rate, mean_len, ins_frac, founder_freq, max_len):
+    """v3 "overlay" `--indel-model`: indels fully decoupled from the
+    coalescent lineage array -- each founder gets its own private
+    process, not tied to lineage-sharing, so IBD founders do NOT
+    automatically share indel content in this mode (an accepted,
+    documented simplification: "reference-stable" is read here as
+    "indel generation independent of the coalescent," while the
+    coalescent still supplies the SNP-match signal so founder-affinity
+    -- which only reads the SNP-match columns -- stays unaffected).
+
+    Reuses `_indel_tracts` verbatim with M=K (each founder treated as its
+    own private lineage slot) and a single LogNormal length scale
+    (`large_frac=1.0`, median `mean_len`) instead of the two-component
+    mixture -- one rate, one length scale, one founder-participation
+    frequency; the caller must pass a per-founder-IDENTITY lineage array
+    (`lineage[n,k,r]=k` for all r) to `_indel_suppressed_rate`/
+    `_indel_chunk` instead of the real coalescent lineage array, which is
+    what actually severs the tie to SNP-level IBD sharing (see
+    `simulate()`'s `indel_model=="overlay"` branch).
+
+    `founder_freq < 1` additionally gates entire founders out of indel
+    generation (a fraction of founders carry no indels at all, on top of
+    `rate` controlling event density among the founders that do).
+
+    Returns `(del_mask[n,K,R] bool, ins_bp[n,K,R] int32)`.
+    """
+    del_mask, ins_bp = _indel_tracts(
+        rng, n, K, R, rate, ins_frac,
+        large_frac=1.0, small_alpha=1.7, small_max=50,
+        large_logmean=float(np.log(max(mean_len, 1.0))), large_logsd=0.7,
+        max_len=max_len)
+    if founder_freq < 1.0:
+        gate = (rng.random((n, K)) < founder_freq)[:, :, None]
+        del_mask = del_mask & gate
+        ins_bp = ins_bp * gate.astype(ins_bp.dtype)
+    return del_mask, ins_bp
+
+
 def _indel_suppressed_rate(rate, del_mask, ins_bp, suppress, flank):
     """Recomb-rate map [n, R] with crossover locally suppressed near
     indels (PLAN.md SS2.6), reusing the EXISTING `--recomb-span` rate-map
@@ -838,14 +945,17 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              emit_snp_panel=False, inbreeding_per_window=None,
              breeding_classes=None, class_inbred_frac=0.5,
              constant_pair_frac=0.0, constant_inbred_frac=0.5, chunk=1000,
-             simulate_indels=False, indel_density=2.3e-3, indel_ins_frac=0.5,
+             simulate_indels=False, indel_model="tracts",
+             indel_density=2.3e-3, indel_ins_frac=0.5,
              indel_large_frac=0.027, indel_small_alpha=1.7, indel_small_max=50,
              indel_large_logmean=8.6, indel_large_logsd=1.6,
              indel_max_len=65536, indel_coverage=2.0,
              indel_ins_read_per_bp=2e-3, indel_max_stack=64,
              indel_region_mult=4, indel_recomb_suppress=0.9,
              indel_recomb_flank=32, indel_anchor_thresh=0,
-             indel_ref_founder=-1):
+             indel_ref_founder=-1, indel_lineage_frac=0.15,
+             indel_overlay_rate=2.3e-3, indel_overlay_mean_len=300.0,
+             indel_overlay_founder_freq=1.0):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
     (default) behavior, including rng draw order, is byte-for-byte
@@ -892,6 +1002,9 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             "emit_snp_panel is not supported with simulate_indels (the "
             "panel is reference-site indexed; this mode's row axis is "
             "not)")
+    if indel_model not in ("tracts", "lineage", "overlay"):
+        raise ValueError(f"indel_model must be one of tracts/lineage/overlay, "
+                          f"got {indel_model!r}")
     if not coalescent:
         q = (allele_sharing * K - 1.0) / (K - 1)   # match rate for non-true founders
         if q < 0:
@@ -959,10 +1072,24 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             lineage, M = _draw_lineages(rng, n, R, K, ancestors,
                                          ancestor_crossovers, rmap_R,
                                          sharing_theta, max_lin)
-            del_lin, ins_lin = _indel_tracts(
-                rng, n, M, R, indel_density, indel_ins_frac,
-                indel_large_frac, indel_small_alpha, indel_small_max,
-                indel_large_logmean, indel_large_logsd, indel_max_len)
+            if indel_model == "tracts":
+                del_lin, ins_lin = _indel_tracts(
+                    rng, n, M, R, indel_density, indel_ins_frac,
+                    indel_large_frac, indel_small_alpha, indel_small_max,
+                    indel_large_logmean, indel_large_logsd, indel_max_len)
+                lineage_indel, M_indel = lineage, M
+            elif indel_model == "lineage":
+                del_lin, ins_lin = _lineage_indels(
+                    rng, n, K, M, R, lineage, indel_lineage_frac,
+                    indel_ins_frac, indel_max_len)
+                lineage_indel, M_indel = lineage, M
+            else:  # "overlay" -- decoupled from the coalescent lineage array
+                del_lin, ins_lin = _overlay_indels(
+                    rng, n, K, R, indel_overlay_rate, indel_overlay_mean_len,
+                    indel_ins_frac, indel_overlay_founder_freq, indel_max_len)
+                lineage_indel = np.broadcast_to(
+                    np.arange(K, dtype=np.int32)[None, :, None], (n, K, R))
+                M_indel = K
             rmap_path = _indel_suppressed_rate(
                 rmap_R, del_lin, ins_lin, indel_recomb_suppress,
                 indel_recomb_flank)
@@ -1017,7 +1144,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
 
             (tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null,
              n_deleted, n_founder_sites) = _indel_chunk(
-                rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
+                rng, n, R, T, K, h1, h2, lineage_indel, del_lin, ins_lin,
                 match1, match2, gamete_balance, indel_coverage,
                 indel_ins_read_per_bp, indel_max_stack, indel_anchor_thresh,
                 indel_ref_founder, DIST_LOG_SCALE)
@@ -1247,6 +1374,34 @@ def parse_args():
                         "structure (mean event ~530bp, bp-dominant class 4-64kb) needs "
                         "a much larger --sites (8192+) to be meaningfully represented "
                         "in a single window.")
+    p.add_argument("--indel-model", choices=["tracts", "lineage", "overlay"],
+                   default="tracts",
+                   help="How indel structure is generated (v3, "
+                        "experiments/simulator-indels/PLAN.md v3 section). "
+                        "'tracts' (default): today's independent Poisson/length-"
+                        "mixture process (--indel-density etc, below) -- unchanged. "
+                        "'lineage': derive indels directly from the EXISTING "
+                        "coalescent lineage mosaic -- a contiguous run where a "
+                        "lineage is shared becomes a candidate indel with "
+                        "probability --indel-lineage-frac, using the run's own "
+                        "length; IBD correlation falls out of the same lineage "
+                        "structure that already drives SNP sharing, no separate "
+                        "stacked process. 'overlay': indels fully decoupled from "
+                        "the coalescent lineage array -- each founder gets its own "
+                        "private process (--indel-overlay-*), so IBD founders do "
+                        "NOT automatically share indel content in this mode.")
+    p.add_argument("--indel-lineage-frac", type=float, default=0.15,
+                   help="'lineage' --indel-model only: probability that a "
+                        "contiguous lineage-occupancy run is promoted to an indel.")
+    p.add_argument("--indel-overlay-rate", type=float, default=2.3e-3,
+                   help="'overlay' --indel-model only: indel events per reference "
+                        "bp per founder (among participating founders).")
+    p.add_argument("--indel-overlay-mean-len", type=float, default=300.0,
+                   help="'overlay' --indel-model only: median event length (bp), "
+                        "one LogNormal scale (no two-component mixture).")
+    p.add_argument("--indel-overlay-founder-freq", type=float, default=1.0,
+                   help="'overlay' --indel-model only: fraction of founders that "
+                        "participate in indel generation at all (1.0 = all K).")
     p.add_argument("--indel-density", type=float, default=2.3e-3,
                    help="Indel events per reference bp per lineage (ins+del combined). "
                         "Calibrated against BOTH real maize acceptance targets jointly "
@@ -1546,7 +1701,11 @@ def main():
         class_inbred_frac=args.class_inbred_frac,
         constant_pair_frac=args.constant_pair_frac,
         constant_inbred_frac=args.constant_inbred_frac,
-        simulate_indels=args.simulate_indels,
+        simulate_indels=args.simulate_indels, indel_model=args.indel_model,
+        indel_lineage_frac=args.indel_lineage_frac,
+        indel_overlay_rate=args.indel_overlay_rate,
+        indel_overlay_mean_len=args.indel_overlay_mean_len,
+        indel_overlay_founder_freq=args.indel_overlay_founder_freq,
         indel_density=args.indel_density, indel_ins_frac=args.indel_ins_frac,
         indel_large_frac=args.indel_large_frac,
         indel_small_alpha=args.indel_small_alpha,

@@ -13,6 +13,7 @@ from python.crf.simulate_alleles import (
     _indel_lengths, _encode_dist, _anchor_distance, _gather_by_lineage,
     _indel_tracts, _draw_lineages, _coalescent_feats, _good_mask, simulate,
     _indel_suppressed_rate, _row_counts, _sample_rows, _indel_chunk,
+    _lineage_indels, _overlay_indels,
 )
 
 # --- golden hashes: pre-change simulate() output on fixed args/seed, ------
@@ -763,3 +764,134 @@ def test_indel_chunk_insertion_stacking_appears_with_enough_budget():
     # colinear reads) -- the extra occurrences are the stacked insertion
     # reads, all landing at the SAME reference position.
     assert (refpos[0] == 1).sum() > 2
+
+
+# --- v3 --indel-model: _lineage_indels / _overlay_indels ----------------
+
+def _shared_lineage_fixture(seed=7, n=2, K=6, M=3, R=200):
+    rng = np.random.default_rng(seed)
+    lineage = rng.integers(0, M, size=(n, K, R)).astype(np.int32)
+    lineage[:, 0, 20:80] = 0
+    lineage[:, 1, 20:80] = 0          # founders 0,1 share lineage 0 on [20,80)
+    lineage[:, 2, 20:80] = 1          # founder 2 on a different lineage there
+    return rng, lineage, n, K, M, R
+
+
+def test_lineage_indels_shape_dtype():
+    rng, lineage, n, K, M, R = _shared_lineage_fixture()
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=0.5,
+                                        ins_frac=0.5, max_len=1000)
+    assert del_mask.shape == (n, M, R) and del_mask.dtype == bool
+    assert ins_bp.shape == (n, M, R) and ins_bp.dtype == np.int32
+
+
+def test_lineage_indels_never_active_where_lineage_unoccupied():
+    rng, lineage, n, K, M, R = _shared_lineage_fixture()
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=0.9,
+                                        ins_frac=0.3, max_len=1000)
+    occ = np.zeros((n, M, R), dtype=bool)
+    ii, rr = np.arange(n)[:, None], np.arange(R)[None, :]
+    for k in range(K):
+        occ[ii, lineage[:, k, :], rr] = True
+    assert not (del_mask & ~occ).any()
+    assert not ((ins_bp > 0) & ~occ).any()
+
+
+def test_lineage_indels_ibd_founders_share_content_after_gather():
+    """Founders 0,1 share lineage 0 on [20,80) -- after the SAME
+    `_gather_by_lineage` projection `_indel_tracts` output also goes
+    through, they must see byte-identical indel content there (the
+    core correlation claim of --indel-model lineage)."""
+    rng, lineage, n, K, M, R = _shared_lineage_fixture()
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=0.9,
+                                        ins_frac=0.3, max_len=1000)
+    del_kt = _gather_by_lineage(del_mask, lineage)
+    ins_kt = _gather_by_lineage(ins_bp, lineage)
+    assert np.array_equal(del_kt[:, 0, 20:80], del_kt[:, 1, 20:80])
+    assert np.array_equal(ins_kt[:, 0, 20:80], ins_kt[:, 1, 20:80])
+
+
+def test_lineage_indels_promoted_run_uses_its_own_full_length():
+    """frac=1.0, ins_frac=0.0 -> every occupied run is a full-length
+    deletion; the promoted run on [20,80) must be deleted in full,
+    not some Poisson-drawn sub-length."""
+    rng, lineage, n, K, M, R = _shared_lineage_fixture()
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=1.0,
+                                        ins_frac=0.0, max_len=1000)
+    assert del_mask[:, 0, 20:80].all()
+    assert not ins_bp.any()
+
+
+def test_lineage_indels_zero_frac_is_a_no_op():
+    rng, lineage, n, K, M, R = _shared_lineage_fixture()
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=0.0,
+                                        ins_frac=0.5, max_len=1000)
+    assert not del_mask.any()
+    assert not ins_bp.any()
+
+
+def test_overlay_indels_shape_dtype():
+    rng = np.random.default_rng(3)
+    n, K, R = 3, 8, 500
+    del_mask, ins_bp = _overlay_indels(rng, n, K, R, rate=1e-2, mean_len=50,
+                                        ins_frac=0.4, founder_freq=1.0, max_len=1000)
+    assert del_mask.shape == (n, K, R) and del_mask.dtype == bool
+    assert ins_bp.shape == (n, K, R) and ins_bp.dtype == np.int32
+
+
+def test_overlay_indels_founder_freq_gates_whole_founders():
+    rng = np.random.default_rng(3)
+    n, K, R = 4, 40, 2000
+    del_mask, ins_bp = _overlay_indels(rng, n, K, R, rate=0.02, mean_len=40,
+                                        ins_frac=0.4, founder_freq=0.5, max_len=1000)
+    active = del_mask.any(axis=2) | (ins_bp > 0).any(axis=2)   # [n,K]
+    frac_active = active.mean()
+    assert 0.3 < frac_active < 0.7   # loose band around founder_freq=0.5
+
+
+def test_overlay_indels_zero_founder_freq_is_a_no_op():
+    rng = np.random.default_rng(3)
+    n, K, R = 2, 6, 500
+    del_mask, ins_bp = _overlay_indels(rng, n, K, R, rate=0.05, mean_len=50,
+                                        ins_frac=0.5, founder_freq=0.0, max_len=1000)
+    assert not del_mask.any()
+    assert not ins_bp.any()
+
+
+@pytest.mark.parametrize("model", ["tracts", "lineage", "overlay"])
+def test_simulate_indel_model_end_to_end_shape(model):
+    """Each --indel-model runs simulate() end to end without crashing and
+    produces the same [windows,T,2K+2] output contract."""
+    K, T = 8, 300
+    out = simulate(
+        np.random.default_rng(5), windows=2, sites=T, founders=K,
+        min_cross=1, max_cross=3, inbreeding=0.0, allele_sharing=0.6,
+        bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+        sharing_theta=4.0, simulate_indels=True, indel_model=model,
+        indel_region_mult=4, indel_coverage=2.0)[0]
+    assert out.shape == (2, T, 2 * K + 2)
+    assert out.dtype == np.int8
+
+
+def test_simulate_indel_model_lineage_and_tracts_differ():
+    """Same seed/args, only --indel-model differs -> output must differ
+    (confirms the dispatch actually takes effect, not a silent fallthrough)."""
+    K, T = 8, 300
+    kw = dict(windows=3, sites=T, founders=K, min_cross=1, max_cross=3,
+              inbreeding=0.0, allele_sharing=0.6, bad_frac=0.02,
+              sharing_model="coalescent", ancestors=6, sharing_theta=4.0,
+              simulate_indels=True, indel_region_mult=4, indel_coverage=2.0)
+    out_tracts = simulate(np.random.default_rng(9), indel_model="tracts", **kw)[0]
+    out_lineage = simulate(np.random.default_rng(9), indel_model="lineage", **kw)[0]
+    out_overlay = simulate(np.random.default_rng(9), indel_model="overlay", **kw)[0]
+    assert not np.array_equal(out_tracts, out_lineage)
+    assert not np.array_equal(out_tracts, out_overlay)
+    assert not np.array_equal(out_lineage, out_overlay)
+
+
+def test_simulate_bad_indel_model_raises():
+    with pytest.raises(ValueError):
+        simulate(np.random.default_rng(1), windows=1, sites=100, founders=4,
+                 min_cross=1, max_cross=2, inbreeding=0.0, allele_sharing=0.6,
+                 bad_frac=0.0, sharing_model="coalescent",
+                 simulate_indels=True, indel_model="bogus")
