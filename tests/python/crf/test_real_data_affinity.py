@@ -1,6 +1,9 @@
 """
 Real-data gate for the founder-affinity mechanism (_founder_affinity,
-estimate_inbreeding_coef, homo_scale_from_affinity in train_diploid.py):
+estimate_inbreeding_coef, homo_scale_from_affinity in train_diploid.py) and
+the one canonical real-data inference entrypoint
+(infer_real_founder_pairs, train_diploid_indel.py -- every eval script
+should call this, not re-derive the ext_emb/homo_scale/decode loop):
 real IDX-INBRED/IDX-HYB/IDX-RIL2 samples with known true founders, not
 simulated data. This is the check the model-comparison work in this
 session's checkpoints depends on -- if it fails, the affinity signal
@@ -22,7 +25,9 @@ import pandas as pd
 import torch
 
 from python.crf.train_diploid import (
-    _founder_affinity, estimate_inbreeding_coef, homo_scale_from_affinity)
+    _founder_affinity, estimate_inbreeding_coef, homo_scale_from_affinity,
+    _estimate_inbreeding_coef_batch)
+from python.crf.train_diploid_indel import infer_real_founder_pairs
 
 REALDIR = "/workdir/zrm22/HackathonJun2026/grits_workdir/data/real"
 CKPT = ("/workdir/zrm22/HackathonJun2026/grits_workdir/indel_baseline/checkpoints/"
@@ -173,36 +178,15 @@ class TestRealDataEndToEndPairAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from python.crf.train_diploid_indel import GRITSCRFDiploidIndel
-        from python.crf.crf_kernels import _dcrf_viterbi
-        cls._dcrf_viterbi = staticmethod(_dcrf_viterbi)
         cls.device = "cuda" if torch.cuda.is_available() else "cpu"
         cls.model = GRITSCRFDiploidIndel.load_from_checkpoint(
             CKPT, map_location=cls.device).eval().to(cls.device)
 
     def _pair_acc(self, ds, ind, p1, p2):
         data = np.load(_sample_path(ds, ind))
-        N, T, W = data.shape
-        tern = data[:, :, :K].astype(np.float32)
-        dist = data[:, :, K + 2:2 * K + 2].astype(np.float32)
-        feats = torch.tensor(np.stack([tern, dist], axis=-1), dtype=torch.float32)
-        M = (tern == 1).astype(np.float32)
-        affinity = _founder_affinity(M.reshape(-1, K))
-        homo_scale = homo_scale_from_affinity(M)
-        ext_emb = torch.tensor(affinity, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
         true_lo, true_hi = min(IDX[p1], IDX[p2]), max(IDX[p1], IDX[p2])
-
-        preds_lo, preds_hi = [], []
-        with torch.no_grad():
-            for s in range(0, N, 64):
-                xb = feats[s:s + 64].to(self.device)
-                eb = ext_emb[s:s + 64].to(self.device)
-                hs = torch.full((xb.shape[0],), homo_scale, device=self.device)
-                emis_p, g, c = self.model(xb, ext_emb=eb, homo_scale=hs)
-                pred = self._dcrf_viterbi(emis_p, c, self.model.nsw_pair, self.model.stay_bonus)
-                preds_lo.append(self.model.pi[pred].cpu())
-                preds_hi.append(self.model.pj[pred].cpu())
-        pred_lo, pred_hi = torch.cat(preds_lo), torch.cat(preds_hi)
-        return ((pred_lo == true_lo) & (pred_hi == true_hi)).float().mean().item()
+        pred_lo, pred_hi = infer_real_founder_pairs(self.model, data, K, device=self.device)
+        return float(np.mean((pred_lo == true_lo) & (pred_hi == true_hi)))
 
     def test_real_inbred_pair_accuracy_with_adaptive_homo_scale(self):
         for ds, ind, (p1, p2) in SAMPLES:
@@ -278,8 +262,7 @@ class TestRealRIL2AffinityAndTruth(unittest.TestCase):
         for pair in RIL2_PAIRS:
             with self.subTest(pair=pair):
                 M = _load_match("IDX-RIL2", pair)
-                per_window = np.array([
-                    estimate_inbreeding_coef(_founder_affinity(M[w])[:, 0]) for w in range(M.shape[0])])
+                per_window = _estimate_inbreeding_coef_batch(M.mean(axis=1))
                 p90 = np.percentile(per_window, 90)
                 self.assertGreater(p90, 0.5, f"{pair}: p90 per-window est_F={p90:.3f}, expected >0.5")
 
@@ -296,8 +279,6 @@ class TestRealRIL2EndToEndPairAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from python.crf.train_diploid_indel import GRITSCRFDiploidIndel
-        from python.crf.crf_kernels import _dcrf_viterbi
-        cls._dcrf_viterbi = staticmethod(_dcrf_viterbi)
         cls.device = "cuda" if torch.cuda.is_available() else "cpu"
         cls.model = GRITSCRFDiploidIndel.load_from_checkpoint(
             CKPT, map_location=cls.device).eval().to(cls.device)
@@ -305,30 +286,10 @@ class TestRealRIL2EndToEndPairAccuracy(unittest.TestCase):
     def _pair_acc(self, pair):
         data = np.load(_sample_path("IDX-RIL2", pair))
         truth_w = _ril2_truth_windows(pair)
-        N, T, W = data.shape
-        tern = data[:, :, :K].astype(np.float32)
-        dist = data[:, :, K + 2:2 * K + 2].astype(np.float32)
-        feats = torch.tensor(np.stack([tern, dist], axis=-1), dtype=torch.float32)
-        M = (tern == 1).astype(np.float32)
-        affinity = _founder_affinity(M.reshape(-1, K))
-        homo_scale = homo_scale_from_affinity(M)
-        ext_emb = torch.tensor(affinity, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
-
         true_h1, true_h2 = truth_w[:, :, 0], truth_w[:, :, 1]
         valid = (true_h1 < K) & (true_h2 < K)
         true_lo, true_hi = np.minimum(true_h1, true_h2), np.maximum(true_h1, true_h2)
-
-        preds_lo, preds_hi = [], []
-        with torch.no_grad():
-            for s in range(0, N, 64):
-                xb = feats[s:s + 64].to(self.device)
-                eb = ext_emb[s:s + 64].to(self.device)
-                hs = torch.full((xb.shape[0],), homo_scale, device=self.device)
-                emis_p, g, c = self.model(xb, ext_emb=eb, homo_scale=hs)
-                pred = self._dcrf_viterbi(emis_p, c, self.model.nsw_pair, self.model.stay_bonus)
-                preds_lo.append(self.model.pi[pred].cpu().numpy())
-                preds_hi.append(self.model.pj[pred].cpu().numpy())
-        pred_lo, pred_hi = np.concatenate(preds_lo), np.concatenate(preds_hi)
+        pred_lo, pred_hi = infer_real_founder_pairs(self.model, data, K, device=self.device)
         return ((pred_lo == true_lo) & (pred_hi == true_hi))[valid].mean()
 
     def test_real_ril2_pair_accuracy_with_adaptive_homo_scale(self):

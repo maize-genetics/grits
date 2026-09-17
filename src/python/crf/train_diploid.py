@@ -211,11 +211,29 @@ def homo_scale_from_affinity(M, percentile=90, inbred_thresh=0.5):
 
     M: [N,T,K] binary match indicator for the WHOLE individual (all
     windows), NOT pre-aggregated."""
-    N = M.shape[0]
-    per_window_est_F = np.array([
-        estimate_inbreeding_coef(_founder_affinity(M[w])[:, 0]) for w in range(N)])
+    win_rate = M.mean(axis=1)                                     # [N,K]
+    per_window_est_F = _estimate_inbreeding_coef_batch(win_rate)   # [N]
     p_val = np.percentile(per_window_est_F, percentile)
     return 0.0 if p_val > inbred_thresh else 1.0
+
+
+def _estimate_inbreeding_coef_batch(rates):
+    """Vectorized estimate_inbreeding_coef over [N,K] -> [N] (one row per
+    window). Numerically identical to calling estimate_inbreeding_coef on
+    each row in a Python loop, but computed via argsort/take_along_axis
+    across the whole batch at once -- the loop was the actual bottleneck in
+    homo_scale_from_affinity at real high-coverage N (tens of thousands of
+    windows per individual at 2.0x), not the model inference or the
+    prediction-vs-truth comparison."""
+    order = np.argsort(-rates, axis=1)
+    r1 = np.take_along_axis(rates, order[:, :1], axis=1)[:, 0]
+    r2 = np.take_along_axis(rates, order[:, 1:2], axis=1)[:, 0]
+    bg = np.median(np.take_along_axis(rates, order[:, 2:], axis=1), axis=1)
+    denom = r1 - bg
+    out = np.zeros(len(rates), dtype=np.float64)
+    valid = denom > 1e-6
+    out[valid] = 1.0 - np.clip((r2[valid] - bg[valid]) / denom[valid], 0.0, 1.0)
+    return out
 
 
 class DiploidAffinityDataset(PreWindowedDiploidDataset):

@@ -50,7 +50,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from python.crf.train_crf import IndelFounderPathEncoder
 from python.crf.crf_kernels import _dcrf_nll, _dcrf_viterbi, build_pair_tables
-from python.crf.train_diploid import _founder_affinity
+from python.crf.train_diploid import _founder_affinity, homo_scale_from_affinity
 from python.crf.callbacks import EMACallback
 
 # --- Indel-mode sentinels, mirroring simulate_alleles.py's contract -------
@@ -405,6 +405,54 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
             opt, mode="min", factor=0.5, patience=5)
         return {"optimizer": opt, "lr_scheduler": sched, "monitor": "val/loss"}
+
+
+def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=64):
+    """THE single real-data inference recipe for GRITSCRFDiploidIndel --
+    every eval script (real-data unit tests, depth sweeps, per-checkpoint
+    comparisons) should call this instead of re-deriving the ext_emb /
+    homo_scale / batch / decode loop itself. Real-world ML teams call this
+    "training/serving skew" risk: if feature computation isn't provably the
+    same code path everywhere it's used, eval numbers silently drift from
+    what a shipped model actually does. This session accumulated a dozen
+    near-duplicate scratch scripts before consolidating here -- exactly the
+    failure mode a shared function prevents.
+
+    data: [N,T,2*num_parents+2] real ternary+distance array (the H1/H2
+    label columns are ignored -- real inference never has embedded truth).
+    Uses the checkpoint's one established recipe: genome-wide founder
+    affinity as ext_emb, homo_scale_from_affinity (train_diploid.py, the
+    p90-of-per-window-inbreeding-estimate classifier) as homo_scale. No
+    other variant/override point -- if a different homo_scale is ever
+    needed, change it here, once, not in each caller.
+
+    Returns (pred_lo, pred_hi): [N,T] int arrays, the low/high founder
+    index of the predicted pair at every real site."""
+    K = num_parents
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    N, T, W = data.shape
+    if W != 2 * K + 2:
+        raise ValueError(f"data width {W} != 2*num_parents+2={2 * K + 2}")
+
+    tern = data[:, :, :K].astype(np.float32)
+    dist = data[:, :, K + 2:2 * K + 2].astype(np.float32)
+    feats = torch.tensor(np.stack([tern, dist], axis=-1), dtype=torch.float32)
+    M = (tern == TERN_MATCH).astype(np.float32)
+    affinity = _founder_affinity(M.reshape(-1, K))
+    homo_scale = homo_scale_from_affinity(M)
+    ext_emb = torch.tensor(affinity, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
+
+    preds_lo, preds_hi = [], []
+    with torch.no_grad():
+        for s in range(0, N, batch_size):
+            xb = feats[s:s + batch_size].to(device)
+            eb = ext_emb[s:s + batch_size].to(device)
+            hs = torch.full((xb.shape[0],), homo_scale, device=device)
+            emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs)
+            pred = _dcrf_viterbi(emis_p, c, model.nsw_pair, model.stay_bonus)
+            preds_lo.append(model.pi[pred].cpu().numpy())
+            preds_hi.append(model.pj[pred].cpu().numpy())
+    return np.concatenate(preds_lo), np.concatenate(preds_hi)
 
 
 def parse_args():
