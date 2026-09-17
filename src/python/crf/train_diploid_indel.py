@@ -469,42 +469,22 @@ def _window_error_slots(true_lo_w0, true_hi_w0, maj_lo, maj_hi):
     return list(zip(wrong_true, wrong_pred))
 
 
-def ibd_adjusted_accuracy(model, data, num_parents, true_lo, true_hi, valid,
-                           raw_counts, row_idx, device=None, ibd_thresh=0.8):
-    """Second real-data accuracy metric alongside plain pair_acc: credits
-    window-level errors that real raw read support cannot actually
-    distinguish from the true call (genuine identity-by-descent -- verified
-    this session: 95.3% of real RIL2 errors and 87.7% of real HYB errors
-    show the wrong founder's real support statistically tied with or
-    exceeding the true founder's, concentrated in B73-involving pairs with
-    confirmed local IBD tracts on chr5/6/7/8).
+def score_ibd_adjusted_accuracy(pred_lo, pred_hi, true_lo, true_hi, valid,
+                                 raw_counts, row_idx, num_parents, ibd_thresh=0.8):
+    """The scoring half of ibd_adjusted_accuracy, taking predictions
+    directly instead of a model+data pair -- lets this metric be applied to
+    ANY model's predictions on the same real sample (e.g. comparing the
+    older non-indel GRITSCRFDiploid against GRITSCRFDiploidIndel apples-to-
+    apples: same truth, same raw-support IBD check, same ibd_thresh, only
+    the predictions differ). See ibd_adjusted_accuracy's docstring for the
+    full mechanism description; this is the reusable core of it.
 
-    For each 512-site window, compares the model's majority predicted pair
-    to the true pair (using infer_real_founder_pairs -- the one canonical
-    inference path). If they disagree AND the window has a single
-    well-defined true pair (no internal truth switch), checks the
-    mismatched founder(s)' real raw read support (mean over the window's
-    real rows, from `raw_counts` = raw.npy's [:, :num_parents] count block)
-    against the true founder(s)'. If the wrong founder's support is
-    >=ibd_thresh (default 0.8, calibrated against a correctly-decoded
-    control population -- see [[ibd_adjusted_accuracy_metric]]) of the true
-    founder's, the whole window is credited as correct for this metric: the
-    model's call reflects a real, information-theoretically justified
-    alternative reading of genuinely ambiguous data, not a mistake.
-    Internal-truth-switch windows, or windows where support can't be
-    assessed, are left unadjusted (scored exactly as pair_acc).
-
-    data: [N,T,2*num_parents+2] real array. true_lo/true_hi/valid: [N,T]
-    per-site (pass constant arrays for INBRED/HYB, real oracle per-site
-    arrays for kinds like RIL2 whose true pair varies along the genome).
-    row_idx: list of N real-row-index arrays, one per window, matching
-    data's window boundaries (see ropebwt_npy_to_matrix.py's --window-size
-    chunking -- same convention test_real_data_affinity.py's
-    _ril2_truth_windows uses).
+    pred_lo/pred_hi/true_lo/true_hi/valid: [N,T]. raw_counts: raw.npy's
+    count block (or anything indexable as raw_counts[rows, :num_parents]).
+    row_idx: list of N real-row-index arrays, one per window.
 
     Returns (pair_acc, ibd_adjusted_acc, n_windows_credited, n_windows_checked).
     """
-    pred_lo, pred_hi = infer_real_founder_pairs(model, data, num_parents, device=device)
     pair_acc = float(((pred_lo == true_lo) & (pred_hi == true_hi))[valid].mean())
 
     N, T = pred_lo.shape
@@ -532,6 +512,50 @@ def ibd_adjusted_accuracy(model, data, num_parents, true_lo, true_hi, valid,
     adjusted_correct = ((pred_lo == true_lo) & (pred_hi == true_hi)) | credited
     ibd_adj_acc = float(adjusted_correct[valid].mean())
     return pair_acc, ibd_adj_acc, n_credited_windows, n_checked
+
+
+def ibd_adjusted_accuracy(model, data, num_parents, true_lo, true_hi, valid,
+                           raw_counts, row_idx, device=None, ibd_thresh=0.8):
+    """Second real-data accuracy metric alongside plain pair_acc: credits
+    window-level errors that real raw read support cannot actually
+    distinguish from the true call (genuine identity-by-descent -- verified
+    this session: 95.3% of real RIL2 errors and 87.7% of real HYB errors
+    show the wrong founder's real support statistically tied with or
+    exceeding the true founder's, concentrated in B73-involving pairs with
+    confirmed local IBD tracts on chr5/6/7/8).
+
+    For each 512-site window, compares the model's majority predicted pair
+    to the true pair (using infer_real_founder_pairs -- the one canonical
+    inference path). If they disagree AND the window has a single
+    well-defined true pair (no internal truth switch), checks the
+    mismatched founder(s)' real raw read support (mean over the window's
+    real rows, from `raw_counts` = raw.npy's [:, :num_parents] count block)
+    against the true founder(s)'. If the wrong founder's support is
+    >=ibd_thresh (default 0.8, calibrated against a correctly-decoded
+    control population) of the true founder's, the whole window is
+    credited as correct for this metric: the model's call reflects a real,
+    information-theoretically justified alternative reading of genuinely
+    ambiguous data, not a mistake. Internal-truth-switch windows, or
+    windows where support can't be assessed, are left unadjusted (scored
+    exactly as pair_acc).
+
+    Thin wrapper around score_ibd_adjusted_accuracy (the reusable scoring
+    core -- use that directly to score a DIFFERENT model's predictions on
+    the same sample/truth/raw-support for an apples-to-apples comparison).
+
+    data: [N,T,2*num_parents+2] real array. true_lo/true_hi/valid: [N,T]
+    per-site (pass constant arrays for INBRED/HYB, real oracle per-site
+    arrays for kinds like RIL2 whose true pair varies along the genome).
+    row_idx: list of N real-row-index arrays, one per window, matching
+    data's window boundaries (see ropebwt_npy_to_matrix.py's --window-size
+    chunking -- same convention test_real_data_affinity.py's
+    _ril2_truth_windows uses).
+
+    Returns (pair_acc, ibd_adjusted_acc, n_windows_credited, n_windows_checked).
+    """
+    pred_lo, pred_hi = infer_real_founder_pairs(model, data, num_parents, device=device)
+    return score_ibd_adjusted_accuracy(pred_lo, pred_hi, true_lo, true_hi, valid,
+                                        raw_counts, row_idx, num_parents, ibd_thresh=ibd_thresh)
 
 
 def parse_args():
