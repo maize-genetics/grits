@@ -681,11 +681,20 @@ def parse_args():
     p.add_argument("--resume", default=None,
                    help="Path to a .ckpt to resume training from (optimizer/scheduler "
                         "state included; passed as Trainer.fit(ckpt_path=...)).")
+    p.add_argument("--warm-start-ckpt", default=None,
+                   help="Path to a .ckpt to load ONLY the model weights from "
+                        "(strict=False, e.g. an older checkpoint that predates "
+                        "density_proj -- experiments/depth-confidence-fix/), then "
+                        "train fresh (new optimizer/scheduler/epoch state) -- unlike "
+                        "--resume, which requires an exact architecture match and "
+                        "restores full trainer state. Mutually exclusive with --resume.")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.resume and args.warm_start_ckpt:
+        raise SystemExit("--resume and --warm-start-ckpt are mutually exclusive")
     workdir = Path(args.workdir)
     ckpt_dir = workdir / "checkpoints" / args.run_name
     log_dir = workdir / "logs"
@@ -719,6 +728,18 @@ def main():
         loss_spike_mult=args.loss_spike_mult,
         learned_het=args.learned_het, founder_affinity=args.founder_affinity,
         fast_cells=args.fast_cells)
+
+    if args.warm_start_ckpt:
+        # Weight-only load (strict=False): the source checkpoint may predate
+        # params this architecture has since gained (e.g. density_proj --
+        # experiments/depth-confidence-fix/), which stay at this model's own
+        # init (zero, for density_proj) rather than being an error. Optimizer/
+        # scheduler/epoch state is intentionally NOT restored -- this is a
+        # fresh training run seeded with old weights, not a resumed one.
+        sd = torch.load(args.warm_start_ckpt, map_location="cpu", weights_only=False)["state_dict"]
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        print(f"--warm-start-ckpt {args.warm_start_ckpt}: "
+              f"missing={missing} unexpected={unexpected}")
 
     # Checkpoint/stop on val/pair_acc (max), matching train_diploid.py: the CRF
     # partition NLL can spike on long-block data even as Viterbi accuracy stays
