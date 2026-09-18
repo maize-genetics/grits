@@ -301,20 +301,127 @@ not the feature itself. Not yet promoted; not disproven either. Branch
 `indel-density-features` (and `window_density` within it) remains a
 separate, still-unresolved hypothesis on its own branch.
 
+### Full-scale retrain — matches original recipe's exact scale, but a severe, founder-specific regression appears
+
+Repeated the isolated-variable recipe above at the original v3-K25's
+exact scale: 500+500 individuals (`--inbreeding 1.0`/`0.0`, same clean
+split), `--sites 60000` (not 8192), `--indel-region-mult 4`,
+`--emit-read-counts` — sliced output was **`(117000, 512, 77)`, 1000
+individuals × G=117**, an exact match to the original `maize_v3_k25
+_sliced.npy`'s own `N=117,000 individuals=1000` (only the width differs,
+2K+2→3K+2). `scripts/slice_contigs.py` needed no changes at all — it
+slices along the row axis, agnostic to column width (verified by direct
+content comparison against the source array before trusting it).
+Warm-started identically, 5 epochs, `val_pair_acc` climbed to 0.4533 —
+much higher than the validation-scale run's 0.2527, as expected with far
+more data. Real eval data (`--emit-read-counts`) generated for **all 15**
+IDX-INBRED/IDX-HYB/IDX-RIL2 samples at all 5 depths (not just
+Oh43xIl14H), per request, regardless of how the result looked.
+
+Mean `pair_acc` / `ibd_adjusted_accuracy` by kind and depth, baseline vs.
+full-scale readcount checkpoint (`diploid-indel-v3-readcount-fullscale`,
+epoch 3, val_pair_acc=0.4533):
+
+| kind | metric | 0.01x | 0.1x | 0.5x | 1.0x | 2.0x |
+|---|---|---|---|---|---|---|
+| INBRED | baseline pair_acc | 100.00 | 100.00 | 100.00 | 100.00 | 100.00 |
+| INBRED | new pair_acc | 99.91 | 99.49 | 99.14 | 98.65 | **97.74** |
+| INBRED | baseline/new ibd_adj | 100.00 | 100.00 | 100.00 | 100.00 | 100.00 |
+| HYB | baseline pair_acc | 100.00 | 99.23 | 97.73 | 96.95 | 96.16 |
+| HYB | **new pair_acc** | **50.88** | **38.79** | **31.68** | **29.72** | **28.11** |
+| HYB | baseline ibd_adj | 100.00 | 99.87 | 99.69 | 99.66 | 99.63 |
+| HYB | new ibd_adj | 86.73 | 79.92 | 83.26 | 84.90 | 85.96 |
+| RIL2 | baseline pair_acc | 96.67 | 98.83 | 98.59 | 98.49 | 98.30 |
+| RIL2 | new pair_acc | 96.53 | 92.61 | 89.82 | 88.98 | 88.16 |
+| RIL2 | baseline/new ibd_adj | ~99.6-99.8 | ~99.5-99.6 | ~99.7 | ~99.8 | ~99.8 |
+
+**This is not a mild, uniform regression like the validation-scale
+round — HYB pair_acc collapsed to near-chance.** Per-sample detail
+revealed a clean, severe, founder-specific pattern, not noise:
+
+| sample | baseline pair_acc (2.0x) | new pair_acc (2.0x) |
+|---|---|---|
+| INBRED B73 | 100.00% | **88.70%** (only non-perfect INBRED; all 4 others stayed exactly 100.00% at every depth) |
+| HYB B73xOh43 | 95.29% | **6.39%** |
+| HYB B73xCML103 | ~95% | **5.50%** |
+| HYB Oh43xIl14H | 96.50% | 42.68% |
+| HYB B97xCML103 | ~96% | 45.23% |
+| HYB Il14HxB97 | ~96% | 40.73% |
+| RIL2 B73xCML103 | ~99% | **69.57%** |
+| RIL2 B73xOh43 | ~99% | **73.13%** |
+| RIL2 B97xCML103 | 99.42% | 99.43% |
+| RIL2 Il14HxB97 | ~99% | 99.35% |
+| RIL2 Oh43xIl14H | 99.42% | 99.32% |
+
+**Every sample involving B73 (founder index 0 in this panel) is
+severely degraded; every sample not involving B73 shows the milder,
+roughly-expected pattern** (matching the validation-scale round's
+magnitude for non-B73 HYB pairs, and near-baseline for non-B73 RIL2).
+Severity scales with how actively the decode must *distinguish* B73 from
+alternatives: INBRED B73 (must just stay homozygous) degrades mildly;
+RIL2 B73-pairs (mixed local homo/het) degrade moderately; HYB B73-pairs
+(must actively pick B73 vs. one specific alternative every window)
+collapse to near-chance. `ibd_adjusted_accuracy` for HYB (80-87%) is
+well above raw `pair_acc` (28-51%) but still far below baseline's
+~99.6-99.9%, so this isn't just "confidently wrong on ties" — the raw
+founder-pair prediction itself is often genuinely broken specifically
+where B73 is a candidate.
+
+**Not (obviously) a code bug.** Nothing in `--emit-read-counts` or the
+model changes special-cases founder index 0 anywhere — the count
+aggregation, `count_proj`, and `_cell_input` all operate identically
+across all K founders. B73 is the real panel's reference genome, and the
+simulator's `--indel-ref-founder` defaults to `-1` (no founder is given
+special reference-like treatment during generation) — a genuine
+simulated/real domain mismatch for whichever index happens to be B73 in
+the real panel. But **this exact mismatch was equally present in the
+original v3-K25 training** (same default), and its checkpoint handles
+B73 fine (95-100% across all B73-involving samples) — so the mismatch
+alone doesn't explain why this specific retrain broke it. Leading
+hypothesis: a genuine warm-start/retraining instability specific to this
+run's data realization, not (yet) shown to be inherent to the count
+feature or to scale generally — this project has documented history of
+exactly this class of pathology (`baseline_training_log_2026-09-15.md`'s
+"the homo-penalty detour": `--homo-penalty 3` caused loss to go flat/
+oscillate under certain data compositions in earlier training attempts).
+**Not diagnosed further this round** — the natural next check (not yet
+run) is the same full-scale scale, warm-start, and composition with the
+count block stripped (mirroring the validation-scale `scale-control`
+ablation that cleanly resolved the earlier confound) to see whether this
+B73-specific collapse is present without the count feature too, which
+would point away from count entirely and toward something in the retrain
+recipe itself.
+
+### Verdict, updated
+
+The validation-scale round's cautiously positive read (count helps
+0.1x-1.0x once isolated from a composition confound) **does not
+generalize cleanly to full scale** — at minimum, this specific full-scale
+run introduced a severe, B73-specific regression that swamps any
+depth-confidence signal for the affected samples. Genuinely unresolved:
+whether this is a count-feature problem, a general full-scale-retrain
+instability (independent of count), or a data-realization fluke specific
+to this run's `--seed 401`/`402`. **Not promoted. Do not use
+`diploid-indel-v3-readcount-fullscale` for anything.**
+
 ### Next steps (not yet done)
 
-1. **Full-scale retrain** — repeat this exact recipe (clean INBRED/HYB
-   composition, `--emit-read-counts`, warm-start) at a scale matching the
-   original v3-K25 recipe (~1000 individuals, `--sites 60000`-ish) to see
-   whether the count feature's small positive effect holds up or grows
-   once the scale deficit is removed. This is the natural next
-   experiment, not yet run (validation-scale only, this round).
-2. **Genotype-level confirmation** — the plan's Verification item 5
-   (genome-wide SNP+RefCall rescore) was not yet run for either the
-   readcount-isolated or scale-control checkpoints; founder-decode and
-   genotype accuracy have already diverged once this session, so this
-   remains required before any promotion decision.
-3. If a full-scale retrain confirms the effect, consider whether the
-   simulator's own count-derivation simplification (site-uniform count
-   magnitude across all MATCH-showing founders at a site, vs. real data's
-   richer independently-varying per-founder counts) is worth refining.
+1. **Full-scale no-count control** — same scale/composition/warm-start,
+   count block stripped (`maize_v3_readcount_sliced_nocount.npy`'s
+   full-scale sibling doesn't exist yet) — directly tests whether the
+   B73-specific collapse is count-caused or a general full-scale-retrain
+   issue. The single highest-value next experiment.
+2. If the control also collapses on B73: this is unrelated to the count
+   feature, points at something about this retrain recipe at this scale
+   (or this specific data realization) more generally — investigate
+   independent of the read-count-feature hypothesis.
+3. If the control does NOT collapse on B73: isolates the problem to the
+   count feature specifically at full scale — worth checking whether
+   `count_proj`'s learned weights are unusually extreme/unstable, or
+   whether the simulator's count-derivation simplification (site-uniform
+   count magnitude, PLAN.md's documented simplification) interacts badly
+   with founder index 0's simulated-vs-real asymmetry specifically.
+4. **Genotype-level confirmation** — the plan's Verification item 5
+   (genome-wide SNP+RefCall rescore) still not run for any of these
+   checkpoints; remains required before any promotion decision regardless
+   of how the above resolves.
