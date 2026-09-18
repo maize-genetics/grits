@@ -475,9 +475,34 @@ def score_ibd_adjusted_accuracy(pred_lo, pred_hi, true_lo, true_hi, valid,
     directly instead of a model+data pair -- lets this metric be applied to
     ANY model's predictions on the same real sample (e.g. comparing the
     older non-indel GRITSCRFDiploid against GRITSCRFDiploidIndel apples-to-
-    apples: same truth, same raw-support IBD check, same ibd_thresh, only
-    the predictions differ). See ibd_adjusted_accuracy's docstring for the
-    full mechanism description; this is the reusable core of it.
+    apples: same truth, same raw-support check, same ibd_thresh, only the
+    predictions differ). See ibd_adjusted_accuracy's docstring for the full
+    mechanism description; this is the reusable core of it.
+
+    IMPORTANT CALIBRATION CAVEAT (found via a genome-wide genotype-level
+    rescore, not just founder-decode -- do not re-litigate without new
+    evidence): the ibd_thresh=0.8 raw-read-count-ratio test verifies tied
+    READ-MAPPING support between the true and predicted founder, NOT tied
+    SNP GENOTYPE. A window can show tied raw counts (repetitive sequence,
+    paralogy, anchor/liftover ambiguity -- the same mechanism that produces
+    "PLACED" vs "EXACT" reads) without the two founders actually agreeing
+    at most individual SNP positions inside that window. Confirmed on real
+    IDX-HYB Oh43xIl14H: this metric reports ~flat ~99.6-99.9% accuracy at
+    every depth (0.01x-2.0x), but the genome-wide SNP+RefCall-restricted
+    genotype comparator (compare_gvcf_truth_diploid.py --snp-refcall-
+    metrics, which independently excludes all indel-classified sites) shows
+    real, depth-INCREASING SNP-level error (0.64%->2.65% SNP-class error,
+    0.1x->2.0x) that tracks the model's RAW (non-adjusted) founder error far
+    more closely than this "IBD-adjusted" number. Root cause: as real depth
+    rises, the CRF's Viterbi decode becomes more CONFIDENT in the whole-
+    window majority call (via stay_bonus reinforcing within-window
+    consistency) -- more confidence, not more correctness, when the
+    underlying read-mapping signal was ambiguous to begin with. So: treat
+    this function's "credited" windows as "real, non-random read-mapping
+    confound identified" (a legitimate, still-useful signal -- these are
+    NOT arbitrary/random model errors), not as "verified correct at the
+    genotype level." Don't assume ibd_adjusted_acc approximates true
+    SNP-level accuracy, especially at higher real depth.
 
     pred_lo/pred_hi/true_lo/true_hi/valid: [N,T]. raw_counts: raw.npy's
     count block (or anything indexable as raw_counts[rows, :num_parents]).
@@ -518,11 +543,23 @@ def ibd_adjusted_accuracy(model, data, num_parents, true_lo, true_hi, valid,
                            raw_counts, row_idx, device=None, ibd_thresh=0.8):
     """Second real-data accuracy metric alongside plain pair_acc: credits
     window-level errors that real raw read support cannot actually
-    distinguish from the true call (genuine identity-by-descent -- verified
-    this session: 95.3% of real RIL2 errors and 87.7% of real HYB errors
-    show the wrong founder's real support statistically tied with or
-    exceeding the true founder's, concentrated in B73-involving pairs with
-    confirmed local IBD tracts on chr5/6/7/8).
+    distinguish from the true call (a real, non-random read-MAPPING
+    confound -- verified this session: 95.3% of real RIL2 errors and 87.7%
+    of real HYB errors show the wrong founder's real support statistically
+    tied with or exceeding the true founder's, concentrated in B73-
+    involving pairs with confirmed local IBD tracts on chr5/6/7/8).
+
+    CAVEAT (read score_ibd_adjusted_accuracy's docstring in full before
+    treating this as "true accuracy"): "tied raw read support" is NOT the
+    same claim as "tied SNP genotype". A genome-wide genotype-level rescore
+    found this metric reports flat ~99.6-99.9% for real HYB at every depth
+    while the actual SNP+RefCall-restricted genotype error rises real and
+    sharply with depth (0.64%->2.65% SNP-class error, 0.1x->2.0x) -- this
+    metric is a legitimate "is the error explainable by a real mapping
+    confound, not random noise" signal, not a genotype-level correctness
+    guarantee, and its accuracy degrades specifically as real depth rises
+    (the CRF gets more CONFIDENT in an already-ambiguous majority call, not
+    more correct).
 
     For each 512-site window, compares the model's majority predicted pair
     to the true pair (using infer_real_founder_pairs -- the one canonical
@@ -531,11 +568,8 @@ def ibd_adjusted_accuracy(model, data, num_parents, true_lo, true_hi, valid,
     mismatched founder(s)' real raw read support (mean over the window's
     real rows, from `raw_counts` = raw.npy's [:, :num_parents] count block)
     against the true founder(s)'. If the wrong founder's support is
-    >=ibd_thresh (default 0.8, calibrated against a correctly-decoded
-    control population) of the true founder's, the whole window is
-    credited as correct for this metric: the model's call reflects a real,
-    information-theoretically justified alternative reading of genuinely
-    ambiguous data, not a mistake. Internal-truth-switch windows, or
+    >=ibd_thresh (default 0.8) of the true founder's, the whole window is
+    credited as correct for this metric. Internal-truth-switch windows, or
     windows where support can't be assessed, are left unadjusted (scored
     exactly as pair_acc).
 
