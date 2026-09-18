@@ -65,8 +65,15 @@ LABEL_PAD = -1
 # --------------------------------------------------------------------------- #
 
 class IndelDiploidDataset(Dataset):
-    """(N,T,2K+2): cols 0:K ternary, col K=H1, col K+1=H2, cols K+2:2K+2
-    distance. Returns the (ternary,distance) feature window plus the two
+    """(N,T,2K+2 or 3K+2): cols 0:K ternary, col K=H1, col K+1=H2, cols
+    K+2:2K+2 distance, optional cols 2K+2:3K+2 real per-cell read-support
+    count (experiments/depth-confidence-fix/ -- --emit-read-counts on
+    either producer). Width is checked per-item from the data itself, not
+    a constructor flag, so old (2K+2) and new (3K+2) files are both
+    transparently supported -- "count" is simply absent from the returned
+    dict for old data, and GRITSCRFDiploidIndel.forward already treats a
+    missing count as "no signal" (matches its zero-initialized count_proj).
+    Returns the (ternary,distance[,count]) feature window plus the two
     haplotype labels. Unlike PreWindowedDiploidDataset's np.clip(label,0,K)
     (which wrongly maps LABEL_PAD=-1 onto founder 0), unlabeled positions are
     explicitly remapped to the null-founder index K, matching the convention
@@ -88,16 +95,21 @@ class IndelDiploidDataset(Dataset):
         h2_raw = row[:, K + 1].astype(np.int64)
         h1 = np.where(h1_raw < 0, K, h1_raw)
         h2 = np.where(h2_raw < 0, K, h2_raw)
-        return {"input_embeds": feats,
-                "h1": torch.tensor(h1, dtype=torch.long),
-                "h2": torch.tensor(h2, dtype=torch.long)}
+        out = {"input_embeds": feats,
+               "h1": torch.tensor(h1, dtype=torch.long),
+               "h2": torch.tensor(h2, dtype=torch.long)}
+        if row.shape[-1] >= 3 * K + 2:
+            count = row[:, 2 * K + 2:3 * K + 2].astype(np.float32)
+            out["count"] = torch.tensor(count, dtype=torch.float32)
+        return out
 
 
 def _check_width(path, data, num_parents):
-    expected = 2 * num_parents + 2
-    if data.shape[-1] != expected:
-        raise ValueError(f"{path}: expected width {expected} (2K+2, K={num_parents}), "
-                         f"got {data.shape[-1]}")
+    K = num_parents
+    if data.shape[-1] not in (2 * K + 2, 3 * K + 2):
+        raise ValueError(f"{path}: expected width {2 * K + 2} (2K+2) or "
+                         f"{3 * K + 2} (3K+2, with read-support counts) for "
+                         f"K={K}, got {data.shape[-1]}")
 
 
 def make_indel_diploid_splits(path, num_parents, val_frac, test_frac, limit_n=0):
@@ -279,7 +291,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         print(f"GRITSCRFDiploidIndel: K={K} states, P={self.P} pair-states, "
               f"{n_params:,} params")
 
-    def forward(self, X, homo_scale=None, ext_emb=None):
+    def forward(self, X, homo_scale=None, ext_emb=None, count=None):
         B, T, K_feat, _ = X.shape
         K = self.num_parents + 1
         # Null-founder pad: (TERN_DIV, DIST_PAD), not zeros — DIST_PAD=-1 is
@@ -296,11 +308,15 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         if ext_emb is not None:                                  # pad the null founder
             ext_emb = torch.cat(
                 [ext_emb, torch.zeros(B, 1, ext_emb.shape[-1], device=X.device)], dim=1)
+        if count is not None:                                    # 0 = no read support, neutral
+            count = torch.cat(
+                [count, torch.zeros(B, T, 1, device=X.device, dtype=count.dtype)], dim=2)
         if self.learned_het:
             emis_f, g, c, het = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
-                                             emit_het=True)
+                                             emit_het=True, count=count)
         else:
-            emis_f, g, c = self.encoder(X_pad, founder_mask, ext_emb=ext_emb)  # [B,T,K]
+            emis_f, g, c = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
+                                        count=count)  # [B,T,K]
         emis_p = emis_f[..., self.pi] + emis_f[..., self.pj]     # [B,T,P]
         if self.learned_het:
             het_pen = F.softplus(het).unsqueeze(-1)              # [B,T,1] >= 0
@@ -317,7 +333,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
 
     def _step(self, batch):
         X, h1, h2 = batch["input_embeds"], batch["h1"], batch["h2"]
-        emis_p, g, c = self(X, batch.get("homo_scale"), batch.get("ext_emb"))
+        emis_p, g, c = self(X, batch.get("homo_scale"), batch.get("ext_emb"),
+                            batch.get("count"))
         tags = self._pair_labels(h1, h2)
         crf = _dcrf_nll(emis_p, c, self.nsw_pair, self.stay_bonus, tags)
         loss = crf + self.gate_reg * (1.0 - g).mean()
@@ -418,25 +435,36 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=6
     near-duplicate scratch scripts before consolidating here -- exactly the
     failure mode a shared function prevents.
 
-    data: [N,T,2*num_parents+2] real ternary+distance array (the H1/H2
-    label columns are ignored -- real inference never has embedded truth).
-    Uses the checkpoint's one established recipe: genome-wide founder
-    affinity as ext_emb, homo_scale_from_affinity (train_diploid.py, the
-    p90-of-per-window-inbreeding-estimate classifier) as homo_scale. No
-    other variant/override point -- if a different homo_scale is ever
-    needed, change it here, once, not in each caller.
+    data: [N,T,2*num_parents+2] or [N,T,3*num_parents+2] real ternary(+
+    distance)(+count) array (the H1/H2 label columns are ignored -- real
+    inference never has embedded truth). The wider 3K+2 form (real
+    per-cell read-support counts, experiments/depth-confidence-fix/ --
+    emit via ropebwt_npy_to_matrix.py --emit-read-counts) is detected
+    from the array's own width -- no separate flag or parameter needed;
+    old 2K+2 real-data conversions keep working with count=None (the
+    model's zero-initialized count_proj then contributes nothing, so this
+    is safe by construction, not just "supported"). Uses the checkpoint's
+    one established recipe: genome-wide founder affinity as ext_emb,
+    homo_scale_from_affinity (train_diploid.py, the p90-of-per-window-
+    inbreeding-estimate classifier) as homo_scale. No other variant/
+    override point -- if a different homo_scale is ever needed, change it
+    here, once, not in each caller.
 
     Returns (pred_lo, pred_hi): [N,T] int arrays, the low/high founder
     index of the predicted pair at every real site."""
     K = num_parents
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     N, T, W = data.shape
-    if W != 2 * K + 2:
-        raise ValueError(f"data width {W} != 2*num_parents+2={2 * K + 2}")
+    if W not in (2 * K + 2, 3 * K + 2):
+        raise ValueError(f"data width {W} not in {{2K+2={2 * K + 2}, "
+                         f"3K+2 (with read-support counts)={3 * K + 2}}}")
+    has_count = W == 3 * K + 2
 
     tern = data[:, :, :K].astype(np.float32)
     dist = data[:, :, K + 2:2 * K + 2].astype(np.float32)
     feats = torch.tensor(np.stack([tern, dist], axis=-1), dtype=torch.float32)
+    count = (torch.tensor(data[:, :, 2 * K + 2:3 * K + 2].astype(np.float32),
+                          dtype=torch.float32) if has_count else None)
     M = (tern == TERN_MATCH).astype(np.float32)
     affinity = _founder_affinity(M.reshape(-1, K))
     homo_scale = homo_scale_from_affinity(M)
@@ -448,7 +476,8 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=6
             xb = feats[s:s + batch_size].to(device)
             eb = ext_emb[s:s + batch_size].to(device)
             hs = torch.full((xb.shape[0],), homo_scale, device=device)
-            emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs)
+            cb = count[s:s + batch_size].to(device) if count is not None else None
+            emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs, count=cb)
             pred = _dcrf_viterbi(emis_p, c, model.nsw_pair, model.stay_bonus)
             preds_lo.append(model.pi[pred].cpu().numpy())
             preds_hi.append(model.pj[pred].cpu().numpy())

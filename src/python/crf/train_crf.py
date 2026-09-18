@@ -333,6 +333,29 @@ class IndelFounderPathEncoder(nn.Module):
         # suppress crossover; local deletion density is the observable).
         self.recomb_head = nn.Linear(d_model + 4, 1)
         self.scale = d_model ** -0.5
+        # count_proj: per-CELL (per site, per founder) real read-support-
+        # count bias -- experiments/depth-confidence-fix/. Colleague's
+        # lab-meeting suggestion, validated against real cached data before
+        # implementation (readcount_probe.py): true-founder read count
+        # separates correct from incorrect real predictions sharply
+        # (4.40% error at 0 reads vs 0.36% at >10, at 2.0x) -- the current
+        # {-1,0,1} ternary encoding alone throws this away (a match backed
+        # by 1 read looks identical to one backed by 30). Deliberately a
+        # separate additive term on the already-computed cell embedding,
+        # not a 6th dim folded into _cell_input -- that would blow up
+        # fast_cells' 516-state enumeration to 516x127 states and force a
+        # harder migration for no benefit. Zero-initialized, constructed
+        # LAST (after every other layer, including recomb_head) so its
+        # weight-init RNG draws don't shift any other layer's random
+        # initialization under a fixed seed (same reasoning verified for
+        # density_proj against TestOverfitSmoke on the sibling
+        # window_density branch) -- at init this model is numerically
+        # identical to a checkpoint trained without this input, which is
+        # what makes warm-starting from diploid-indel-v3-k25-overlay-
+        # affinity safe.
+        self.count_proj = nn.Linear(1, d_model)
+        nn.init.zeros_(self.count_proj.weight)
+        nn.init.zeros_(self.count_proj.bias)
 
     @staticmethod
     def _posenc(T, d, device):
@@ -357,11 +380,17 @@ class IndelFounderPathEncoder(nn.Module):
                                   dist_f / 127.0).unsqueeze(-1)
         return torch.cat([onehot, dist_scalar], dim=-1)
 
-    def _embed_cells(self, X):
+    def _embed_cells(self, X, count=None):
         """Per-(site,founder) embedding [B,T,K,d] from (ternary, distance).
         X: [B,T,K,2], X[...,0]=ternary, X[...,1]=distance code. With
         fast_cells, the finite 516-state alphabet collapses the per-cell MLP
-        to an exact table lookup, mirroring FounderPathEncoder.binary_cells."""
+        to an exact table lookup, mirroring FounderPathEncoder.binary_cells.
+
+        count: optional [B,T,K] real read-support-count code (same {-1,0..
+        127}-ish int8 alphabet as distance, no PAD sentinel needed -- 0 is
+        itself the informative "no support" value). Added as a separate
+        term AFTER the base cell embedding (fast_cells table lookup or
+        plain MLP, either path) -- experiments/depth-confidence-fix/."""
         tern, dist = X[..., 0], X[..., 1]
         if self.fast_cells:
             tern_idx = torch.arange(4, device=X.device) - 2           # {-2,-1,0,1}
@@ -369,12 +398,17 @@ class IndelFounderPathEncoder(nn.Module):
             tt, dd = torch.meshgrid(tern_idx, dist_idx, indexing="ij")
             table = self.cell(self._cell_input(tt.reshape(-1), dd.reshape(-1)))  # [516,d]
             state_id = (tern.long() + 2) * self.N_DIST + (dist.long() + 1)       # [B,T,K]
-            return table[state_id]
-        return self.cell(self._cell_input(tern, dist))
+            cells = table[state_id]
+        else:
+            cells = self.cell(self._cell_input(tern, dist))
+        if count is not None:
+            count_n = torch.where(count.float() < 0, 0.0, count.float() / 127.0)
+            cells = cells + self.count_proj(count_n.unsqueeze(-1))
+        return cells
 
-    def forward(self, X, founder_mask, dbp=None, ext_emb=None, emit_het=False):
+    def forward(self, X, founder_mask, dbp=None, ext_emb=None, emit_het=False, count=None):
         B, T, K, _ = X.shape
-        cells = self._embed_cells(X)
+        cells = self._embed_cells(X, count=count)
 
         cf = cells.reshape(B * T, K, self.d_model)
         q = self.fquery.expand(B * T, 1, self.d_model)
