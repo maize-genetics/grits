@@ -159,3 +159,162 @@ generation-time) windowing change, not a model change — no retraining
 required to validate further, though the training data's own windowing
 convention would need the same fix for train/inference consistency
 before promoting a production default.
+
+**Note**: the stride fix above is diagnostic only (discards real reads)
+and was not shipped. A parallel, still-unresolved attempt at a
+non-wasteful whole-window aggregate confidence feature (`window_density`,
+branch `indel-density-features`) gave a negative, confounded real-data
+result — see that branch's own writeup. Its own probe gate rejected an
+earlier per-row (gap/stack) design as flat/non-predictive of correctness,
+which is what motivated the per-cell read-support-count idea below.
+
+## Per-cell read-support count — branch `indel-readcount-feature`
+
+2026-09-18, later the same day. Lab-meeting suggestion (colleague, via
+user): keep the per-founder ternary state as-is (`{-1,0,1}`), but add an
+explicit per-cell **read-support count** — how many reads actually voted
+for that call, at that (site, founder). Different from `window_density`'s
+whole-window aggregate: a genuinely finer-grained, per-cell confidence
+signal the current ternary encoding throws away entirely (a match backed
+by 1 read looks identical to one backed by 30).
+
+**Validated directly against real cached data before any implementation**
+(`scripts/readcount_probe.py`, using `raw.npy`'s already-cached counts
+block and the deployed model's own predictions — no new pipeline code
+needed to test the hypothesis). Error rate drops sharply and
+monotonically with true-founder read support, at 2.0x (pooled HYB+RIL2):
+
+| true-founder support | 0 reads | 1 | 2 | 3–5 | 5–10 | >10 |
+|---|---|---|---|---|---|---|
+| error rate | **4.40%** | 0.83% | 0.74% | 0.65% | 0.60% | **0.36%** |
+
+Over 10x reduction worst-to-best — a real signal, and starkly different
+from `window_density`'s per-row gap/stack probe (flat, 2.08–2.32% across
+most of its range). A class-breakdown check also confirmed this hits SNP
+and indel sites roughly equally (HYB indel-class error 0%→3.70% vs
+SNP-class 0%→3.07%, 0.01x→2.0x) — a founder-decode problem, not a
+variant-class artifact.
+
+### Implementation
+
+- `simulate_alleles.py --emit-read-counts`: `_indel_chunk` derives a
+  per-(window,site,founder) count. Rows sharing one site are **not** all
+  identical (on1/on2/insertion-kind rows draw independently — verified
+  against `test_indel_chunk_tiny_exact`'s own fixture), so the count must
+  be a genuine tally of how many rows at that site show MATCH per
+  founder, not the site's total row count regardless of founder (an
+  earlier design that would have over-counted). Deterministic from
+  already-drawn `tern`/`cnt` — zero new RNG draws, golden hashes
+  untouched.
+- `ropebwt_npy_to_matrix.py --emit-read-counts`: the real per-(row,
+  founder) count already exists in refmap's `--anchor-dist-npy` export
+  (`arr[:, :K]`) — this script just discarded it until now. Threaded
+  through as a 4th block. No refmap/alignment rerun needed — verified
+  against the already-cached real HYB 2.0x `raw.npy` this session has
+  used throughout.
+- `IndelFounderPathEncoder.count_proj`: zero-initialized `Linear(1,
+  d_model)`, a separate additive term on the cell embedding (not folded
+  into `_cell_input`'s 5-dim representation, which would blow up
+  `fast_cells`' 516-state table to 516×127). Constructed **last** in
+  `__init__` — the RNG-order-safety lesson from `window_density`,
+  applied proactively this time; `TestOverfitSmoke` passed clean with no
+  rework needed.
+- Count lives **in the main array** (2K+2 → 3K+2), not a sidecar —
+  `_check_width`/Dataset/`infer_real_founder_pairs` just detect width.
+  Old 2K+2 data and checkpoints keep working unchanged.
+- `TestBitIdenticalWarmStart`: checkpoint loaded `strict=False`
+  reproduces its own pre-`count_proj` real-data predictions exactly —
+  13/13 real-data tests passed first try.
+
+### Isolated-variable retrain — avoiding last round's mistake
+
+`window_density`'s retrain confounded two changes at once (mixed-depth
+data + a synthetically-harder founder-count composition,
+`--min-founders 2 --max-founders 25`), so its HYB regression couldn't be
+attributed to either cleanly. This round: training data generated with
+the **same single-coverage regime as the original v3-K25 recipe**
+(`coverage_model=linear`, `coverage=2.0`) and a **clean, real-sample-like
+composition** — two sub-populations, `--inbreeding 1.0` (100 individuals,
+verified `het_frac=0.000`, matching real INBRED) and `--inbreeding 0.0`
+(100 individuals, verified `het_frac=0.969`, matching real 2-founder
+HYB), concatenated and individual-shuffled, **not** the grouped/
+min-max-founders mechanism that caused last round's regression. `--sites
+8192` per individual (smaller than the original's 60000, for a fast
+validation-scale run), sliced to `T=512` via `scripts/slice_contigs.py`
+(needed zero changes — it slices along the row axis, agnostic to column
+width, verified by direct content comparison against the source array).
+200 individuals × 16 sub-windows = 3,200 total training windows.
+`--emit-read-counts` on both sub-populations. Real eval data
+(`ropebwt_npy_to_matrix.py --emit-read-counts`) regenerated for HYB/RIL2
+Oh43xIl14H at all 5 depths — window counts matched the previously-known
+values exactly, confirming correctness.
+
+Warm-started `diploid-indel-v3-k25-overlay-affinity` via the new
+`--warm-start-ckpt` flag, 5 epochs. Training healthy (val_pair_acc
+0.021→0.25, much higher than `window_density`'s 0.21 on a harder task).
+
+### Real-data result — regression vs. full-scale baseline, but a genuine ablation resolves why
+
+| depth | v3-K25 baseline (full-scale) | readcount-isolated (small-scale, with count) |
+|---|---|---|
+| 0.01x | 100.00% | 100.00% |
+| 0.1x | 99.03% | 98.35% |
+| 0.5x | 98.08% | 96.92% |
+| 1.0x | 97.13% | 95.34% |
+| 2.0x | 96.50% | 94.40% |
+
+HYB regressed at every depth from 0.1x on — this time genuinely with
+`count` non-null on both sides (unlike `window_density`'s eval, which
+never exercised its own mechanism). Rather than stop here, ran one more
+cheap ablation (retraining took ~15s): the exact same isolated-variable
+data and individuals, warm-started identically, with the count block
+simply stripped (`2K+2`, not `3K+2` — `count_proj` never fires during
+this training, so its weights stay exactly zero throughout — a true
+"same everything except count" control,
+`diploid-indel-v3-scale-control-nocount`).
+
+| depth | v3-K25 baseline (full-scale) | scale-control (small-scale, no count) | readcount-isolated (small-scale, with count) |
+|---|---|---|---|
+| 0.01x | 100.00% | 100.00% | 100.00% |
+| 0.1x | 99.03% | 97.83% | 98.35% (**+0.52pp** vs control) |
+| 0.5x | 98.08% | 96.16% | 96.92% (**+0.76pp**) |
+| 1.0x | 97.13% | 95.16% | 95.34% (**+0.18pp**) |
+| 2.0x | 96.50% | 94.48% | 94.40% (−0.08pp, flat) |
+
+**This resolves the confound.** The bulk of the gap vs. the full-scale
+baseline is explained by training **scale** (200 individuals vs. the
+original's ~1000) — the scale-only control regresses almost as much as
+the count version did, at every depth. Once that's controlled for, the
+count feature shows a **small, consistent, real improvement at 3 of 4
+non-ceiling depths** (0.1x–1.0x, +0.18 to +0.76pp), going flat only at
+2.0x, the depth where the original problem is worst. RIL2 is flat across
+all three variants (±0.1pp, noise) at every depth, consistent with its
+error being IBD/homology-driven, not depth-confidence-driven — no
+mechanism tested this session has moved RIL2 either direction
+meaningfully.
+
+**Verdict: promising but inconclusive.** The count feature has a real,
+positive, if modest, effect once cleanly isolated — but this validation-
+scale test can't yet tell whether it would close the depth-confidence
+gap, because training scale is the dominant limiting factor right now,
+not the feature itself. Not yet promoted; not disproven either. Branch
+`indel-density-features` (and `window_density` within it) remains a
+separate, still-unresolved hypothesis on its own branch.
+
+### Next steps (not yet done)
+
+1. **Full-scale retrain** — repeat this exact recipe (clean INBRED/HYB
+   composition, `--emit-read-counts`, warm-start) at a scale matching the
+   original v3-K25 recipe (~1000 individuals, `--sites 60000`-ish) to see
+   whether the count feature's small positive effect holds up or grows
+   once the scale deficit is removed. This is the natural next
+   experiment, not yet run (validation-scale only, this round).
+2. **Genotype-level confirmation** — the plan's Verification item 5
+   (genome-wide SNP+RefCall rescore) was not yet run for either the
+   readcount-isolated or scale-control checkpoints; founder-decode and
+   genotype accuracy have already diverged once this session, so this
+   remains required before any promotion decision.
+3. If a full-scale retrain confirms the effect, consider whether the
+   simulator's own count-derivation simplification (site-uniform count
+   magnitude across all MATCH-showing founders at a site, vs. real data's
+   richer independently-varying per-founder counts) is worth refining.
