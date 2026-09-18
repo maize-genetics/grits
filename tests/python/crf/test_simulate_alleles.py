@@ -14,6 +14,7 @@ from python.crf.simulate_alleles import (
     _indel_tracts, _draw_lineages, _coalescent_feats, _good_mask, simulate,
     _indel_suppressed_rate, _row_counts, _sample_rows, _indel_chunk,
     _lineage_indels, _overlay_indels, _lineage_substitutions,
+    compute_window_density,
 )
 
 # --- golden hashes: pre-change simulate() output on fixed args/seed, ------
@@ -1080,3 +1081,98 @@ def test_simulate_v4_flags_end_to_end(subst_model, coverage_model):
         subst_model=subst_model, subst_rate=0.02, coverage_model=coverage_model)[0]
     assert out.shape == (2, T, 2 * K + 2)
     assert out.dtype == np.int8
+
+
+# --- compute_window_density: the per-window evidence-density feature ------
+# (experiments/depth-confidence-fix/ -- replaces an earlier per-row design
+# that the plan's own probe gate rejected; see the function's docstring).
+
+def test_compute_window_density_shape_dtype():
+    site_idx = np.tile(np.arange(10), (3, 1)).astype(np.int64)
+    valid = np.ones((3, 10), dtype=bool)
+    out = compute_window_density(site_idx, valid)
+    assert out.shape == (3, 2)
+    assert out.dtype == np.int8
+
+
+def test_compute_window_density_hand_computed_values():
+    # One window, T=6, sites [10,10,11,11,11,15] -- span=15-10=5,
+    # uniq={10,11,15}=3. Encoded via the same _encode_dist formula.
+    site_idx = np.array([[10, 10, 11, 11, 11, 15]], dtype=np.int64)
+    valid = np.ones((1, 6), dtype=bool)
+    out = compute_window_density(site_idx, valid)
+    assert out[0, 0] == _encode_dist(5)
+    assert out[0, 1] == _encode_dist(3)
+
+
+def test_compute_window_density_zero_span_all_same_site():
+    # Every row stacked at the same site: span=0 (colinear, matches
+    # _encode_dist's "exactly 0 at d=0" convention), uniq=1.
+    site_idx = np.full((2, 8), 7, dtype=np.int64)
+    valid = np.ones((2, 8), dtype=bool)
+    out = compute_window_density(site_idx, valid)
+    assert (out[:, 0] == 0).all()
+    assert (out[:, 1] == _encode_dist(1)).all()
+
+
+def test_compute_window_density_padding_gives_dist_pad():
+    # 0 valid rows -> both PAD. 1 valid row -> span PAD (undefined),
+    # uniq well-defined (=1).
+    site_idx = np.array([[5, 5, 5], [5, 5, 5]], dtype=np.int64)
+    valid = np.array([[False, False, False], [True, False, False]])
+    out = compute_window_density(site_idx, valid)
+    assert out[0, 0] == DIST_PAD and out[0, 1] == DIST_PAD
+    assert out[1, 0] == DIST_PAD
+    assert out[1, 1] == _encode_dist(1)
+
+
+def test_compute_window_density_padding_trails_valid_prefix():
+    # Short window: 4 real rows then padding -- matches _sample_rows'/
+    # _indel_chunk's "short windows pad the tail" contract.
+    site_idx = np.array([[3, 3, 4, 9, -1, -1]], dtype=np.int64)
+    valid = np.array([[True, True, True, True, False, False]])
+    out = compute_window_density(site_idx, valid)
+    assert out[0, 0] == _encode_dist(9 - 3)  # span among the 4 real rows only
+    assert out[0, 1] == _encode_dist(3)       # {3,4,9}
+
+
+def test_compute_window_density_matches_naive_reference():
+    """Vectorized implementation vs a trivially-correct per-row Python loop,
+    on random non-decreasing-per-row data with random padding -- catches
+    vectorization bugs the hand-picked cases above might miss."""
+    rng = np.random.default_rng(0)
+    N, T = 50, 32
+    site_idx = np.sort(rng.integers(0, 100, size=(N, T)), axis=1).astype(np.int64)
+    n_valid = rng.integers(0, T + 1, size=N)
+    valid = np.arange(T)[None, :] < n_valid[:, None]  # left-aligned, matches padding contract
+
+    out = compute_window_density(site_idx, valid)
+
+    for i in range(N):
+        v = site_idx[i][valid[i]]
+        if v.size >= 2:
+            assert out[i, 0] == _encode_dist(int(v.max() - v.min())), i
+        else:
+            assert out[i, 0] == DIST_PAD, i
+        if v.size >= 1:
+            assert out[i, 1] == _encode_dist(int(np.unique(v).size)), i
+        else:
+            assert out[i, 1] == DIST_PAD, i
+
+
+def test_simulate_emit_density_matches_refpos_end_to_end():
+    """compute_window_density applied to simulate()'s own refpos_out output
+    (simulate_indels=True) runs end-to-end and produces sane, non-degenerate
+    values -- the exact call sequence main() uses for --emit-density."""
+    K, T = 8, 128
+    out, _ibd, _ind, _panel, _het, _cls, refpos, _short, _cov = simulate(
+        np.random.default_rng(11), windows=4, sites=T, founders=K,
+        min_cross=1, max_cross=3, inbreeding=0.0, allele_sharing=0.6,
+        bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+        sharing_theta=4.0, simulate_indels=True, indel_model="overlay",
+        indel_region_mult=8, indel_coverage=2.0, coverage_model="linear")
+    density = compute_window_density(refpos, refpos >= 0)
+    assert density.shape == (4, 2)
+    assert density.dtype == np.int8
+    assert out.shape == (4, T, 2 * K + 2)          # main array contract unchanged
+    assert (density[:, 1] != DIST_PAD).all()        # every window has >=1 valid row

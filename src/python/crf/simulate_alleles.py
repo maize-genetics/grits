@@ -356,6 +356,56 @@ def _encode_dist(d, scale=DIST_LOG_SCALE):
     return np.clip(code, 0, DIST_SAT - 1).astype(np.int8)
 
 
+def compute_window_density(site_idx, valid, scale=DIST_LOG_SCALE):
+    """Two per-window evidence-density scalars from each window's per-row
+    reference-site index (`site_idx[N,T]` -- `simulate()`'s `refpos_out`,
+    or the real-data equivalent derived from `ropebwt_npy_to_matrix.py`'s
+    `bins_df["bin"]` column) and a `valid[N,T]` mask (False = padding).
+
+    THE single shared helper for this quantity -- `simulate_alleles.py`,
+    `ropebwt_npy_to_matrix.py`, and `train_diploid_indel.py` (Dataset +
+    `infer_real_founder_pairs`) all call this, not a re-derived copy, so
+    real and simulated data get identical encodings by construction (see
+    experiments/depth-confidence-fix/results/ for why per-row density was
+    tried and rejected in favor of this per-window design -- per-row
+    gap/stack does not separate correct from incorrect real predictions
+    within a fixed depth, but the whole-window aggregate effect is large).
+
+    Requires `site_idx` non-decreasing along axis 1 within valid entries,
+    with any padding (`valid=False`) trailing the valid prefix -- true by
+    construction for both producers (`_sample_rows`'s own "non-decreasing
+    site order, first T kept" contract; `ropebwt_npy_to_matrix.py`'s
+    consecutive-sorted-row windowing, which never pads at all).
+
+    Returns `[N,2]` int8, log-coded via `_encode_dist` (same alphabet,
+    `DIST_PAD=-1` sentinel):
+      column 0 = window_span = last-first site index among valid rows
+                 (undefined, `DIST_PAD`, if fewer than 2 valid rows).
+      column 1 = window_uniq_sites = count of distinct site indices among
+                 valid rows (0 valid rows -> `DIST_PAD`; `T / uniq_sites`
+                 is the window's mean read-stack depth, so this alone
+                 carries the "stacking" signal without a third column).
+    """
+    site_idx = np.asarray(site_idx)
+    valid = np.asarray(valid, dtype=bool)
+    n_valid = valid.sum(axis=1)
+
+    hi = np.where(valid, site_idx, np.iinfo(np.int64).min).max(axis=1)
+    lo = np.where(valid, site_idx, np.iinfo(np.int64).max).min(axis=1)
+    span = hi - lo
+
+    changed = np.zeros(site_idx.shape, dtype=bool)
+    changed[:, 1:] = valid[:, 1:] & valid[:, :-1] & (site_idx[:, 1:] != site_idx[:, :-1])
+    first_valid = valid & (np.cumsum(valid, axis=1) == 1)
+    uniq = (changed | first_valid).sum(axis=1)
+
+    out = np.full((site_idx.shape[0], 2), DIST_PAD, dtype=np.int8)
+    ok_span, ok_uniq = n_valid >= 2, n_valid >= 1
+    out[ok_span, 0] = _encode_dist(span[ok_span], scale)
+    out[ok_uniq, 1] = _encode_dist(uniq[ok_uniq], scale)
+    return out
+
+
 def _anchor_distance(del_mask):
     """Distance [same leading shape as del_mask] to the nearest colinear
     (non-deleted) site along the last axis.
@@ -1667,6 +1717,13 @@ def parse_args():
                    help="Founder index treated as the reference (e.g. B73): never "
                         "given deletions, distance pinned to 0. -1 = no reference "
                         "founder in this panel (all K founders carry indels).")
+    p.add_argument("--emit-density", action="store_true",
+                   help="--simulate-indels only: also write a `<out>.density.npy` "
+                        "sidecar ([windows,2] int8) via compute_window_density -- "
+                        "per-window evidence-density (span, uniq_sites), derived "
+                        "from the already-computed refpos_out, no new RNG draws, "
+                        "main [windows,T,2K+2] array unchanged either way. Off by "
+                        "default. See experiments/depth-confidence-fix/.")
 
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -1820,6 +1877,9 @@ def _print_indel_summary(args, data, refpos, short, out_path, refpos_path, true_
 
 def main():
     args = parse_args()
+    if args.emit_density and not args.simulate_indels:
+        raise SystemExit("--emit-density requires --simulate-indels "
+                          "(refpos_out, its source, only exists in that mode)")
     rng = np.random.default_rng(args.seed)
 
     # E7: per-individual inbreeding coefficient F → per-window F (constant within
@@ -1931,6 +1991,13 @@ def main():
     if refpos is not None:
         refpos_path = out_dir / (Path(args.out).stem + ".refpos.npy")
         np.save(refpos_path, refpos)
+    if args.emit_density and refpos is not None:
+        density = compute_window_density(refpos, refpos >= 0)
+        density_path = out_dir / (Path(args.out).stem + ".density.npy")
+        np.save(density_path, density)
+        n_scored = int((density[:, 0] != DIST_PAD).sum())
+        print(f"  evidence density (.density) → {density_path}  shape={density.shape}  "
+              f"windows_with_span={n_scored}/{density.shape[0]}")
     if finb is not None:
         finb_path = out_dir / (Path(args.out).stem + ".finb.npy")
         np.save(finb_path, finb)

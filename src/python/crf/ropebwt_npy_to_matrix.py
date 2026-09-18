@@ -76,6 +76,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from python.crf.simulate_alleles import compute_window_density
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="ropebwt3-phg PS4G/npy -> grits training matrix")
@@ -117,11 +119,22 @@ def parse_args():
     p.add_argument("--dist-log-scale", type=float, default=8.0,
                    help="Log-scale factor for distance-to-anchor coding, matching "
                         "simulate_alleles.py's DIST_LOG_SCALE default.")
+    p.add_argument("--emit-density", action="store_true",
+                   help="--anchor-dist-npy only: also write a `<out>.density.npy` "
+                        "sidecar ([N,2] int8) via simulate_alleles.compute_window_density "
+                        "-- per-window evidence-density (span, uniq_sites) computed "
+                        "from bins.tsv's bin column, the real-data counterpart to the "
+                        "simulator's own --emit-density. Off by default. See "
+                        "experiments/depth-confidence-fix/.")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.emit_density and not args.anchor_dist_npy:
+        raise SystemExit("--emit-density requires --anchor-dist-npy "
+                          "(the ternary+distance real-data contract this "
+                          "sidecar is built for)")
     window_size = args.window_size
     step_size = args.step_size or window_size
 
@@ -232,7 +245,9 @@ def main():
         rows = np.concatenate([feats, labels], axis=1)         # [n_rows, K+2] int8
 
     windows = []
+    window_bins = [] if args.emit_density else None
     contig_window_counts = {}
+    bin_col = bins_df["bin"].to_numpy()
     for contig, idx in bins_df.groupby("contig", sort=False).indices.items():
         idx = np.sort(idx)                                     # preserve on-disk order
         n_windows = 0
@@ -240,6 +255,8 @@ def main():
         while start + window_size <= len(idx):
             sel = idx[start:start + window_size]
             windows.append(rows[sel])
+            if args.emit_density:
+                window_bins.append(bin_col[sel])
             n_windows += 1
             start += step_size
         contig_window_counts[contig] = n_windows
@@ -251,6 +268,16 @@ def main():
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(out_path, out)
+
+    if args.emit_density:
+        # This windowing loop never pads (a trailing partial window per
+        # contig is simply dropped, unlike the simulator's short-window
+        # case), so every row in every window is real -- valid is all-True.
+        site_idx = np.stack(window_bins, axis=0).astype(np.int64)
+        density = compute_window_density(site_idx, np.ones_like(site_idx, dtype=bool))
+        density_path = out_path.parent / (out_path.stem + ".density.npy")
+        np.save(density_path, density)
+        print(f"  evidence density (.density) → {density_path}  shape={density.shape}")
 
     het = (out[:, :, K] != out[:, :, K + 1])
     labeled = (out[:, :, K] != K) | (out[:, :, K + 1] != K)

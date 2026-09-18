@@ -333,6 +333,25 @@ class IndelFounderPathEncoder(nn.Module):
         # suppress crossover; local deletion density is the observable).
         self.recomb_head = nn.Linear(d_model + 4, 1)
         self.scale = d_model ** -0.5
+        # density_proj: per-WINDOW (not per-timestep) evidence-density bias
+        # -- experiments/depth-confidence-fix/. A per-row version was tried
+        # first and rejected (the plan's own probe gate: per-row gap/stack
+        # does not separate correct from incorrect predictions within a
+        # fixed depth, only the whole-window aggregate does), so this is
+        # added once per window and broadcasts over T, same zero-init
+        # convention as ext_bias/het_head above -- at init the model is
+        # numerically identical to a checkpoint trained without this input,
+        # which is what makes warm-starting from diploid-indel-v3-k25-
+        # overlay-affinity safe. Constructed LAST (after every other layer
+        # above) so its weight-init RNG draws don't shift any other layer's
+        # random initialization under a fixed seed -- nn.Linear's constructor
+        # always draws from the RNG even though these weights are zeroed
+        # immediately after; verified against
+        # TestOverfitSmoke.test_loss_falls_and_accuracy_rises, whose fixed-
+        # seed trajectory changed when density_proj was constructed earlier.
+        self.density_proj = nn.Linear(2, d_model)
+        nn.init.zeros_(self.density_proj.weight)
+        nn.init.zeros_(self.density_proj.bias)
 
     @staticmethod
     def _posenc(T, d, device):
@@ -372,7 +391,8 @@ class IndelFounderPathEncoder(nn.Module):
             return table[state_id]
         return self.cell(self._cell_input(tern, dist))
 
-    def forward(self, X, founder_mask, dbp=None, ext_emb=None, emit_het=False):
+    def forward(self, X, founder_mask, dbp=None, ext_emb=None, emit_het=False,
+                window_density=None):
         B, T, K, _ = X.shape
         cells = self._embed_cells(X)
 
@@ -381,6 +401,15 @@ class IndelFounderPathEncoder(nn.Module):
         kpad = ~founder_mask.bool().unsqueeze(1).expand(B, T, K).reshape(B * T, K)
         h, _ = self.fpool(q, cf, cf, key_padding_mask=kpad)
         h = h.reshape(B, T, self.d_model) + self._posenc(T, self.d_model, X.device)
+        if window_density is not None:
+            # [B,2] raw int8-range codes (compute_window_density's alphabet,
+            # DIST_PAD=-1 sentinel) -> [-1,1] scalars, same normalization
+            # _cell_input uses for the per-cell distance channel -- then a
+            # single vector per window, broadcast over T (unsqueeze(1)),
+            # zero at init so this is a pure additive bias once trained.
+            wd = window_density.float()
+            wd = torch.where(wd < 0, torch.full_like(wd, -1.0), wd / 127.0)
+            h = h + self.density_proj(wd).unsqueeze(1)
         H = self.pos_encoder(h)
 
         tern = X[..., 0]

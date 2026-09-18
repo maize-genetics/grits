@@ -71,9 +71,14 @@ class IndelDiploidDataset(Dataset):
     (which wrongly maps LABEL_PAD=-1 onto founder 0), unlabeled positions are
     explicitly remapped to the null-founder index K, matching the convention
     ropebwt_npy_to_matrix.py already uses for real data (gA[gA<0]=K)."""
-    def __init__(self, data, num_parents=24):
+    def __init__(self, data, num_parents=24, window_density=None):
         self.data = data
         self.K = num_parents
+        # [N,2] int8, compute_window_density's output, or None -- old data
+        # generated without --emit-density stays loadable, window_density
+        # defaults to a zero bias at inference (see IndelFounderPathEncoder
+        # .forward). experiments/depth-confidence-fix/.
+        self.window_density = window_density
 
     def __len__(self):
         return len(self.data)
@@ -88,9 +93,13 @@ class IndelDiploidDataset(Dataset):
         h2_raw = row[:, K + 1].astype(np.int64)
         h1 = np.where(h1_raw < 0, K, h1_raw)
         h2 = np.where(h2_raw < 0, K, h2_raw)
-        return {"input_embeds": feats,
-                "h1": torch.tensor(h1, dtype=torch.long),
-                "h2": torch.tensor(h2, dtype=torch.long)}
+        out = {"input_embeds": feats,
+               "h1": torch.tensor(h1, dtype=torch.long),
+               "h2": torch.tensor(h2, dtype=torch.long)}
+        if self.window_density is not None:
+            out["window_density"] = torch.tensor(
+                np.asarray(self.window_density[idx]).astype(np.float32))
+        return out
 
 
 def _check_width(path, data, num_parents):
@@ -100,21 +109,42 @@ def _check_width(path, data, num_parents):
                          f"got {data.shape[-1]}")
 
 
+def _load_window_density(path, n_total):
+    """Optional `<path>.density.npy` sidecar (compute_window_density's own
+    [N,2] int8 output, written by simulate_alleles.py/ropebwt_npy_to_matrix.py
+    --emit-density) alongside a training .npy. Returns None if it doesn't
+    exist -- old data stays loadable with no code change, window_density
+    just defaults to a zero bias. experiments/depth-confidence-fix/."""
+    density_path = Path(path).parent / (Path(path).stem + ".density.npy")
+    if not density_path.exists():
+        return None
+    density = np.load(density_path, mmap_mode="r")
+    if len(density) != n_total:
+        raise ValueError(f"{density_path}: length {len(density)} != data length {n_total}")
+    return density
+
+
 def make_indel_diploid_splits(path, num_parents, val_frac, test_frac, limit_n=0):
     """Same deterministic head-slice split as train_diploid.make_diploid_splits,
     applied to the 2K+2 layout."""
     data = np.load(path, allow_pickle=True, mmap_mode="r")
     _check_width(path, data, num_parents)
+    density = _load_window_density(path, len(data))
     if limit_n and limit_n < len(data):
         data = data[:limit_n]
+        density = density[:limit_n] if density is not None else None
     N = len(data)
     n_test = int(N * test_frac)
     n_val = int(N * val_frac)
     n_tr = N - n_val - n_test
-    mk = lambda a: IndelDiploidDataset(a, num_parents)
+    mk = lambda a, d: IndelDiploidDataset(a, num_parents, d)
+    sl = lambda d, s, e: None if d is None else d[s:e]
     print(f"IndelDiploid {Path(path).name}: N={N:,} cols={data.shape[-1]}  "
-          f"train={n_tr:,} val={n_val:,} test={n_test:,}")
-    return mk(data[:n_tr]), mk(data[n_tr:n_tr + n_val]), mk(data[n_tr + n_val:])
+          f"train={n_tr:,} val={n_val:,} test={n_test:,}  "
+          f"window_density={'yes' if density is not None else 'no'}")
+    return (mk(data[:n_tr], sl(density, 0, n_tr)),
+            mk(data[n_tr:n_tr + n_val], sl(density, n_tr, n_tr + n_val)),
+            mk(data[n_tr + n_val:], sl(density, n_tr + n_val, N)))
 
 
 def _het_scale_indel(feats_block, het_inbred, het_outbred):
@@ -138,8 +168,8 @@ class IndelDiploidIndividualDataset(IndelDiploidDataset):
     scale, from the genome-wide het proxy over the MATCH view (ternary==1).
     Windows grouped in blocks of G, mirroring DiploidIndividualDataset."""
     def __init__(self, data, num_parents, windows_per_individual,
-                 het_inbred=0.23, het_outbred=0.50):
-        super().__init__(data, num_parents)
+                 het_inbred=0.23, het_outbred=0.50, window_density=None):
+        super().__init__(data, num_parents, window_density)
         G = windows_per_individual
         if len(data) % G:
             raise ValueError(f"rows {len(data)} not divisible by windows/ind {G}")
@@ -166,17 +196,23 @@ def make_indel_diploid_individual_splits(path, num_parents, val_frac, test_frac,
                                          het_inbred=0.23, het_outbred=0.50, limit_n=0):
     data = np.load(path, allow_pickle=True, mmap_mode="r")
     _check_width(path, data, num_parents)
+    density = _load_window_density(path, len(data))
     if limit_n:
         data = data[:(limit_n // G) * G]
+        density = density[:(limit_n // G) * G] if density is not None else None
     N = len(data)
     n_ind = N // G
     n_test = int(n_ind * test_frac) * G
     n_val = int(n_ind * val_frac) * G
     n_tr = N - n_val - n_test
-    mk = lambda a: IndelDiploidIndividualDataset(a, num_parents, G, het_inbred, het_outbred)
+    mk = lambda a, d: IndelDiploidIndividualDataset(a, num_parents, G, het_inbred, het_outbred, d)
+    sl = lambda d, s, e: None if d is None else d[s:e]
     print(f"IndelDiploid(individual) {Path(path).name}: N={N:,} individuals={n_ind} "
-          f"train={n_tr:,} val={n_val:,} test={n_test:,}")
-    return mk(data[:n_tr]), mk(data[n_tr:n_tr + n_val]), mk(data[n_tr + n_val:])
+          f"train={n_tr:,} val={n_val:,} test={n_test:,}  "
+          f"window_density={'yes' if density is not None else 'no'}")
+    return (mk(data[:n_tr], sl(density, 0, n_tr)),
+            mk(data[n_tr:n_tr + n_val], sl(density, n_tr, n_tr + n_val)),
+            mk(data[n_tr + n_val:], sl(density, n_tr + n_val, N)))
 
 
 class IndelDiploidAffinityDataset(IndelDiploidDataset):
@@ -184,8 +220,8 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
     from train_diploid._founder_affinity (reused verbatim, bit-identical — it
     has no calibration constants to shift, just mean/centered-mean over the
     MATCH view) attached to every window of the individual."""
-    def __init__(self, data, num_parents, windows_per_individual):
-        super().__init__(data, num_parents)
+    def __init__(self, data, num_parents, windows_per_individual, window_density=None):
+        super().__init__(data, num_parents, window_density)
         G = windows_per_individual
         if len(data) % G:
             raise ValueError(f"rows {len(data)} not divisible by windows/ind {G}")
@@ -208,17 +244,23 @@ def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G
     make_diploid_affinity_splits intent)."""
     data = np.load(path, allow_pickle=True, mmap_mode="r")
     _check_width(path, data, num_parents)
+    density = _load_window_density(path, len(data))
     if limit_n:
         data = data[:(limit_n // G) * G]
+        density = density[:(limit_n // G) * G] if density is not None else None
     N = len(data)
     n_ind = N // G
     n_test = int(n_ind * test_frac) * G
     n_val = int(n_ind * val_frac) * G
     n_tr = N - n_val - n_test
-    mk = lambda a: IndelDiploidAffinityDataset(a, num_parents, G)
+    mk = lambda a, d: IndelDiploidAffinityDataset(a, num_parents, G, d)
+    sl = lambda d, s, e: None if d is None else d[s:e]
     print(f"IndelDiploid(affinity) {Path(path).name}: N={N:,} individuals={n_ind} "
-          f"train={n_tr:,} val={n_val:,} test={n_test:,}")
-    return mk(data[:n_tr]), mk(data[n_tr:n_tr + n_val]), mk(data[n_tr + n_val:])
+          f"train={n_tr:,} val={n_val:,} test={n_test:,}  "
+          f"window_density={'yes' if density is not None else 'no'}")
+    return (mk(data[:n_tr], sl(density, 0, n_tr)),
+            mk(data[n_tr:n_tr + n_val], sl(density, n_tr, n_tr + n_val)),
+            mk(data[n_tr + n_val:], sl(density, n_tr + n_val, N)))
 
 
 # --------------------------------------------------------------------------- #
@@ -279,7 +321,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         print(f"GRITSCRFDiploidIndel: K={K} states, P={self.P} pair-states, "
               f"{n_params:,} params")
 
-    def forward(self, X, homo_scale=None, ext_emb=None):
+    def forward(self, X, homo_scale=None, ext_emb=None, window_density=None):
         B, T, K_feat, _ = X.shape
         K = self.num_parents + 1
         # Null-founder pad: (TERN_DIV, DIST_PAD), not zeros — DIST_PAD=-1 is
@@ -298,9 +340,10 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                 [ext_emb, torch.zeros(B, 1, ext_emb.shape[-1], device=X.device)], dim=1)
         if self.learned_het:
             emis_f, g, c, het = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
-                                             emit_het=True)
+                                             emit_het=True, window_density=window_density)
         else:
-            emis_f, g, c = self.encoder(X_pad, founder_mask, ext_emb=ext_emb)  # [B,T,K]
+            emis_f, g, c = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
+                                        window_density=window_density)  # [B,T,K]
         emis_p = emis_f[..., self.pi] + emis_f[..., self.pj]     # [B,T,P]
         if self.learned_het:
             het_pen = F.softplus(het).unsqueeze(-1)              # [B,T,1] >= 0
@@ -317,7 +360,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
 
     def _step(self, batch):
         X, h1, h2 = batch["input_embeds"], batch["h1"], batch["h2"]
-        emis_p, g, c = self(X, batch.get("homo_scale"), batch.get("ext_emb"))
+        emis_p, g, c = self(X, batch.get("homo_scale"), batch.get("ext_emb"),
+                            batch.get("window_density"))
         tags = self._pair_labels(h1, h2)
         crf = _dcrf_nll(emis_p, c, self.nsw_pair, self.stay_bonus, tags)
         loss = crf + self.gate_reg * (1.0 - g).mean()
@@ -407,7 +451,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         return {"optimizer": opt, "lr_scheduler": sched, "monitor": "val/loss"}
 
 
-def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=64):
+def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=64,
+                             window_density=None):
     """THE single real-data inference recipe for GRITSCRFDiploidIndel --
     every eval script (real-data unit tests, depth sweeps, per-checkpoint
     comparisons) should call this instead of re-deriving the ext_emb /
@@ -426,6 +471,15 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=6
     other variant/override point -- if a different homo_scale is ever
     needed, change it here, once, not in each caller.
 
+    window_density: optional [N,2] int8/float array, compute_window_density's
+    output (simulate_alleles.py) for the SAME windows as `data` -- pass the
+    `<...>.density.npy` sidecar written by `--emit-density` if the real data
+    was converted with that flag. Default None means "no density signal"
+    (old real-data conversions, or a checkpoint trained without this input):
+    the encoder's density_proj is zero-initialized, so passing None here is
+    numerically identical to passing an all-zero array through a freshly
+    warm-started checkpoint -- the bit-identical-warm-start regression test.
+
     Returns (pred_lo, pred_hi): [N,T] int arrays, the low/high founder
     index of the predicted pair at every real site."""
     K = num_parents
@@ -433,6 +487,8 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=6
     N, T, W = data.shape
     if W != 2 * K + 2:
         raise ValueError(f"data width {W} != 2*num_parents+2={2 * K + 2}")
+    if window_density is not None and len(window_density) != N:
+        raise ValueError(f"window_density length {len(window_density)} != data length {N}")
 
     tern = data[:, :, :K].astype(np.float32)
     dist = data[:, :, K + 2:2 * K + 2].astype(np.float32)
@@ -441,6 +497,8 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=6
     affinity = _founder_affinity(M.reshape(-1, K))
     homo_scale = homo_scale_from_affinity(M)
     ext_emb = torch.tensor(affinity, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
+    wd = (None if window_density is None else
+          torch.tensor(np.asarray(window_density), dtype=torch.float32))
 
     preds_lo, preds_hi = [], []
     with torch.no_grad():
@@ -448,7 +506,8 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=6
             xb = feats[s:s + batch_size].to(device)
             eb = ext_emb[s:s + batch_size].to(device)
             hs = torch.full((xb.shape[0],), homo_scale, device=device)
-            emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs)
+            wb = wd[s:s + batch_size].to(device) if wd is not None else None
+            emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs, window_density=wb)
             pred = _dcrf_viterbi(emis_p, c, model.nsw_pair, model.stay_bonus)
             preds_lo.append(model.pi[pred].cpu().numpy())
             preds_hi.append(model.pj[pred].cpu().numpy())

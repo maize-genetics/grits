@@ -30,7 +30,8 @@ import torch
 from python.crf.train_diploid import (
     _founder_affinity, estimate_inbreeding_coef, homo_scale_from_affinity,
     _estimate_inbreeding_coef_batch)
-from python.crf.train_diploid_indel import infer_real_founder_pairs, ibd_adjusted_accuracy
+from python.crf.train_diploid_indel import (
+    infer_real_founder_pairs, ibd_adjusted_accuracy, GRITSCRFDiploidIndel)
 
 REALDIR = "/workdir/zrm22/HackathonJun2026/grits_workdir/data/real"
 CKPT = ("/workdir/zrm22/HackathonJun2026/grits_workdir/indel_baseline/checkpoints/"
@@ -76,12 +77,13 @@ def _build_row_idx(outdir, window_size=512):
     return row_idx
 
 
-def _ril2_truth_windows(pair, window_size=512):
+def _ril2_truth_windows(pair, window_size=512, depth="0.1x"):
     """[N,T,2] true (h1,h2) founder indices in native K=25 space, windowed
     with the EXACT same per-contig chunking ropebwt_npy_to_matrix.py's
     --window-size uses (so row N aligns 1:1 with the corresponding real
     *_ternary_k25native.npy window). -1 = unresolved."""
-    outdir = _ril2_outdir(pair)
+    outdir = (_ril2_outdir(pair) if depth == "0.1x" else
+              os.path.join(RIL2_SCRATCH, f"IDX-RIL2__{pair}__{depth}"))
     bins_df = pd.read_csv(f"{outdir}/raw.npy.bins.tsv", sep="\t")
     truth = np.load(f"{outdir}/truth_labels.npy")
     windows = []
@@ -202,8 +204,16 @@ class TestRealDataEndToEndPairAccuracy(unittest.TestCase):
     def setUpClass(cls):
         from python.crf.train_diploid_indel import GRITSCRFDiploidIndel
         cls.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # strict=False: CKPT predates density_proj (experiments/depth-
+        # confidence-fix/) -- zero-initialized by nn.Linear.reset_parameters
+        # then explicitly zeroed again for clarity, so the loaded model is
+        # numerically identical to CKPT's own weights (bit-identical warm
+        # start, verified by TestBitIdenticalWarmStart below).
         cls.model = GRITSCRFDiploidIndel.load_from_checkpoint(
-            CKPT, map_location=cls.device).eval().to(cls.device)
+            CKPT, map_location=cls.device, strict=False).eval().to(cls.device)
+        with torch.no_grad():
+            cls.model.encoder.density_proj.weight.zero_()
+            cls.model.encoder.density_proj.bias.zero_()
 
     def _pair_acc(self, ds, ind, p1, p2):
         data = np.load(_sample_path(ds, ind))
@@ -303,8 +313,16 @@ class TestRealRIL2EndToEndPairAccuracy(unittest.TestCase):
     def setUpClass(cls):
         from python.crf.train_diploid_indel import GRITSCRFDiploidIndel
         cls.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # strict=False: CKPT predates density_proj (experiments/depth-
+        # confidence-fix/) -- zero-initialized by nn.Linear.reset_parameters
+        # then explicitly zeroed again for clarity, so the loaded model is
+        # numerically identical to CKPT's own weights (bit-identical warm
+        # start, verified by TestBitIdenticalWarmStart below).
         cls.model = GRITSCRFDiploidIndel.load_from_checkpoint(
-            CKPT, map_location=cls.device).eval().to(cls.device)
+            CKPT, map_location=cls.device, strict=False).eval().to(cls.device)
+        with torch.no_grad():
+            cls.model.encoder.density_proj.weight.zero_()
+            cls.model.encoder.density_proj.bias.zero_()
 
     def _pair_acc(self, pair):
         data = np.load(_sample_path("IDX-RIL2", pair))
@@ -338,8 +356,16 @@ class TestIBDAdjustedAccuracy(unittest.TestCase):
     def setUpClass(cls):
         from python.crf.train_diploid_indel import GRITSCRFDiploidIndel
         cls.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # strict=False: CKPT predates density_proj (experiments/depth-
+        # confidence-fix/) -- zero-initialized by nn.Linear.reset_parameters
+        # then explicitly zeroed again for clarity, so the loaded model is
+        # numerically identical to CKPT's own weights (bit-identical warm
+        # start, verified by TestBitIdenticalWarmStart below).
         cls.model = GRITSCRFDiploidIndel.load_from_checkpoint(
-            CKPT, map_location=cls.device).eval().to(cls.device)
+            CKPT, map_location=cls.device, strict=False).eval().to(cls.device)
+        with torch.no_grad():
+            cls.model.encoder.density_proj.weight.zero_()
+            cls.model.encoder.density_proj.bias.zero_()
 
     def _accuracies(self, pair):
         data = np.load(_sample_path("IDX-RIL2", pair))
@@ -374,6 +400,70 @@ class TestIBDAdjustedAccuracy(unittest.TestCase):
                           f"expected B73xOh43 to have the largest IBD-adjustment delta, got {deltas}")
         self.assertGreater(deltas["B73xOh43"], 0.01,
                             f"B73xOh43 IBD-adjustment delta={deltas['B73xOh43']:.4f}, expected >0.01")
+
+
+@unittest.skipUnless(_have_ril2_truth() and _have_ckpt(),
+                      "RIL2 real corpus/truth or diploid-indel-v3-k25-overlay-affinity "
+                      "checkpoint not found")
+class TestBitIdenticalWarmStart(unittest.TestCase):
+    """experiments/depth-confidence-fix/ plan, Verification item 2: the
+    density_proj-widened model, loaded from CKPT with strict=False (its
+    state_dict predates that param), must reproduce CKPT's own real-data
+    predictions EXACTLY -- proof the migration is safe and any later change
+    is attributable to training, not plumbing. window_density is never
+    passed (None) here, so IndelFounderPathEncoder.forward's density branch
+    is not merely zero-weighted but never executed at all -- byte-identical
+    by construction, not just numerically close.
+
+    Pinned against pair_acc/ibd_adj recorded this session BEFORE density_proj
+    existed at all (experiments/depth-confidence-fix/scripts/
+    stay_bonus_sweep.py's stay_bonus=2.0 rows, the checkpoint's trained
+    default -- same infer_real_founder_pairs/score-path methodology, same
+    checkpoint, same cached real data)."""
+
+    EXPECTED = {
+        ("IDX-HYB", "Oh43xIl14H", "0.1x"): (0.9903, 0.9994),
+        ("IDX-HYB", "Oh43xIl14H", "2.0x"): (0.9650, 0.9974),
+        ("IDX-RIL2", "Oh43xIl14H", "0.1x"): (0.9962, 0.9962),
+        ("IDX-RIL2", "Oh43xIl14H", "2.0x"): (0.9942, 0.9992),
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = "cuda" if torch.cuda.is_available() else "cpu"
+        cls.model = GRITSCRFDiploidIndel.load_from_checkpoint(
+            CKPT, map_location=cls.device, strict=False).eval().to(cls.device)
+        with torch.no_grad():
+            cls.model.encoder.density_proj.weight.zero_()
+            cls.model.encoder.density_proj.bias.zero_()
+
+    def test_pinned_pair_acc_and_ibd_adj_reproduced_exactly(self):
+        for (ds, ind, depth), (exp_pair, exp_ibd) in self.EXPECTED.items():
+            with self.subTest(ds=ds, ind=ind, depth=depth):
+                data = np.load(os.path.join(
+                    REALDIR, f"{ind}_{ds}_{depth}_ternary_k25native.npy"))
+                if ds == "IDX-HYB":
+                    p1, p2 = ind.split("x")
+                    tlo, thi = min(IDX[p1], IDX[p2]), max(IDX[p1], IDX[p2])
+                    N = data.shape[0]
+                    true_lo = np.full((N, 512), tlo)
+                    true_hi = np.full((N, 512), thi)
+                    valid = np.ones((N, 512), dtype=bool)
+                else:
+                    truth_w = _ril2_truth_windows(ind, depth=depth)
+                    h1, h2 = truth_w[:, :, 0], truth_w[:, :, 1]
+                    valid = (h1 >= 0) & (h2 >= 0)
+                    true_lo, true_hi = np.minimum(h1, h2), np.maximum(h1, h2)
+                outdir = os.path.join(RIL2_SCRATCH, f"{ds}__{ind}__{depth}")
+                raw = np.load(f"{outdir}/raw.npy", mmap_mode="r")
+                row_idx = _build_row_idx(outdir)
+                pair_acc, ibd_adj, _cred, _chk = ibd_adjusted_accuracy(
+                    self.model, data, K, true_lo, true_hi, valid, raw, row_idx,
+                    device=self.device)
+                self.assertAlmostEqual(pair_acc, exp_pair, places=4,
+                                       msg=f"{ds}/{ind}/{depth}: pair_acc drifted from pinned value")
+                self.assertAlmostEqual(ibd_adj, exp_ibd, places=4,
+                                       msg=f"{ds}/{ind}/{depth}: ibd_adj drifted from pinned value")
 
 
 if __name__ == "__main__":
