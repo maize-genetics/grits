@@ -117,11 +117,23 @@ def parse_args():
     p.add_argument("--dist-log-scale", type=float, default=8.0,
                    help="Log-scale factor for distance-to-anchor coding, matching "
                         "simulate_alleles.py's DIST_LOG_SCALE default.")
+    p.add_argument("--emit-read-counts", action="store_true",
+                   help="--anchor-dist-npy only: widen the output from 2K+2 to 3K+2 "
+                        "by appending a 4th per-founder block -- the real per-(row,"
+                        "founder) read-support count refmap's --anchor-dist-npy "
+                        "export already carries (arr[:, :K], today's counts block, "
+                        "currently discarded by this script), log-coded via the "
+                        "same scheme as distance. Matches simulate_alleles.py's own "
+                        "--emit-read-counts contract. Off by default. See "
+                        "experiments/depth-confidence-fix/.")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.emit_read_counts and not args.anchor_dist_npy:
+        raise SystemExit("--emit-read-counts requires --anchor-dist-npy "
+                          "(the counts block only exists in that source layout)")
     window_size = args.window_size
     step_size = args.step_size or window_size
 
@@ -170,6 +182,18 @@ def main():
         code = np.clip(code, 0, DIST_SAT - 1).astype(np.int8)
         dist = np.where(has_anchor, code, DIST_PAD).astype(np.int8)
 
+        counts = None
+        if args.emit_read_counts:
+            # arr[:, :K]: real per-(row,founder) read-support count, already
+            # produced by refmap's --anchor-dist-npy export, discarded until
+            # now. Log-coded via the identical scheme as distance -- no PAD
+            # sentinel needed, 0 is itself the informative "no support"
+            # value (matches simulate_alleles.py's own --emit-read-counts).
+            counts_raw = arr[:, :K].astype(np.int64)
+            count_code = np.rint(args.dist_log_scale *
+                                  np.log2(1.0 + np.maximum(counts_raw, 0).astype(np.float64)))
+            counts = np.clip(count_code, 0, DIST_SAT - 1).astype(np.int8)
+
         if args.drop_idx is not None:
             drop_idx = args.drop_idx
             if not (0 <= drop_idx < K):
@@ -180,17 +204,21 @@ def main():
             remap[keep_idx] = np.arange(target)
             name = (gametes.sort_values("gameteIndex")["sampleName"].to_numpy()[drop_idx]
                     if gametes is not None else str(drop_idx))
-            print(f"Dropping fixed founder idx={drop_idx} ({name}) from all three blocks "
+            print(f"Dropping fixed founder idx={drop_idx} ({name}) from all "
+                  f"{'four' if counts is not None else 'three'} blocks "
                   f"(K={K} -> {target})")
             tern = tern[:, keep_idx]
             dist = dist[:, keep_idx]
+            if counts is not None:
+                counts = counts[:, keep_idx]
             gA = remap[gA]
             gB = remap[gB]
             K = target
 
         labels = np.stack([gA, gB], axis=1).astype(np.int8)    # [n_rows, 2]
-        rows = np.concatenate([tern, labels, dist], axis=1)    # [n_rows, 2K+2] int8, matches
-                                                                 # simulate_alleles.py's [ternary(K)|H1|H2|distance(K)]
+        blocks = [tern, labels, dist] + ([counts] if counts is not None else [])
+        rows = np.concatenate(blocks, axis=1)                  # [n_rows, 2K+2 or 3K+2] int8, matches
+                                                                 # simulate_alleles.py's [ternary(K)|H1|H2|distance(K)(|count(K))]
     else:
         assert arr.shape[1] == K + 2, (
             f"npy has {arr.shape[1]} cols; expected K+2={K + 2} for K={K}")
@@ -268,7 +296,7 @@ def main():
     print(f"  het (gA != gB)      : {het.mean()*100:.1f}%")
     if args.anchor_dist_npy:
         tern_out = out[:, :, :K]
-        dist_out = out[:, :, K + 2:]
+        dist_out = out[:, :, K + 2:2 * K + 2]
         either_covered = (tern_out == 1).any(axis=2).mean()
         print(f"  ternary match/div/del: "
               f"{(tern_out==1).mean()*100:.1f}% / {(tern_out==0).mean()*100:.1f}% / "
@@ -277,6 +305,11 @@ def main():
         print(f"  distance code: pad(no anchor)={ (dist_out==-1).mean()*100:.2f}%  "
               f"sat(127)={(dist_out==127).mean()*100:.2f}%  "
               f"mean(non-pad)={dist_out[dist_out>=0].mean():.1f}")
+        if args.emit_read_counts:
+            count_out = out[:, :, 2 * K + 2:3 * K + 2]
+            real_count = count_out[tern_out == 1]
+            print(f"  read-support count (MATCH cells only): "
+                  f"mean={real_count.mean():.2f}  frac==0={(real_count==0).mean()*100:.2f}%")
 
 
 if __name__ == "__main__":
