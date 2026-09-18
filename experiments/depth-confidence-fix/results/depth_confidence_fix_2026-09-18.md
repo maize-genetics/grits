@@ -159,3 +159,101 @@ generation-time) windowing change, not a model change — no retraining
 required to validate further, though the training data's own windowing
 convention would need the same fix for train/inference consistency
 before promoting a production default.
+
+### Window-density feature (`window_density`) + mixed-depth retrain — negative result so far, on branch `indel-density-features`
+
+The stride/subsample fix above is diagnostic-only (it discards real
+reads). The non-wasteful alternative: give the model an explicit
+per-window evidence-density signal so it can *discount* redundant
+clustered evidence itself while still seeing every real read, rather
+than treating a genomically-compressed high-depth window as 512
+independent observations.
+
+**Design, revised after a probe gate.** A per-ROW version (gap-to-
+previous-row, read-stack-depth) was designed first and tested directly
+against the deployed model's real predictions
+(`scripts/density_probe.py`) before any implementation: per-row values
+do **not** separate correct from incorrect predictions within a fixed
+depth (HYB 2.0x: mean_gap[correct]=0.568 vs mean_gap[wrong]=0.647;
+stack-bucketed error rate flat 2.08–2.32% across stack=1–10). The large
+depth→error effect is real but lives at the whole-window level, not the
+per-row level. Redesigned to two per-window scalars —
+`compute_window_density(site_idx, valid)` in `simulate_alleles.py`:
+`window_span` (last−first reference-site index among valid rows) and
+`window_uniq_sites` (distinct site count; `T/uniq_sites` is mean stack
+depth) — delivered as a small `[N,2]` sidecar (`--emit-density`, both
+producers, byte-identical main-array contract otherwise) rather than
+widening the `[N,T,2K+2]` array. Consumed via a zero-initialized
+`density_proj` in `IndelFounderPathEncoder`, broadcast-added once per
+window right where positional encoding is added — reaches emissions,
+gate, and transition potential. Zero-init (constructed *last* in
+`__init__`, after every other layer, so its weight-init RNG draws don't
+shift any other layer's fixed-seed initialization — verified against
+`TestOverfitSmoke`) means a freshly-widened model is numerically
+identical to the deployed checkpoint, confirmed by a new regression
+test (`TestBitIdenticalWarmStart`) pinning exact pre-existing pair_acc/
+ibd_adj numbers on real HYB/RIL2 data.
+
+**Mixed-depth training data.** The default `--indel-coverage-model
+linear` gives `P=1.0` (guaranteed read at every present site) at the
+module's own defaults — simulated data never varies genomic compression
+at all. Generated a small validation-scale mixed-depth set instead:
+`--indel-coverage-model reads` (real contiguous-fragment sampling) at
+0.1x/0.5x/1.0x/2.0x (region-mult tuned per depth for ~0% short-window
+padding: 40/10/6/6), 200 windows/depth, `--windows-per-individual 20`,
+concatenated and individual-block-shuffled (so train/val/test splits
+mix depths, not confounded by file order) into one 800-window set.
+Decoded `window_density` confirms a clean depth gradient survived
+concatenation: mean span 8,619→666 bin-units, 0.1x→2.0x (~13x, matching
+the real-data compression ratio that motivated this whole investigation).
+
+**Retrain**: new `--warm-start-ckpt` flag (`train_diploid_indel.py`) —
+`--resume`'s `ckpt_path=` mechanism requires an exact architecture match
+(Lightning's strict-mode state-dict load), which fails once
+`density_proj` exists; `--warm-start-ckpt` loads only the weights
+(`strict=False`) and starts a genuinely fresh optimizer/epoch, not a
+resumed one. Warm-started from `diploid-indel-v3-k25-overlay-affinity`,
+5 epochs, same hyperparameters recovered from that checkpoint
+(`time_local_emis`, `homo_penalty=3.0`, `spike_skip`, `founder_affinity`,
+`batch_size=64`, `bf16-mixed`). Training healthy — no crash, val_pair_acc
+climbed monotonically each epoch (0.021→0.033→0.090→0.133→0.208) on this
+new, harder synthetic task (`--min-founders 2 --max-founders 25`, up to
+25-way founder mixtures — not directly comparable to v3-K25's own 0.68).
+
+**Real-data result — negative, and doesn't yet test the actual
+hypothesis.** `ropebwt_npy_to_matrix.py --emit-density` was never run
+against the cached real HYB/RIL2 data, so `window_density=None`
+throughout this eval on *both* checkpoints — `density_proj` never fired.
+What this measures is purely 5 epochs of warm-start fine-tuning on the
+small mixed-depth set:
+
+| depth | HYB v3-K25 (baseline) | HYB density-mixed-depth (new) | RIL2 v3-K25 | RIL2 density-mixed-depth |
+|---|---|---|---|---|
+| 0.01x | 100.00% | 98.65% | 96.92% | 97.77% |
+| 0.1x | 99.03% | 96.05% | 99.62% | 99.74% |
+| 0.5x | 98.08% | 93.93% | 99.63% | 99.73% |
+| 1.0x | 97.13% | 92.51% | 99.57% | 99.64% |
+| 2.0x | 96.50% | 91.73% | 99.42% | 99.58% |
+
+HYB — the case this whole investigation is about — got **worse at every
+depth**, and proportionally worse depth-degradation, not better (baseline
+drops ~3.5pp 0.01x→2.0x; new checkpoint drops ~7pp). RIL2 improved
+slightly at every depth, a small win against a much clearer HYB loss.
+
+Most likely cause: **catastrophic forgetting**, not a failure of the
+density-feature idea — the validation set's `--min-founders 2
+--max-founders 25` individual composition looks nothing like a real
+2-founder F1 hybrid, so 5 epochs fine-tuning on it plausibly pulled the
+model's other weights away from what it already did well on that
+specific case, while incidentally helping RIL2-like harder cases.
+**The density-feature hypothesis itself remains untested on real data**
+— `density_proj` never received a non-zero input in this eval. Next
+steps before any further verdict: (1) run `--emit-density` against the
+cached real HYB/RIL2 npy so `window_density` is actually non-null at
+real inference time, (2) fix the training-composition mismatch (narrower
+founder-count range matching real hybrids more closely, and/or more
+scale/epochs) so warm-starting doesn't erode existing hybrid-decoding
+skill before the density signal gets a fair test.
+
+Branch `indel-density-features` (cut from `indel-v3-simulator`, disposable
+per this session's explicit agreement) — not merged, not promoted.
