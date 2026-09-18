@@ -956,8 +956,11 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   max_stack, anchor_thresh, ref_founder, dist_scale,
                   coverage_model="linear", read_len=150):
     """Assemble one chunk's indel-mode output:
-    `(tern, dist [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T] int32,
-    short [n] bool, n_either int, n_hemi int, n_null int)`.
+    `(tern, dist, count [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T]
+    int32, short [n] bool, n_either int, n_hemi int, n_null int)`. `count`
+    is always computed (cheap, deterministic) -- callers decide whether to
+    write it into a widened output array (experiments/depth-confidence-fix/,
+    --emit-read-counts).
 
     `h1`/`h2`/`lineage`/`del_lin`/`ins_lin`/`match1`/`match2` are all
     indexed over the R-site GENERATION region; the output arrays are
@@ -1041,6 +1044,7 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
 
     tern_out = np.full((n, T, K), TERN_PAD, dtype=np.int8)
     dist_out = np.full((n, T, K), DIST_PAD, dtype=np.int8)
+    count_out = np.full((n, T, K), 0, dtype=np.int8)   # 0 = no PAD sentinel needed, itself informative
     lab1_out = np.full((n, T), LABEL_PAD, dtype=np.int8)
     lab2_out = np.full((n, T), LABEL_PAD, dtype=np.int8)
     refpos_out = np.full((n, T), -1, dtype=np.int32)
@@ -1072,7 +1076,31 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
         lab2_out[w, r] = h2[w, t].astype(np.int8)
         refpos_out[w, r] = t
 
-    return (tern_out, dist_out, lab1_out, lab2_out, refpos_out, short,
+        # count_out: per-cell read-support -- experiments/depth-confidence-fix/.
+        # Rows sharing one (window,site) are NOT all identical: different
+        # "kind" (on1/on2/insertion-derived) rows draw from match1/match2/
+        # lineage independently, so e.g. an on1-kind row and an on2-kind row
+        # at the SAME site can show genuinely different ternary vectors
+        # (verified against test_indel_chunk_tiny_exact's own fixture, which
+        # has exactly this: alternating [1,0]/[0,1] rows at one site). So
+        # the per-founder count must be a genuine per-site tally of how many
+        # of THIS SITE's rows (any kind) show MATCH for founder k -- not
+        # cnt[w,t] (the row count regardless of founder), which would
+        # overcount every founder that ANY row at the site happens to
+        # support. Group rows by (window,site) and sum the MATCH indicator,
+        # broadcasting the per-site-per-founder total back to every row at
+        # that site (real refmap-exported rows are themselves already
+        # small per-gameteSet-bin aggregates, not literally one row per
+        # single physical read, so this broadcast matches that structure).
+        # Deterministic from already-drawn tern_rows -- no new RNG draws.
+        site_key = w.astype(np.int64) * R + t.astype(np.int64)
+        _, group_id = np.unique(site_key, return_inverse=True)
+        group_match = np.zeros((group_id.max() + 1, K), dtype=np.int64)
+        np.add.at(group_match, group_id, (tern_rows == TERN_MATCH).astype(np.int64))
+        count_rows = group_match[group_id]                    # [Rows,K]
+        count_out[w, r] = _encode_dist(count_rows, dist_scale)
+
+    return (tern_out, dist_out, count_out, lab1_out, lab2_out, refpos_out, short,
             n_either, n_hemi, n_null, n_deleted, n_founder_sites)
 
 
@@ -1096,7 +1124,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              indel_ref_founder=-1, indel_lineage_frac=0.15,
              indel_overlay_rate=2.3e-3, indel_overlay_mean_len=300.0,
              indel_overlay_founder_freq=1.0, subst_model="dense",
-             subst_rate=0.018, coverage_model="linear", read_len=150):
+             subst_rate=0.018, coverage_model="linear", read_len=150,
+             emit_read_counts=False):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
     (default) behavior, including rng draw order, is byte-for-byte
@@ -1106,6 +1135,13 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
     simulate_indels: emit the indel-aware ternary+distance layout
     (2K+2 columns: [ternary(K) | H1 | H2 | distance(K)]) instead of the
     binary K+2 (or K+3 with the eval-only recomb-rate column) layout.
+    `emit_read_counts` (experiments/depth-confidence-fix/) widens this to
+    3K+2 by appending a 4th per-founder block: [ternary(K) | H1 | H2 |
+    distance(K) | count(K)], count = the site's total real read count
+    wherever that founder's ternary state is MATCH, else 0, log-coded via
+    the same `_encode_dist` scheme as distance (no new RNG draws). Off by
+    default (`ncol` stays 2K+2, byte-identical to before this param
+    existed).
     Windows still have exactly `sites` OUTPUT rows (PLAN.md's row-
     assembly note: a window is "the next T real rows in reference
     order," not "rows covering a fixed reference-bp span" -- no padding
@@ -1143,6 +1179,9 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             "emit_snp_panel is not supported with simulate_indels (the "
             "panel is reference-site indexed; this mode's row axis is "
             "not)")
+    if emit_read_counts and not simulate_indels:
+        raise ValueError("emit_read_counts requires simulate_indels=True "
+                          "(the count block only exists in that mode)")
     if indel_model not in ("tracts", "lineage", "overlay"):
         raise ValueError(f"indel_model must be one of tracts/lineage/overlay, "
                           f"got {indel_model!r}")
@@ -1179,7 +1218,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
     true_deleted_sum = true_founder_sites_sum = 0
     if simulate_indels:
         R = indel_region_mult * T
-        ncol = 2 * K + 2
+        ncol = (3 if emit_read_counts else 2) * K + 2
         out = np.empty((windows, T, ncol), dtype=np.int8)
         # Unlike the base case, ibd is R-site indexed here (the same
         # generation-region axis as the indel tracts), not T-site indexed
@@ -1289,7 +1328,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 lineage=lineage, lineage_M=M, per_gamete=True,
                 subst_model=subst_model, subst_rate=subst_rate)
 
-            (tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null,
+            (tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null,
              n_deleted, n_founder_sites) = _indel_chunk(
                 rng, n, R, T, K, h1, h2, lineage_indel, del_lin, ins_lin,
                 match1, match2, gamete_balance, indel_coverage,
@@ -1299,7 +1338,9 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             out[sl, :, :K] = tern
             out[sl, :, K] = lab1
             out[sl, :, K + 1] = lab2
-            out[sl, :, K + 2:] = dist
+            out[sl, :, K + 2:2 * K + 2] = dist
+            if emit_read_counts:
+                out[sl, :, 2 * K + 2:3 * K + 2] = count
             ibd[sl] = np.transpose(lineage, (0, 2, 1)).astype(np.int8)
             refpos_out[sl] = refpos
             short_out[sl] = short
@@ -1667,6 +1708,14 @@ def parse_args():
                    help="Founder index treated as the reference (e.g. B73): never "
                         "given deletions, distance pinned to 0. -1 = no reference "
                         "founder in this panel (all K founders carry indels).")
+    p.add_argument("--emit-read-counts", action="store_true",
+                   help="--simulate-indels only: widen the output from 2K+2 to 3K+2 "
+                        "by appending a 4th per-founder block -- per-cell real "
+                        "read-support count (the site's total real read count "
+                        "wherever that founder's ternary state is MATCH, else 0), "
+                        "log-coded via _encode_dist. Deterministic from "
+                        "already-drawn cnt/tern -- no new RNG draws. Off by "
+                        "default. See experiments/depth-confidence-fix/.")
 
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -1687,11 +1736,13 @@ def _print_indel_summary(args, data, refpos, short, out_path, refpos_path, true_
     tern = data[:, :, :K]
     lab1 = data[:, :, K].astype(np.int64)
     lab2 = data[:, :, K + 1].astype(np.int64)
-    dist_code = data[:, :, K + 2:]
+    dist_code = data[:, :, K + 2:2 * K + 2]
+    count_code = data[:, :, 2 * K + 2:3 * K + 2] if data.shape[-1] >= 3 * K + 2 else None
 
     print(f"\nWrote {out_path}")
     print(f"  shape={data.shape}  dtype={data.dtype}  "
-          f"size={data.nbytes / 1e9:.2f} GB  (2K+2 ternary+distance layout)")
+          f"size={data.nbytes / 1e9:.2f} GB  "
+          f"({'3K+2 ternary+distance+count' if count_code is not None else '2K+2 ternary+distance'} layout)")
     print(f"  windows needing padding: {short.mean()*100:.2f}%  "
           f"(should be ~0% at sane --indel-coverage/--indel-density; if not, "
           f"raise --indel-region-mult or --indel-coverage)")
@@ -1814,6 +1865,13 @@ def _print_indel_summary(args, data, refpos, short, out_path, refpos_path, true_
         print(f"  distance code (all real rows): mean {real_dist.mean():.2f}  "
               f"p99 {np.percentile(real_dist, 99):.1f}  "
               f"saturated(={DIST_SAT-1}) frac {(real_dist == DIST_SAT-1).mean()*100:.2f}%")
+    if count_code is not None:
+        match_mask = tern[valid] == TERN_MATCH
+        real_count = count_code[valid][match_mask]
+        if real_count.size:
+            print(f"  read-support count (MATCH cells only): mean {real_count.mean():.2f}  "
+                  f"p99 {np.percentile(real_count, 99):.1f}  "
+                  f"frac==0 {(real_count == 0).mean()*100:.2f}%")
     if refpos_path is not None:
         print(f"  reference positions → {refpos_path}  shape={refpos.shape}")
 
@@ -1895,6 +1953,7 @@ def main():
         indel_overlay_founder_freq=args.indel_overlay_founder_freq,
         subst_model=args.subst_model, subst_rate=args.subst_rate,
         coverage_model=args.indel_coverage_model, read_len=args.indel_read_len_bp,
+        emit_read_counts=args.emit_read_counts,
         indel_density=args.indel_density, indel_ins_frac=args.indel_ins_frac,
         indel_large_frac=args.indel_large_frac,
         indel_small_alpha=args.indel_small_alpha,

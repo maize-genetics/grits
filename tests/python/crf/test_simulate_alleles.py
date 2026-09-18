@@ -665,7 +665,7 @@ def test_indel_chunk_tiny_exact():
     n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
     T = 8
     rng = np.random.default_rng(0)
-    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+    tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
         rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
         gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
         anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
@@ -693,7 +693,7 @@ def test_indel_chunk_shape_dtype():
     n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
     T = 5
     rng = np.random.default_rng(1)
-    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+    tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
         rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
         gamete_balance=0.5, coverage=2.0, ins_read_per_bp=2e-3, max_stack=64,
         anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
@@ -718,7 +718,7 @@ def test_indel_chunk_rare_shortfall_pads_and_flags():
     match2 = np.zeros((n, R, K), dtype=np.int8)
     T = 50
     rng = np.random.default_rng(2)
-    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+    tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
         rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
         gamete_balance=0.5, coverage=0.0, ins_read_per_bp=0.0, max_stack=1,
         anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
@@ -739,7 +739,7 @@ def test_indel_chunk_ternary_never_one_where_deleted_fuzz():
         h2 = rng.integers(0, K, size=(n, R))
         match1 = (rng.random((n, R, K)) < 0.3).astype(np.int8)
         match2 = (rng.random((n, R, K)) < 0.3).astype(np.int8)
-        tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+        tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
             rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
             gamete_balance=0.5, coverage=2.0, ins_read_per_bp=2e-3,
             max_stack=64, anchor_thresh=0, ref_founder=-1,
@@ -756,7 +756,7 @@ def test_indel_chunk_insertion_stacking_appears_with_enough_budget():
     n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
     T = 8
     rng = np.random.default_rng(4)
-    tern, dist, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+    tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
         rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
         gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
         anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
@@ -1080,3 +1080,152 @@ def test_simulate_v4_flags_end_to_end(subst_model, coverage_model):
         subst_model=subst_model, subst_rate=0.02, coverage_model=coverage_model)[0]
     assert out.shape == (2, T, 2 * K + 2)
     assert out.dtype == np.int8
+
+
+# --- read-support count (--emit-read-counts) -----------------------------
+# experiments/depth-confidence-fix/. Colleague's lab-meeting suggestion,
+# validated first against real cached data (readcount_probe.py) before any
+# implementation: per-cell true-founder read-support count separates
+# correct from incorrect real predictions sharply (4.40% error at 0
+# reads vs 0.36% at >10, at 2.0x) -- a real, previously-unused signal.
+
+def test_indel_chunk_count_tiny_exact():
+    """Same fixture as test_indel_chunk_tiny_exact. Rows sharing one site
+    are NOT all identical (on1-kind vs on2-kind rows draw independently),
+    so count must be a genuine per-(site,founder) tally of how many rows
+    at that site show MATCH -- hand-derived and cross-checked against the
+    fixture's own known refpos/tern structure:
+      site0 (rows0,1): founder0 MATCH x1 (row0), founder1 MATCH x1 (row1)
+      site1 (rows2-5): founder0 MATCH x1 (row2), founder1 MATCH x3 (rows3-5,
+                        the 3000bp insertion stacking on founder1/lineage1)
+      site2 (row6):    founder0 deleted (not MATCH), founder1 MATCH x1
+      site3 (row7):    founder0 MATCH x1, founder1 diverged (not MATCH)
+    """
+    n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
+    T = 8
+    rng = np.random.default_rng(0)
+    tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+
+    expect_raw = np.array([[1, 1], [1, 1], [1, 3], [1, 3], [1, 3], [1, 3],
+                            [0, 1], [1, 0]])
+    expect_count = _encode_dist(expect_raw, DIST_LOG_SCALE)
+    np.testing.assert_array_equal(count[0], expect_count)
+
+
+def test_indel_chunk_count_zero_where_deleted():
+    """Deletion status (dist_row) is site-uniform (the same for every row
+    sharing a site, unlike MATCH/DIVERGED which can differ by kind), so a
+    founder shown as DEL at a site is guaranteed count=0 there -- no row
+    at that site can show MATCH for it. (DIVERGED is NOT guaranteed 0:
+    a sibling row of a different kind at the same site can show MATCH,
+    and the broadcast aggregate reflects that.)"""
+    n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
+    T = 8
+    rng = np.random.default_rng(0)
+    tern, dist, count, *_ = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+    deleted = tern[0] == TERN_DEL
+    assert deleted.any(), "fixture should have at least one deleted cell"
+    assert (count[0][deleted] == 0).all()
+
+
+def test_indel_chunk_count_positive_where_matched():
+    """A row showing MATCH for founder k always contributes to that
+    site's own tally, so count there is guaranteed > 0 (>= _encode_dist(1))
+    -- self-contribution, regardless of any sibling rows."""
+    n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
+    T = 8
+    rng = np.random.default_rng(0)
+    tern, dist, count, *_ = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+    matched = tern[0] == TERN_MATCH
+    assert matched.any(), "fixture should have at least one matched cell"
+    assert (count[0][matched] >= _encode_dist(np.array([1]), DIST_LOG_SCALE)[0]).all()
+
+
+def test_indel_chunk_count_matches_naive_reference_fuzz():
+    """Vectorized per-site-per-founder MATCH tally vs a trivially-correct
+    per-row Python loop, on randomized fixtures -- catches aggregation
+    bugs (e.g. the cnt[w,t]-total-row-count design this replaced, which
+    over-counted founders that only SOME rows at a site actually support)."""
+    rng = np.random.default_rng(9)
+    for trial in range(15):
+        n, M, K, R = 2, 3, 3, int(rng.integers(4, 12))
+        T = int(rng.integers(2, R))
+        lineage = rng.integers(0, M, size=(n, K, R)).astype(np.int64)
+        del_lin, ins_lin = _indel_tracts(rng, n, M, R, **_TRACT_KW)
+        h1 = rng.integers(0, K, size=(n, R))
+        h2 = rng.integers(0, K, size=(n, R))
+        match1 = (rng.random((n, R, K)) < 0.5).astype(np.int8)
+        match2 = (rng.random((n, R, K)) < 0.5).astype(np.int8)
+
+        chunk_rng = np.random.default_rng(trial)
+        tern, dist, count, lab1, lab2, refpos, short, *_ = _indel_chunk(
+            chunk_rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
+            match1, match2, gamete_balance=0.5, coverage=8.0,
+            ins_read_per_bp=5e-3, max_stack=8, anchor_thresh=0,
+            ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+
+        for wi in range(n):
+            valid = refpos[wi] >= 0
+            if not valid.any():
+                continue
+            sites = refpos[wi][valid]
+            tern_v = tern[wi][valid]
+            count_v = count[wi][valid]
+            for site in np.unique(sites):
+                rows_at_site = sites == site
+                naive = (tern_v[rows_at_site] == TERN_MATCH).sum(axis=0)  # [K]
+                expect = _encode_dist(naive, DIST_LOG_SCALE)
+                got = count_v[rows_at_site]
+                np.testing.assert_array_equal(
+                    got, np.tile(expect, (rows_at_site.sum(), 1)),
+                    err_msg=f"trial={trial} window={wi} site={site}")
+
+
+def test_simulate_emit_read_counts_widens_output_and_invariant_holds():
+    """End-to-end: --emit-read-counts widens 2K+2 -> 3K+2, and the two
+    guaranteed invariants hold genome-wide (count==0 at DEL -- deletion
+    is site-uniform; count>0 at MATCH -- self-contribution). DIVERGED has
+    no fixed invariant (a sibling row of a different kind at the same
+    site can show MATCH), so it's deliberately not asserted here."""
+    K, T = 8, 256
+    out = simulate(
+        np.random.default_rng(5), windows=3, sites=T, founders=K,
+        min_cross=1, max_cross=3, inbreeding=0.0, allele_sharing=0.6,
+        bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+        sharing_theta=4.0, simulate_indels=True, indel_model="overlay",
+        indel_region_mult=8, indel_coverage=2.0, emit_read_counts=True)[0]
+    assert out.shape == (3, T, 3 * K + 2)
+    tern = out[:, :, :K]
+    count = out[:, :, 2 * K + 2:3 * K + 2]
+    assert (count[tern == TERN_DEL] == 0).all()
+    assert (count[tern == TERN_MATCH] > 0).all()
+
+
+def test_simulate_emit_read_counts_off_by_default_is_2k2():
+    """emit_read_counts=False (default) keeps the exact pre-existing 2K+2
+    contract -- no behavior change for existing callers."""
+    K, T = 8, 200
+    out = simulate(
+        np.random.default_rng(5), windows=2, sites=T, founders=K,
+        min_cross=1, max_cross=3, inbreeding=0.0, allele_sharing=0.6,
+        bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+        sharing_theta=4.0, simulate_indels=True, indel_model="overlay",
+        indel_region_mult=8, indel_coverage=2.0)[0]
+    assert out.shape == (2, T, 2 * K + 2)
+
+
+def test_simulate_emit_read_counts_requires_simulate_indels():
+    with pytest.raises(ValueError, match="emit_read_counts requires simulate_indels"):
+        simulate(
+            np.random.default_rng(0), windows=2, sites=32, founders=4,
+            min_cross=1, max_cross=2, inbreeding=0.0, allele_sharing=0.6,
+            bad_frac=0.02, emit_read_counts=True)
