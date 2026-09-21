@@ -424,7 +424,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         return {"optimizer": opt, "lr_scheduler": sched, "monitor": "val/loss"}
 
 
-def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=64):
+def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=256):
     """THE single real-data inference recipe for GRITSCRFDiploidIndel --
     every eval script (real-data unit tests, depth sweeps, per-checkpoint
     comparisons) should call this instead of re-deriving the ext_emb /
@@ -541,27 +541,44 @@ def score_ibd_adjusted_accuracy(pred_lo, pred_hi, true_lo, true_hi, valid,
     """
     pair_acc = float(((pred_lo == true_lo) & (pred_hi == true_hi))[valid].mean())
 
+    # Vectorized pre-filter (experiments/depth-confidence-fix/, same class of
+    # fix as homo_scale_from_affinity's earlier O(N) loop): compute has_err/
+    # has_switch for ALL N windows at once, and batch-gather raw_counts for
+    # every remaining candidate in ONE fancy-index call instead of N separate
+    # per-window mmap reads -- verified bit-exact against the original
+    # per-window loop on real data (bench_score_ibd_adjusted.py). The
+    # per-window majority-vote/_window_error_slots logic is deliberately left
+    # as a loop over just the (usually much smaller) candidate set -- low
+    # risk, and not the actual bottleneck (0.02-0.34s even at N=28k;
+    # infer_real_founder_pairs's Viterbi decode dominates real eval time by
+    # 2+ orders of magnitude).
     N, T = pred_lo.shape
+    correct = (pred_lo == true_lo) & (pred_hi == true_hi)
+    has_err = (~correct & valid).any(axis=1)
+    has_switch = (true_lo != true_lo[:, :1]).any(axis=1) | (true_hi != true_hi[:, :1]).any(axis=1)
+    candidates = np.flatnonzero(has_err & ~has_switch)
+
     credited = np.zeros((N, T), dtype=bool)
     n_checked, n_credited_windows = 0, 0
-    for w in range(N):
-        err_w = ((pred_lo[w] != true_lo[w]) | (pred_hi[w] != true_hi[w])) & valid[w]
-        if not err_w.any():
-            continue
-        if (true_lo[w] != true_lo[w, 0]).any() or (true_hi[w] != true_hi[w, 0]).any():
-            continue  # internal truth switch -- leave unadjusted (conservative)
-        pairs, counts = np.unique(np.stack([pred_lo[w], pred_hi[w]], axis=1), axis=0, return_counts=True)
-        maj_lo, maj_hi = pairs[np.argmax(counts)]
-        slots = _window_error_slots(true_lo[w, 0], true_hi[w, 0], maj_lo, maj_hi)
-        if not slots:
-            continue  # majority call is actually right even though some sites in the window differ
-        mean_support = np.asarray(raw_counts[row_idx[w], :num_parents]).astype(np.float64).mean(axis=0)
-        n_checked += 1
-        ok = all(mean_support[tf] > 1e-9 and mean_support[pf] / mean_support[tf] >= ibd_thresh
-                 for tf, pf in slots)
-        if ok:
-            credited[w] = err_w
-            n_credited_windows += 1
+
+    if candidates.size:
+        idx2d = np.stack([row_idx[w] for w in candidates], axis=0)              # [C,T]
+        mean_support_all = np.asarray(raw_counts[idx2d, :num_parents]).astype(np.float64).mean(axis=1)  # [C,K]
+
+        for i, w in enumerate(candidates):
+            err_w = (~correct[w]) & valid[w]
+            pairs, counts = np.unique(np.stack([pred_lo[w], pred_hi[w]], axis=1), axis=0, return_counts=True)
+            maj_lo, maj_hi = pairs[np.argmax(counts)]
+            slots = _window_error_slots(true_lo[w, 0], true_hi[w, 0], maj_lo, maj_hi)
+            if not slots:
+                continue  # majority call is actually right even though some sites in the window differ
+            mean_support = mean_support_all[i]
+            n_checked += 1
+            ok = all(mean_support[tf] > 1e-9 and mean_support[pf] / mean_support[tf] >= ibd_thresh
+                     for tf, pf in slots)
+            if ok:
+                credited[w] = err_w
+                n_credited_windows += 1
 
     adjusted_correct = ((pred_lo == true_lo) & (pred_hi == true_hi)) | credited
     ibd_adj_acc = float(adjusted_correct[valid].mean())
