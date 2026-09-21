@@ -1076,28 +1076,33 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
         lab2_out[w, r] = h2[w, t].astype(np.int8)
         refpos_out[w, r] = t
 
-        # count_out: per-cell read-support -- experiments/depth-confidence-fix/.
-        # Rows sharing one (window,site) are NOT all identical: different
-        # "kind" (on1/on2/insertion-derived) rows draw from match1/match2/
-        # lineage independently, so e.g. an on1-kind row and an on2-kind row
-        # at the SAME site can show genuinely different ternary vectors
-        # (verified against test_indel_chunk_tiny_exact's own fixture, which
-        # has exactly this: alternating [1,0]/[0,1] rows at one site). So
-        # the per-founder count must be a genuine per-site tally of how many
-        # of THIS SITE's rows (any kind) show MATCH for founder k -- not
-        # cnt[w,t] (the row count regardless of founder), which would
-        # overcount every founder that ANY row at the site happens to
-        # support. Group rows by (window,site) and sum the MATCH indicator,
-        # broadcasting the per-site-per-founder total back to every row at
-        # that site (real refmap-exported rows are themselves already
-        # small per-gameteSet-bin aggregates, not literally one row per
-        # single physical read, so this broadcast matches that structure).
+        # count_out: per-row read-support -- experiments/depth-confidence-fix/.
+        # SUPERSEDES an earlier per-founder-MATCH-tally-pooled-across-kinds
+        # design (git history): that design broadcast a site-wide count to
+        # EVERY row at a site regardless of the row's own pattern (so e.g.
+        # an on1-kind row and an on2-kind row at the same site, which CAN
+        # show genuinely different ternary vectors -- verified against
+        # test_indel_chunk_tiny_exact's fixture -- got the same count),
+        # and was always 0 for non-MATCH cells even when many reads agreed
+        # on a DIVERGED/deleted call. A full-scale retrain with that design
+        # broke real-data accuracy broadly (not just for the affected
+        # founder) -- see depth_confidence_fix_2026-09-18.md's "RESOLVED"
+        # section. This is the corrected design: group rows by (window,
+        # site, their own EXACT K-length ternary vector) and use each row's
+        # own group size as its count -- "how many reads showed this exact
+        # observed pattern here," which is always >0 (a row is always a
+        # member of its own group) and meaningful for DEL/DIVERGED patterns
+        # too, not just MATCH. The scalar is broadcast across all K columns
+        # of its own row (not other rows at the site) purely to keep the
+        # on-disk width/model wiring (K-wide, per-cell count_proj) unchanged
+        # -- semantically this is now a per-ROW quantity, not per-founder.
         # Deterministic from already-drawn tern_rows -- no new RNG draws.
         site_key = w.astype(np.int64) * R + t.astype(np.int64)
-        _, group_id = np.unique(site_key, return_inverse=True)
-        group_match = np.zeros((group_id.max() + 1, K), dtype=np.int64)
-        np.add.at(group_match, group_id, (tern_rows == TERN_MATCH).astype(np.int64))
-        count_rows = group_match[group_id]                    # [Rows,K]
+        group_key = np.concatenate([site_key[:, None], tern_rows.astype(np.int64)], axis=1)
+        _, group_id, group_sizes = np.unique(group_key, axis=0, return_inverse=True,
+                                              return_counts=True)
+        row_group_size = group_sizes[group_id]                # [Rows]
+        count_rows = np.repeat(row_group_size[:, None], K, axis=1)  # [Rows,K]
         count_out[w, r] = _encode_dist(count_rows, dist_scale)
 
     return (tern_out, dist_out, count_out, lab1_out, lab2_out, refpos_out, short,

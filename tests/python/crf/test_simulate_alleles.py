@@ -1088,18 +1088,35 @@ def test_simulate_v4_flags_end_to_end(subst_model, coverage_model):
 # implementation: per-cell true-founder read-support count separates
 # correct from incorrect real predictions sharply (4.40% error at 0
 # reads vs 0.36% at >10, at 2.0x) -- a real, previously-unused signal.
+#
+# GROUPED-COUNT design (branch indel-readcount-grouped-count): SUPERSEDES an
+# earlier per-founder-MATCH-tally-pooled-across-kinds design that broadcast
+# a site-wide count to every row at a site regardless of that row's own
+# pattern, and was always 0 for non-MATCH cells. A full-scale retrain with
+# that design broke real-data accuracy broadly (see
+# depth_confidence_fix_2026-09-18.md's "RESOLVED" section) -- not narrowly
+# tied to one founder, so the count semantics themselves were suspect, not
+# just an unlucky training run. This design groups rows by (window, site,
+# their own EXACT K-length ternary vector) and uses each row's own group
+# size as its count, broadcast across all K columns of ITS OWN row only --
+# "how many reads showed this exact observed pattern here," always >0 (a
+# row is always a member of its own group), and meaningful for DEL/
+# DIVERGED patterns too, not just MATCH.
 
 def test_indel_chunk_count_tiny_exact():
-    """Same fixture as test_indel_chunk_tiny_exact. Rows sharing one site
-    are NOT all identical (on1-kind vs on2-kind rows draw independently),
-    so count must be a genuine per-(site,founder) tally of how many rows
-    at that site show MATCH -- hand-derived and cross-checked against the
-    fixture's own known refpos/tern structure:
-      site0 (rows0,1): founder0 MATCH x1 (row0), founder1 MATCH x1 (row1)
-      site1 (rows2-5): founder0 MATCH x1 (row2), founder1 MATCH x3 (rows3-5,
-                        the 3000bp insertion stacking on founder1/lineage1)
-      site2 (row6):    founder0 deleted (not MATCH), founder1 MATCH x1
-      site3 (row7):    founder0 MATCH x1, founder1 diverged (not MATCH)
+    """Same fixture as test_indel_chunk_tiny_exact. Hand-derived from the
+    fixture's own known tern/refpos structure (expect_tern in
+    test_indel_chunk_tiny_exact, reproduced here for the grouping):
+      row0=[1,0] row1=[0,1]                 at site0 -- two distinct
+                                              patterns, each size 1
+      row2=[1,0] row3=[0,1] row4=[0,1] row5=[0,1]  at site1 -- [1,0] size 1
+                                              (row2), [0,1] size 3 (rows3-5,
+                                              the 3000bp insertion stacking
+                                              on founder1/lineage1)
+      row6=[-1,1]                           at site2 -- size 1
+      row7=[1,0]                            at site3 -- size 1
+    Cross-checked directly against _indel_chunk's own output before being
+    fixed as a test value.
     """
     n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
     T = 8
@@ -1109,19 +1126,18 @@ def test_indel_chunk_count_tiny_exact():
         gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
         anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
 
-    expect_raw = np.array([[1, 1], [1, 1], [1, 3], [1, 3], [1, 3], [1, 3],
-                            [0, 1], [1, 0]])
+    expect_raw = np.array([[1, 1], [1, 1], [1, 1], [3, 3], [3, 3], [3, 3],
+                            [1, 1], [1, 1]])
     expect_count = _encode_dist(expect_raw, DIST_LOG_SCALE)
     np.testing.assert_array_equal(count[0], expect_count)
 
 
-def test_indel_chunk_count_zero_where_deleted():
-    """Deletion status (dist_row) is site-uniform (the same for every row
-    sharing a site, unlike MATCH/DIVERGED which can differ by kind), so a
-    founder shown as DEL at a site is guaranteed count=0 there -- no row
-    at that site can show MATCH for it. (DIVERGED is NOT guaranteed 0:
-    a sibling row of a different kind at the same site can show MATCH,
-    and the broadcast aggregate reflects that.)"""
+def test_indel_chunk_count_always_positive():
+    """Every real (non-PAD) row is a member of its own (site, pattern)
+    group, so its count is always > 0 -- regardless of whether its own
+    ternary vector is all-MATCH, all-DEL, all-DIVERGED, or mixed. This is
+    the key semantic difference from the superseded design (which was
+    always 0 for DEL/DIVERGED cells)."""
     n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
     T = 8
     rng = np.random.default_rng(0)
@@ -1131,13 +1147,13 @@ def test_indel_chunk_count_zero_where_deleted():
         anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
     deleted = tern[0] == TERN_DEL
     assert deleted.any(), "fixture should have at least one deleted cell"
-    assert (count[0][deleted] == 0).all()
+    assert (count[0][deleted] > 0).all(), \
+        "grouped-count design: DEL cells get a real group-size count too"
 
 
 def test_indel_chunk_count_positive_where_matched():
-    """A row showing MATCH for founder k always contributes to that
-    site's own tally, so count there is guaranteed > 0 (>= _encode_dist(1))
-    -- self-contribution, regardless of any sibling rows."""
+    """A row showing MATCH for founder k is (like every row) a member of
+    its own group, so count there is guaranteed > 0."""
     n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
     T = 8
     rng = np.random.default_rng(0)
@@ -1151,10 +1167,10 @@ def test_indel_chunk_count_positive_where_matched():
 
 
 def test_indel_chunk_count_matches_naive_reference_fuzz():
-    """Vectorized per-site-per-founder MATCH tally vs a trivially-correct
+    """Vectorized group-by-(site,full-pattern) vs a trivially-correct
     per-row Python loop, on randomized fixtures -- catches aggregation
-    bugs (e.g. the cnt[w,t]-total-row-count design this replaced, which
-    over-counted founders that only SOME rows at a site actually support)."""
+    bugs (grouping by the wrong key, or leaking counts across rows that
+    share a site but not the same pattern)."""
     rng = np.random.default_rng(9)
     for trial in range(15):
         n, M, K, R = 2, 3, 3, int(rng.integers(4, 12))
@@ -1181,21 +1197,28 @@ def test_indel_chunk_count_matches_naive_reference_fuzz():
             tern_v = tern[wi][valid]
             count_v = count[wi][valid]
             for site in np.unique(sites):
-                rows_at_site = sites == site
-                naive = (tern_v[rows_at_site] == TERN_MATCH).sum(axis=0)  # [K]
+                rows_at_site = np.flatnonzero(sites == site)
+                patterns = tern_v[rows_at_site]
+                # naive per-row group size: count of OTHER rows at this site
+                # sharing this row's exact full ternary vector (self included)
+                naive = np.array([
+                    int((patterns == patterns[i]).all(axis=1).sum())
+                    for i in range(len(rows_at_site))
+                ])
                 expect = _encode_dist(naive, DIST_LOG_SCALE)
-                got = count_v[rows_at_site]
+                got = count_v[rows_at_site][:, 0]  # scalar broadcast across K
                 np.testing.assert_array_equal(
-                    got, np.tile(expect, (rows_at_site.sum(), 1)),
-                    err_msg=f"trial={trial} window={wi} site={site}")
+                    got, expect, err_msg=f"trial={trial} window={wi} site={site}")
+                # broadcast check: every column within a row is identical
+                for row in count_v[rows_at_site]:
+                    assert (row == row[0]).all()
 
 
 def test_simulate_emit_read_counts_widens_output_and_invariant_holds():
-    """End-to-end: --emit-read-counts widens 2K+2 -> 3K+2, and the two
-    guaranteed invariants hold genome-wide (count==0 at DEL -- deletion
-    is site-uniform; count>0 at MATCH -- self-contribution). DIVERGED has
-    no fixed invariant (a sibling row of a different kind at the same
-    site can show MATCH), so it's deliberately not asserted here."""
+    """End-to-end: --emit-read-counts widens 2K+2 -> 3K+2, and count is
+    always > 0 for every real (non-PAD) cell, including DEL/DIVERGED --
+    the grouped-count design's key invariant (every row is a member of at
+    least its own group)."""
     K, T = 8, 256
     out = simulate(
         np.random.default_rng(5), windows=3, sites=T, founders=K,
@@ -1206,8 +1229,10 @@ def test_simulate_emit_read_counts_widens_output_and_invariant_holds():
     assert out.shape == (3, T, 3 * K + 2)
     tern = out[:, :, :K]
     count = out[:, :, 2 * K + 2:3 * K + 2]
-    assert (count[tern == TERN_DEL] == 0).all()
-    assert (count[tern == TERN_MATCH] > 0).all()
+    real_cell = tern != TERN_PAD
+    assert (count[real_cell] > 0).all()
+    assert (count[tern == TERN_DEL] > 0).any(), \
+        "sanity: fixture should exercise at least one DEL cell with a real count"
 
 
 def test_simulate_emit_read_counts_off_by_default_is_2k2():
