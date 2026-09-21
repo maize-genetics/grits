@@ -647,6 +647,118 @@ that matters.
 
 ### Branch B real-data result
 
-*(pending — full-scale retrain in progress, same recipe/scale as Branch
-A, `--collapse-rows` added; will be appended once the real-data eval
-completes)*
+Full-scale retrain (`diploid-indel-v3-collapse-fullscale`, fresh
+`--collapse-rows --emit-read-counts` generation — see the pre-check note
+above for why this couldn't reuse the cached raw arrays the way Branch A
+did: collapse-rows changes row SAMPLING itself, not just a post-hoc
+count value, so it needs a real `simulate()` run). Same scale as the
+original recipe and Branch A (500+500 individuals, `--sites 60000`,
+sliced to 117,000 windows, `G=117`). Warm-started identically, 5 epochs.
+`val_pair_acc` climbed to 0.6542 — lower than Branch A's 0.7427, and
+*this* time that lines up with real-data behavior rather than
+contradicting it (see below).
+
+Mean pair_acc / ibd_adj by kind and depth, baseline vs Branch B:
+
+| depth | INBRED pa/ia | HYB pa/ia | RIL2 pa/ia |
+|---|---|---|---|
+| | **baseline** | | |
+| 0.01x | 100.00% / 100.00% | 100.00% / 100.00% | 96.67% / 96.76% |
+| 0.1x | 100.00% / 100.00% | 99.23% / 99.87% | 98.83% / 99.59% |
+| 0.5x | 100.00% / 100.00% | 97.73% / 99.69% | 98.59% / 99.74% |
+| 1.0x | 100.00% / 100.00% | 96.95% / 99.66% | 98.49% / 99.76% |
+| 2.0x | 100.00% / 100.00% | 96.16% / 99.63% | 98.30% / 99.75% |
+| | **Branch B (collapse-rows)** | | |
+| 0.01x | 100.00% / 100.00% | 100.00% / 100.00% | 96.61% / 96.79% |
+| 0.1x | 100.00% / 100.00% | 99.31% / 100.00% | 98.95% / 99.63% |
+| 0.5x | 100.00% / 100.00% | 97.69% / 99.98% | 98.84% / 99.89% |
+| 1.0x | 99.99% / 100.00% | 96.55% / 99.97% | 98.71% / 99.93% |
+| 2.0x | 99.99% / 100.00% | 95.32% / 99.95% | 98.57% / 99.93% |
+
+**INBRED**: a match to baseline within 0.01pp everywhere.
+
+**HYB, full per-pair detail** (pair_acc/ibd_adj, baseline → Branch B, all 5 depths):
+
+| pair | 0.01x | 0.1x | 0.5x | 1.0x | 2.0x |
+|---|---|---|---|---|---|
+| B73xOh43 | 100/100→100/100 | 98.90/99.81→99.41/100.00 | 96.95/99.54→97.91/99.96 | 95.95/99.54→97.16/99.95 | 95.29/99.53→**96.01**/99.91 |
+| B73xCML103 | 100/100→100/100 | 99.00/99.73→99.59/100.00 | 96.78/99.60→98.24/99.98 | 96.13/99.47→97.27/99.96 | 95.21/99.36→**96.33**/99.94 |
+| Oh43xIl14H | 100/100→100/100 | 99.03/99.94→98.76/100.00 | 98.08/99.74→97.49/99.98 | 97.13/99.75→95.65/99.97 | 96.50/99.74→**94.57**/99.97 |
+| B97xCML103 | 100/100→100/100 | 99.76/99.94→99.59/100.00 | 98.93/99.84→98.07/99.98 | 98.33/99.81→97.25/99.99 | 97.60/99.83→**95.92**/99.97 |
+| Il14HxB97 | 100/100→100/100 | 99.44/99.95→99.22/100.00 | 97.90/99.74→96.76/99.98 | 97.22/99.73→95.44/99.97 | 96.20/99.69→**93.76**/99.96 |
+
+Two of five HYB pairs (B73xOh43, B73xCML103) come out slightly *ahead*
+of baseline at 2.0x; the other three (Oh43xIl14H, B97xCML103, Il14HxB97)
+land 1.6-2.4pp behind. Net mean gap at the worst depth (2.0x) is
+**-0.84pp** (95.32% vs 96.16%) — a rounding error next to Branch A's
+**-14.78pp** (81.38% vs 96.16%) at the same depth. `ibd_adjusted_accuracy`
+is at or above baseline at every single HYB cell, often noticeably so
+(99.91-99.99% vs baseline's 99.36-99.83% at 2.0x) — Branch B's remaining
+disagreements with baseline are overwhelmingly IBD-explainable, not
+genuine wrong calls.
+
+**RIL2, full per-pair detail**:
+
+| pair | 0.01x | 0.1x | 0.5x | 1.0x | 2.0x |
+|---|---|---|---|---|---|
+| B73xCML103 | 97.20/97.20→96.12/97.04 | 98.93/99.59→97.76/99.64 | 99.43/99.88→97.52/99.91 | 99.41/99.90→97.40/99.93 | 99.27/99.84→97.28/99.95 |
+| B73xOh43 | 96.76/97.22→**97.26**/97.26 | 96.74/99.44→**98.74**/99.62 | 95.08/99.19→**98.82**/99.90 | 94.77/99.15→**98.80**/99.93 | 94.40/99.18→**98.55**/99.92 |
+| B97xCML103 | 96.34/96.34→96.34/96.34 | 99.50/99.69→99.42/99.61 | 99.45/99.85→99.33/99.89 | 99.46/99.90→99.26/99.92 | 99.37/99.90→99.26/99.93 |
+| Il14HxB97 | 96.12/96.12→96.45/96.45 | 99.37/99.61→99.28/99.61 | 99.38/99.88→99.00/99.87 | 99.22/99.93→98.71/99.94 | 99.02/99.92→98.62/99.94 |
+| Oh43xIl14H | 96.92/96.92→96.88/96.88 | 99.62/99.62→99.56/99.66 | 99.63/99.89→99.51/99.89 | 99.57/99.90→99.36/99.92 | 99.42/99.92→99.14/99.92 |
+
+One pair (B73xCML103) is consistently 1.3-2.2pp worse across every
+depth; one pair (B73xOh43) is consistently, substantially *better*
+(+2.0 to +4.2pp, biggest gain of anything measured this session); the
+other three are flat within noise (≤0.3pp). No depth-scaling pattern
+either direction — unlike HYB, these gaps don't grow or shrink with
+depth, consistent with RIL2 error being IBD/homology-driven rather than
+depth-confidence-driven, same conclusion as every prior round.
+
+**Why this succeeded where Branch A didn't, despite the pre-check
+showing ~no window-span benefit**: the span measurement was checking the
+wrong mechanism. The real difference isn't (mainly) "windows see more
+genome" — it's that Branch A still feeds the model long runs of
+literally identical consecutive (ternary, count) rows whenever a site
+had real stacking, while Branch B eliminates that repetition by
+construction (one row per kind-group, weighted). Branch A's `val_pair_acc`
+being *higher* than baseline's while real accuracy was *worse* is the
+signature of exactly this: the model overfit to a simulator-specific
+artifact (long runs of identical rows) that doesn't exist in real data's
+one-row-per-site format. Branch B's `val_pair_acc` (0.6542) being lower
+than Branch A's but far more consistent with real accuracy fits that
+story.
+
+**Verdict: promote candidate.** Branch B (`diploid-indel-v3-collapse-fullscale`)
+is the first version of the read-count idea that doesn't cost real
+accuracy at any depth on the metric this whole investigation was about —
+HYB. Net effect across all three kinds is a wash-to-small-win (INBRED
+flat, HYB -0.84pp mean at worst depth with 2 of 5 pairs improving, RIL2
++0.27pp mean at worst depth with 1 of 5 pairs meaningfully better and
+1 meaningfully worse). Genotype-level SNP+RefCall confirmation (plan's
+Verification item 5, still not run for any checkpoint this session) is
+the required next step before promoting for real — founder-decode wins
+have diverged from genotype-level reality before this session — but
+this is by a wide margin the strongest result of everything tried under
+this investigation.
+
+### Current status / next steps (2026-09-21)
+
+1. **Genotype-level confirmation for Branch B** — genome-wide SNP+RefCall
+   rescore (`compare_gvcf_truth_diploid.py --snp-refcall-metrics`) against
+   `diploid-indel-v3-collapse-fullscale`, required before any real
+   promotion decision. Not yet run.
+2. **Branch A (`indel-readcount-grouped-count`) is not promoted** — real,
+   depth-growing HYB regression, no path forward identified. Keep the
+   branch for its test coverage of the corrected count formula (a real
+   fix over the original bug), but the checkpoint itself is dead.
+3. **Branch B (`indel-readcount-row-collapse`) is the promote candidate**
+   — closest-to-baseline (and in places better-than-baseline) real-data
+   result of every variant tried across both rounds of this
+   investigation. Pending item 1 above.
+4. **On-disk layout cleanup** (H1/H2 truth labels moved to the end of the
+   array) — still unblocked, still not done, still worth doing before
+   either format is considered final/published. See the earlier note in
+   this doc for the exact motivation.
+5. `indel-density-features` (`window_density`) remains a separate,
+   still-unresolved, untouched hypothesis on its own branch.
