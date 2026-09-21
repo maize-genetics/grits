@@ -279,7 +279,21 @@ def compare_diploid(imputed_tsv: str, truth_h1: str, truth_h2: str,
         cursors1: Dict[str, "cgt.TruthCursor"] = {}
         cursors2: Dict[str, "cgt.TruthCursor"] = {}
 
+        # TruthCursor.resolve() is forward-only per contig -- it already
+        # silently assumes non-decreasing pos within a contig (whether or not
+        # main() skipped the external sort). One dict lookup/site turns a
+        # violation of that assumption into a loud, immediate failure instead
+        # of silent wrong "no truth info" results for the out-of-order tail.
+        _last_pos: Dict[str, int] = {}
+
         for chrom, pos, ref, alt, info, gt in cgt.iter_imputed_tsv(imputed_tsv):
+            last = _last_pos.get(chrom, -1)
+            if pos < last:
+                raise RuntimeError(
+                    f"imputed_tsv is not position-sorted within {chrom}: "
+                    f"saw {pos} after {last}. Comparator requires coordinate-"
+                    f"sorted input (see main()'s indexed-input sort skip).")
+            _last_pos[chrom] = pos
             counts["imputed_records"] += 1
             c1 = _get_cursor(chrom, contig_files_1, cursors1, cursor_cls)
             c2 = _get_cursor(chrom, contig_files_2, cursors2, cursor_cls)
@@ -315,9 +329,21 @@ def compare_diploid(imputed_tsv: str, truth_h1: str, truth_h2: str,
                 update_frequency_bins(t_alleles, i_alleles, ac, an, alt, counts,
                                        partial_credit, phase_sensitive)
 
+            # Hoisted out of the class_breakdown/snp_refcall_metrics blocks
+            # below: at whole-genome scale (~160M compared sites) these two
+            # pure functions of (t_alleles, i_alleles, ref, phase_sensitive)
+            # were each being recomputed 2-3x per site for IDENTICAL inputs
+            # (classify_alleles(t_alleles, ref) once for class_breakdown's
+            # `cls` and again for snp_refcall_metrics' `t_cls`;
+            # allele_multiset_score once for partial_credit_sum, again for
+            # class_partial_sum, again for snprc_partial_credit_sum) --
+            # confirmed via cProfile as the dominant real cost of this
+            # comparator (the per-site Python loop, not bcftools/sort).
+            # Values are identical either way since both functions are pure.
+            score = None
             if partial_credit:
-                counts["partial_credit_sum"] += allele_multiset_score(
-                    t_alleles, i_alleles, phase_sensitive)
+                score = allele_multiset_score(t_alleles, i_alleles, phase_sensitive)
+                counts["partial_credit_sum"] += score
 
             if event_metrics:
                 # Per-haplotype site correctness, derived the same way
@@ -357,25 +383,28 @@ def compare_diploid(imputed_tsv: str, truth_h1: str, truth_h2: str,
             else:
                 counts["gt_allele_mismatches"] += 1
 
+            t_cls = None
+            if class_breakdown or snp_refcall_metrics:
+                t_cls = cgt.classify_alleles(t_alleles, ref)
+
             if class_breakdown:
-                cls = cgt.classify_alleles(t_alleles, ref)
+                cls = t_cls
                 counts[f"class_total_{cls}"] = counts.get(f"class_total_{cls}", 0) + 1
                 if not is_match:
                     counts[f"class_mismatch_{cls}"] = counts.get(f"class_mismatch_{cls}", 0) + 1
                 if partial_credit:
                     counts[f"class_partial_sum_{cls}"] = counts.get(
-                        f"class_partial_sum_{cls}", 0.0) + allele_multiset_score(
-                        t_alleles, i_alleles, phase_sensitive)
+                        f"class_partial_sum_{cls}", 0.0) + score
 
             if snp_refcall_metrics:
-                t_cls = cgt.classify_alleles(t_alleles, ref)
                 i_cls = cgt.classify_alleles(i_alleles, ref)
                 counts[f"pairclass_{t_cls}_{i_cls}"] = counts.get(
                     f"pairclass_{t_cls}_{i_cls}", 0) + 1
                 if t_cls in SCORED_CLASSES and i_cls in SCORED_CLASSES:
                     counts["snprc_compared_sites"] += 1
-                    counts["snprc_partial_credit_sum"] += allele_multiset_score(
-                        t_alleles, i_alleles, phase_sensitive)
+                    counts["snprc_partial_credit_sum"] += (
+                        score if score is not None
+                        else allele_multiset_score(t_alleles, i_alleles, phase_sensitive))
                     counts["snprc_gt_allele_matches" if is_match
                            else "snprc_gt_allele_mismatches"] += 1
                     counts[f"snprc_class_total_{t_cls}"] = counts.get(
@@ -588,10 +617,27 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         raw = str(td / "imputed.raw.tsv")
-        sorted_tsv = str(td / "imputed.sorted.tsv")
         write_query_tsv(args.imputed_vcf, raw, args.sample, args.region)
-        sort_tsv(raw, sorted_tsv)
-        counts = compare_diploid(sorted_tsv, args.truth_gvcf_h1, args.truth_gvcf_h2,
+
+        # bcftools query streams records in the source VCF's own file order.
+        # A bgzipped VCF with a .tbi/.csi sidecar is REQUIRED to be coordinate-
+        # sorted (tabix/bcftools index refuse to index an unsorted file), so
+        # for every indexed input in this corpus the external re-sort below
+        # is pure redundant I/O over the full genome-wide TSV (measured at
+        # ~120s of a ~2000-2400s row here -- not the dominant cost, but real
+        # and free to skip). Fall back to the safe sort for any unindexed
+        # input (e.g. a plain text .vcf test fixture) where this guarantee
+        # doesn't hold. compare_diploid()'s own position-monotonicity guard
+        # (below) makes this self-verifying rather than a silent assumption.
+        indexed = (Path(args.imputed_vcf + ".tbi").exists()
+                   or Path(args.imputed_vcf + ".csi").exists())
+        if indexed:
+            imputed_tsv = raw
+        else:
+            imputed_tsv = str(td / "imputed.sorted.tsv")
+            sort_tsv(raw, imputed_tsv)
+
+        counts = compare_diploid(imputed_tsv, args.truth_gvcf_h1, args.truth_gvcf_h2,
                                   args.phase_sensitive, args.partial_credit,
                                   class_breakdown=args.class_breakdown,
                                   event_metrics=args.event_metrics,
