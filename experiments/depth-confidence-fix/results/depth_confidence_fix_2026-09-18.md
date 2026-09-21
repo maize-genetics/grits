@@ -550,3 +550,103 @@ read-count idea is revisited; not required to close out this round.
    effect, Phase 4) but breaks broadly at full scale. Not required to
    close out this investigation; only worth digging into if the
    read-count idea itself gets revisited.
+
+## Second attempt: two variants, branches `indel-readcount-grouped-count` / `indel-readcount-row-collapse`
+
+User request: retry the read-count idea, but literally "group the reads
+which have the same ternary structure at the same position, and use the
+total number of reads as the count" — not just annotate a per-founder
+tally, actually merge rows that already agree. Two interpretations, each
+genuinely different in scope/risk, so both were built on their own
+branch (either might get discarded):
+
+- **Branch A (`indel-readcount-grouped-count`)**: keep today's row
+  structure exactly as-is; fix the count VALUE. `_indel_chunk` now
+  groups rows by `(window, site, the row's own exact K-length ternary
+  vector)` and uses each row's own group size as its count — a per-ROW
+  quantity, always >0 (a row is always a member of its own group),
+  broadcast across its own K columns. This directly targets the flaw in
+  the old design: that one broadcast a SITE-wide per-founder MATCH tally
+  to every row at a site regardless of the row's own pattern, and was
+  always 0 for DEL/DIVERGED cells even when many reads agreed on that
+  call.
+- **Branch B (`indel-readcount-row-collapse`)**: go further and actually
+  collapse same-kind row stacks into one row BEFORE sampling, so windows
+  span more distinct reference sites for the same T-row budget instead
+  of burning slots on duplicate rows (colinear on1/on2 are already
+  boolean, never stacked; only insertion evidence genuinely stacks).
+  Requires restructuring `_row_counts`'s row-budget math
+  (`_sample_rows(groupcnt, T)` instead of `_sample_rows(cnt, T)`).
+
+Both implemented, tested (96/102 and 102/102 respectively, hand-derived
+exact fixtures + naive-reference fuzz tests), and merged so Branch B
+builds on Branch A's corrected formula rather than the known-bad one.
+
+**Pre-check finding on Branch B before committing full-scale compute**:
+measured the actual window-span benefit under the REAL production
+recipe's settings (`indel_model=overlay`, default
+`--indel-ins-read-per-bp 2e-3`) — negligible. Max reference site reached
+per window: 46382 (uncollapsed) vs 46391 (collapsed), a 0.02% difference.
+At these settings insertions are sparse enough (~300bp mean length ×
+0.2% reads/bp ≈ 0.6 expected reads per insertion) that there's rarely
+more than one row to collapse in the first place — the row-collapse
+mechanism is correctly implemented but has almost nothing to act on
+here. Flagged to the user before spending compute on full-scale
+generation; user chose to run it anyway for a real head-to-head number
+rather than rely on the proxy measurement.
+
+### Branch A real-data result
+
+Full-scale retrain (500+500 individuals, `--sites 60000`, matching the
+original recipe's exact scale — recovered by RECOMPUTING the count block
+directly on the already-cached full-scale raw arrays via their `.refpos.npy`
+sidecars, rather than regenerating from scratch: guarantees byte-identical
+composition/individuals/tern/dist to the original run, only the count
+values differ, the cleanest possible isolation of this one variable).
+Warm-started identically, 5 epochs. Training-time `val_pair_acc` climbed
+to **0.7427** — HIGHER than the original no-count baseline's own 0.6820.
+
+That did **not** translate to better real-data accuracy, and the gap
+between the two is itself the finding: `val_pair_acc` is measured on a
+held-out split of the SAME simulated single-coverage (`coverage=2.0`)
+training distribution the model was fit on, not real data at any depth.
+A model can genuinely fit that split better by leaning harder on the
+count feature's very clean within-simulator signal, while generalizing
+worse to real data's noisier count values — and real data spans 0.01x
+to 2.0x, most of it far from the one simulated regime ever trained on.
+
+Real 15-sample × 5-depth eval, baseline vs Branch A:
+
+| kind | metric | 0.01x | 0.1x | 0.5x | 1.0x | 2.0x |
+|---|---|---|---|---|---|---|
+| INBRED | baseline / groupedcount pair_acc | 100.00 / 100.00 | 100.00 / 100.00 | 100.00 / 100.00 | 100.00 / 100.00 | 100.00 / 100.00 |
+| HYB | baseline pair_acc | 100.00 | 99.23 | 97.73 | 96.95 | 96.16 |
+| HYB | **groupedcount pair_acc** | 100.00 | 99.20 | 95.03 | 89.80 | **81.38** |
+| HYB | baseline ibd_adj | 100.00 | 99.88 | 99.69 | 99.66 | 99.63 |
+| HYB | groupedcount ibd_adj | 100.00 | 99.92 | 99.36 | 98.49 | 97.00 |
+| RIL2 | baseline pair_acc | 96.67 | 98.83 | 98.59 | 98.49 | 98.30 |
+| RIL2 | groupedcount pair_acc | 96.33 | 98.50 | 98.09 | 97.98 | 98.23 |
+
+Per-sample detail confirms the HYB regression is **uniform across all 5
+pairs** (B73xOh43 76.66%, B73xCML103 75.33%, Oh43xIl14H 84.26%,
+B97xCML103 87.72%, Il14HxB97 82.93% at 2.0x) — not narrowly tied to one
+founder, same broad-not-founder-specific pattern as the original bug's
+regression, just far milder (28-51% there vs 75-88% here) and
+depth-scaling rather than uniformly catastrophic. INBRED is unaffected
+(100% at every depth). RIL2 is flat/neutral (±0.3pp), consistent with
+its error being IBD-driven rather than depth-confidence-driven —
+matches every prior round this session.
+
+**Verdict: the formula fix worked (no more catastrophic, broadly-broken
+collapse), but the count feature is still a net negative on real HYB
+data at moderate-to-high depth, growing worse with depth.** Not
+promoted. `diploid-indel-v3-groupedcount-fullscale` is a genuine
+improvement over `diploid-indel-v3-readcount-fullscale` (the original
+broken run) but still worse than the no-count baseline on the metric
+that matters.
+
+### Branch B real-data result
+
+*(pending — full-scale retrain in progress, same recipe/scale as Branch
+A, `--collapse-rows` added; will be appended once the real-data eval
+completes)*
