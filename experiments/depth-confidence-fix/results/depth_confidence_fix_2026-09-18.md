@@ -404,24 +404,92 @@ instability (independent of count), or a data-realization fluke specific
 to this run's `--seed 401`/`402`. **Not promoted. Do not use
 `diploid-indel-v3-readcount-fullscale` for anything.**
 
-### Next steps (not yet done)
+### B73 root-cause investigation (in progress)
 
-1. **Full-scale no-count control** — same scale/composition/warm-start,
-   count block stripped (`maize_v3_readcount_sliced_nocount.npy`'s
-   full-scale sibling doesn't exist yet) — directly tests whether the
-   B73-specific collapse is count-caused or a general full-scale-retrain
-   issue. The single highest-value next experiment.
-2. If the control also collapses on B73: this is unrelated to the count
-   feature, points at something about this retrain recipe at this scale
-   (or this specific data realization) more generally — investigate
-   independent of the read-count-feature hypothesis.
-3. If the control does NOT collapse on B73: isolates the problem to the
-   count feature specifically at full scale — worth checking whether
-   `count_proj`'s learned weights are unusually extreme/unstable, or
-   whether the simulator's count-derivation simplification (site-uniform
-   count magnitude, PLAN.md's documented simplification) interacts badly
-   with founder index 0's simulated-vs-real asymmetry specifically.
+Three targeted checks, run in parallel with a full-scale no-count control
+retrain (below):
+
+1. **Background-sharing statistics ruled out.** Checked founder 0's
+   (B73's slot) simulated statistics directly against all 24 other
+   founders in both sub-populations: background match rate z-score
+   -0.31 and -0.95 (well within 1 SD — nothing anomalous), true-match
+   rate and how often it was drawn as ground truth both squarely
+   mid-range. **Founder 0's simulated data is statistically
+   unremarkable** — rules out "founder 0 happened to land an outlier
+   profile in this seed's coalescent tree."
+
+2. **Prediction-pattern check.** For HYB B73xOh43 at 2.0x (true=(0,21)),
+   the model gets Oh43 (21) right in nearly every top prediction, but
+   the *other* slot scatters across many different wrong founders (1,
+   22, 14, 18, 21-homozygous, 15, 10 — no concentrated confusion with one
+   specific look-alike) — and **founder index 0 essentially never
+   appears** even among the wrong top-8 predictions (only 6.39%, exactly
+   the correct rate). Not "B73 confused with a specific other founder" —
+   closer to "index 0's emission score is suppressed almost everywhere."
+   For the non-B73 pair (Oh43xIl14H), errors are far more concentrated/
+   normal-looking (top wrong answer `(11,23)` at 11.79%, a plausible
+   near-neighbor).
+
+3. **`ext_bias` weight drift.** Directly diffed checkpoint state dicts.
+   `encoder.ext_bias.weight` — the layer converting the real per-founder
+   affinity signal (raw + mean-centered match rate) into an additive
+   emission bias — moved from `[0.296, 0.296]` (baseline) to `[0.776,
+   0.776]` (new), **~2.6x steeper**, while an unrelated layer
+   (`gate_head`) barely moved at all (max diff 0.013 vs `ext_bias`'s
+   0.48). `stay_bonus` also drifted (2.01→2.31, +15%; smaller, and this
+   session's earlier `stay_bonus` sweep already found accuracy flat
+   across 0-3, so unlikely to be the primary driver on its own).
+
+**Leading hypothesis, coherent with all three findings**: real B73's
+affinity profile (computed from actual reads — B73 is the literal
+reference genome) sits somewhere the simulator never produces for *any*
+of its 25 founders, since `--indel-ref-founder` was never set to give
+any one of them genuine reference-like treatment during generation. Feed
+that out-of-distribution input through a much steeper `ext_bias` mapping
+and the result could be an extreme, near emission-killing bias
+specifically for B73's slot, while the other 24 founders' real affinity
+profiles — which *do* resemble what the simulator produces — stay
+reasonably calibrated. This also explains why the original baseline
+(same underlying domain gap, milder `ext_bias`) doesn't show the
+problem. **Concrete fix candidate for a future round**: give at least
+one simulated founder actual reference-genome treatment
+(`--indel-ref-founder`) during generation, so training sees an example
+resembling B73's real statistical profile. Not yet tested.
+
+### Next steps
+
+1. **Full-scale no-count control** (running, slower than expected due to
+   shared-GPU contention from other users' jobs on this host — ~1.82
+   it/s vs the readcount run's ~3.6 it/s) — same scale/composition/
+   warm-start, count block stripped. Directly tests whether the
+   `ext_bias` drift / B73 collapse is count-caused or a general
+   full-scale-retrain issue. The single highest-value next check.
+2. If the control also shows `ext_bias` drift + B73 collapse: unrelated
+   to the count feature, points at something about full-scale retraining
+   (or this seed's data realization) more generally.
+3. If the control does NOT show it: isolates the problem to the count
+   feature specifically at full scale.
+4. Either way, the reference-founder-treatment fix candidate above is
+   worth testing once the count-vs-general question is resolved.
 4. **Genotype-level confirmation** — the plan's Verification item 5
    (genome-wide SNP+RefCall rescore) still not run for any of these
    checkpoints; remains required before any promotion decision regardless
    of how the above resolves.
+5. **On-disk layout cleanup (deferred, not urgent)** — the `2K+2`/`3K+2`
+   contract puts the H1/H2 truth-label columns in the *middle* of the
+   array (`[ternary(K) | H1 | H2 | distance(K) | count(K)]`), sandwiched
+   between feature blocks that are the actual model input. This is the
+   direct cause of the two open-ended-slice bugs already hit and fixed
+   this session (`out[sl,:,K+2:]`, `dist_out=out[:,:,K+2:]`) — every
+   consumer needs a `K+2:2K+2`-style offset to skip the labels, which is
+   easy to get wrong and gets more error-prone with each added feature
+   block. Moving labels to the end (`[ternary(K) | distance(K) | count(K)
+   | H1 | H2]`) would make every feature block a simple contiguous range
+   and remove this whole bug class — note the *original* simpler binary
+   format (`GRITSCRFDiploid`, `K+2` width) already does this
+   (`[binary(K)|H1|H2]`); only the ternary+distance format ended up with
+   labels in the middle. User-agreed: worth doing, but deferred until
+   after the current regression is resolved (would otherwise conflate two
+   changes and force regenerating all data built this session) — should
+   happen before this format is considered final/published, tracked here
+   so it isn't dropped.
