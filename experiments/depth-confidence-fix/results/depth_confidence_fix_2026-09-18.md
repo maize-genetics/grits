@@ -456,28 +456,80 @@ one simulated founder actual reference-genome treatment
 (`--indel-ref-founder`) during generation, so training sees an example
 resembling B73's real statistical profile. Not yet tested.
 
+### RESOLVED: count-feature-specific, not a general full-scale-retraining artifact
+
+Ran the decisive control: `diploid-indel-v3-scale-control-fullscale-nocount`
+(identical scale/composition/warm-start/step-count to the with-count
+full-scale run, count block stripped) finished training
+(`d-epoch=04-val_pair_acc=0.4144.ckpt`). Two checks resolve this
+cleanly:
+
+**1. `ext_bias`/`stay_bonus` drift is NOT the causal mechanism — the
+no-count control drifted *further*, not less:**
+
+| | `ext_bias.weight` | `stay_bonus` |
+|---|---|---|
+| baseline | `[0.296, 0.296]` | 2.009 |
+| with-count-fullscale (regressed) | `[0.776, 0.776]` (2.6x) | 2.309 (+15%) |
+| **no-count-control (clean)** | **`[0.919, 0.919]` (3.1x)** | **2.481 (+23.5%)** |
+
+If steeper `ext_bias` were what killed B73's emissions, the no-count
+control — which drifted *more* — should regress at least as badly.
+It doesn't (below). This falsifies the "leading hypothesis" from the
+previous section as the causal mechanism; the drift itself is a generic
+full-scale-retraining/warm-start effect, not what's breaking accuracy.
+
+**2. Real-data eval, all 3 checkpoints, B73-involving samples plus one
+non-B73 control pair (Oh43xIl14H) — the no-count control is completely
+clean everywhere, and the with-count regression is NOT actually
+B73-specific:**
+
+pair_acc, 0.01x → 2.0x:
+
+| sample | baseline | with-count-fullscale | no-count-control |
+|---|---|---|---|
+| IDX-INBRED B73 | 100 / 100 / 100 / 100 / 100 | 99.6 / 97.5 / 95.7 / 93.3 / **88.7** | 100 / 100 / 100 / 100 / 100.0 |
+| IDX-HYB B73xOh43 | 100 / 98.9 / 97.0 / 96.0 / 95.3 | 8.8 / 9.8 / 8.0 / 7.2 / **6.4** | 100 / 99.2 / 96.5 / 94.8 / 93.4 |
+| IDX-HYB B73xCML103 | 100 / 99.0 / 96.8 / 96.1 / 95.2 | 5.0 / 7.1 / 6.5 / 6.2 / **5.5** | 100 / 99.6 / 97.0 / 95.2 / 93.6 |
+| IDX-RIL2 B73xCML103 | 97.2 / 98.9 / 99.4 / 99.4 / 99.3 | 91.9 / 81.9 / 74.2 / 71.7 / **69.6** | 96.2 / 97.6 / 97.3 / 97.2 / 97.2 |
+| IDX-RIL2 B73xOh43 | 96.8 / 96.7 / 95.1 / 94.8 / 94.4 | 91.2 / 82.0 / 76.2 / 74.7 / **73.1** | 97.3 / 98.7 / 98.7 / 98.5 / 98.3 |
+| **IDX-HYB Oh43xIl14H (non-B73 control)** | 100 / 99.0 / 98.1 / 97.1 / 96.5 | 79.2 / 58.0 / 47.4 / 44.9 / **42.7** | 99.6 / 98.6 / 97.1 / 95.5 / 94.8 |
+
+Two things this resolves at once:
+
+- **The no-count control shows no regression anywhere** — every number
+  sits in baseline's normal range (a couple of cells are even slightly
+  better, e.g. RIL2 B73xOh43). Same scale, same data, same warm-start,
+  same step count as the failed run — only the count channel differs.
+  **The regression is caused by the count feature at full scale, full
+  stop.**
+- **The "B73-specific" framing from the previous section was wrong** —
+  Oh43xIl14H involves no B73 at all and still collapses under
+  with-count-fullscale (100%→42.7% by 2.0x, worse in relative terms than
+  several B73 pairs). B73 pairs are hit hardest, but this is a broader
+  full-scale count-training pathology, not narrowly about founder index 0.
+
+**Updated verdict: `diploid-indel-v3-readcount-fullscale` is confirmed
+broken by the count feature's interaction with full-scale training —
+not a seed fluke, not a general retraining artifact, not narrowly a B73
+problem. Definitively not promoted; do not use.** The validation-scale
+round's small positive signal (Phase 4) does not survive scaling up, and
+the mechanism (why count training breaks broadly at full scale but not
+at ~200 steps) remains unexplained — worth a follow-up only if the
+read-count idea is revisited; not required to close out this round.
+
 ### Next steps
 
-1. **Full-scale no-count control** (running, slower than expected due to
-   shared-GPU contention from other users' jobs on this host — ~1.82
-   it/s vs the readcount run's ~3.6 it/s) — same scale/composition/
-   warm-start, count block stripped. Directly tests whether the
-   `ext_bias` drift / B73 collapse is count-caused or a general
-   full-scale-retrain issue. The single highest-value next check.
-2. If the control also shows `ext_bias` drift + B73 collapse: unrelated
-   to the count feature, points at something about full-scale retraining
-   (or this seed's data realization) more generally.
-3. If the control does NOT show it: isolates the problem to the count
-   feature specifically at full scale.
-4. Either way, the reference-founder-treatment fix candidate above is
-   worth testing once the count-vs-general question is resolved.
-4. **Genotype-level confirmation** — the plan's Verification item 5
+1. **Genotype-level confirmation** — the plan's Verification item 5
    (genome-wide SNP+RefCall rescore) still not run for any of these
-   checkpoints; remains required before any promotion decision regardless
-   of how the above resolves.
-5. **On-disk layout cleanup (deferred, not urgent)** — the `2K+2`/`3K+2`
-   contract puts the H1/H2 truth-label columns in the *middle* of the
-   array (`[ternary(K) | H1 | H2 | distance(K) | count(K)]`), sandwiched
+   checkpoints. Now moot for `diploid-indel-v3-readcount-fullscale`
+   specifically (already definitively not-promoted above), but still
+   the right verification to run before ever promoting a future
+   read-count retrain, since founder-decode wins have diverged from
+   genotype-level reality before this session.
+2. **On-disk layout cleanup** — the `2K+2`/`3K+2` contract puts the
+   H1/H2 truth-label columns in the *middle* of the array
+   (`[ternary(K) | H1 | H2 | distance(K) | count(K)]`), sandwiched
    between feature blocks that are the actual model input. This is the
    direct cause of the two open-ended-slice bugs already hit and fixed
    this session (`out[sl,:,K+2:]`, `dist_out=out[:,:,K+2:]`) — every
@@ -488,8 +540,13 @@ resembling B73's real statistical profile. Not yet tested.
    and remove this whole bug class — note the *original* simpler binary
    format (`GRITSCRFDiploid`, `K+2` width) already does this
    (`[binary(K)|H1|H2]`); only the ternary+distance format ended up with
-   labels in the middle. User-agreed: worth doing, but deferred until
-   after the current regression is resolved (would otherwise conflate two
-   changes and force regenerating all data built this session) — should
-   happen before this format is considered final/published, tracked here
-   so it isn't dropped.
+   labels in the middle. User-agreed this is worth doing before the
+   format is considered final/published. Was explicitly deferred until
+   the regression investigation concluded (to avoid conflating two
+   changes); that investigation is now resolved above, so this is
+   unblocked whenever it's picked up — tracked here so it isn't dropped.
+3. **Count-training-breaks-at-full-scale mechanism** — unexplained why
+   the count feature trains cleanly at validation scale (small positive
+   effect, Phase 4) but breaks broadly at full scale. Not required to
+   close out this investigation; only worth digging into if the
+   read-count idea itself gets revisited.
