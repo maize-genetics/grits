@@ -762,3 +762,140 @@ this investigation.
    this doc for the exact motivation.
 5. `indel-density-features` (`window_density`) remains a separate,
    still-unresolved, untouched hypothesis on its own branch.
+
+### Bigger model (d_model 384, n_layers 8) — branch `indel-collapse-bigger-model`
+
+User request: does more model capacity improve further on Branch B's
+already-close-to-baseline result? Architecture-only experiment — same
+`--collapse-rows --emit-read-counts` training data Branch B used
+(`maize_v3_collapse_fullscale_sliced.npy`, 117,000 windows), no data or
+recipe change. `GRITSCRFDiploidIndel`/`IndelFounderPathEncoder` already
+expose `--d-model`/`--n-heads`/`--n-layers` as CLI flags — bumped
+`d_model=256→384, n_layers=6→8` (`n_heads=8` unchanged), giving
+**14,939,146 params vs Branch B's 5,070,346 (2.95x)**. Changing these
+reshapes nearly every weight in the network, so `--warm-start-ckpt`
+can't meaningfully transfer anything from the small model — trained from
+random init instead.
+
+**Convergence was not clean — extending training did not resolve it.**
+First 5 epochs (matching every other full-scale run's budget in this
+project) gave a noisy, non-monotonic trajectory, peaking at epoch 2 and
+never recovering:
+
+| epoch | val_pair_acc |
+|---|---|
+| 0 | 0.4862 |
+| 1 | 0.5393 |
+| 2 | **0.6377** (peak) |
+| 3 | 0.5817 |
+| 4 | 0.5890 |
+
+Per user instruction, since this hadn't clearly plateaued, extended
+training 5 more epochs warm-started from the run's own best checkpoint
+(epoch 2, weight-only load, `missing=[] unexpected=[]` — a clean full
+match since the architecture is unchanged) rather than the literal last
+epoch, since epoch 4 was already worse than epoch 2:
+
+| epoch (cont.) | val_pair_acc |
+|---|---|
+| 0 | 0.5786 |
+| 1 | 0.5858 |
+| 2 | 0.6180 |
+| 3 | 0.6086 |
+| 4 | 0.5970 |
+
+Across all 10 epochs total, the global best never moved past the
+from-scratch run's own epoch 2 (0.6377) — extending training found
+nothing better, it just kept oscillating in roughly the 0.58-0.64 band.
+The `spike-skip` mechanism's skipped-step count climbed steadily
+throughout both runs (6→6→11 in run 1; 18→27→28→30 in run 2) — real,
+worsening training instability at this architecture/LR-schedule
+combination, not mere noise around a converged optimum. Used the actual
+best checkpoint found (epoch 2 of the from-scratch run, val_pair_acc
+0.6377 — itself already lower than Branch B's own converged 0.6542) for
+the real-data eval below, since more training demonstrably didn't
+improve on it.
+
+**Real-data result: notably worse than Branch B, and again B73-driven.**
+Mean pair_acc / ibd_adj by kind and depth, baseline vs bigger model:
+
+| depth | INBRED pa/ia | HYB pa/ia | RIL2 pa/ia |
+|---|---|---|---|
+| | **baseline** | | |
+| 0.01x | 100.00% / 100.00% | 100.00% / 100.00% | 96.67% / 96.76% |
+| 0.1x | 100.00% / 100.00% | 99.23% / 99.87% | 98.83% / 99.59% |
+| 0.5x | 100.00% / 100.00% | 97.73% / 99.69% | 98.59% / 99.74% |
+| 1.0x | 100.00% / 100.00% | 96.95% / 99.66% | 98.49% / 99.76% |
+| 2.0x | 100.00% / 100.00% | 96.16% / 99.63% | 98.30% / 99.75% |
+| | **Bigger model (14.9M params)** | | |
+| 0.01x | 100.00% / 100.00% | 99.00% / 99.64% | 96.09% / 96.73% |
+| 0.1x | 100.00% / 100.00% | 94.75% / 97.57% | 95.64% / 97.30% |
+| 0.5x | 100.00% / 100.00% | 90.16% / 96.19% | 94.89% / 97.47% |
+| 1.0x | 100.00% / 100.00% | 88.72% / 95.83% | 94.50% / 97.54% |
+| 2.0x | 100.00% / 100.00% | 87.51% / 95.43% | 93.87% / 97.25% |
+
+Unlike Branch B, HYB regresses at EVERY depth including 0.01x (99.00%
+vs baseline's 100.00%), and the gap widens steadily with depth to
+**-8.65pp** at 2.0x (87.51% vs 96.16%) — an order of magnitude worse
+than Branch B's -0.84pp at the same depth. RIL2 similarly regresses at
+every depth beyond 0.01x, reaching -4.43pp at 2.0x.
+
+**Per-pair detail shows this is heavily B73-driven, again** (pair_acc,
+baseline → bigger model, at 2.0x):
+
+| pair | baseline | bigger model |
+|---|---|---|
+| HYB B73xOh43 | 95.29% | **74.52%** |
+| HYB B73xCML103 | 95.21% | **67.57%** |
+| HYB Oh43xIl14H | 96.50% | 98.40% |
+| HYB B97xCML103 | 97.60% | 98.66% |
+| HYB Il14HxB97 | 96.20% | 98.38% |
+| RIL2 B73xOh43 | 94.40% | **77.77%** |
+| RIL2 B73xCML103 | 99.27% | 95.13% |
+| RIL2 B97xCML103 | 99.37% | 99.09% |
+| RIL2 Il14HxB97 | 99.02% | 98.38% |
+| RIL2 Oh43xIl14H | 99.42% | 98.97% |
+
+Every non-B73 pair lands within ~1-2pp of baseline (some slightly
+above); every B73-involving pair drops substantially, HYB B73xOh43/
+B73xCML103 severely (67-75% at 2.0x) and RIL2 B73xOh43 severely as well
+(77.77%, worse than its own 0.01x value of 87.55% — degrading with
+depth same as the HYB pairs). This is a similar B73-specific SHAPE to
+the original broken read-count formula's regression from earlier in
+this investigation (though via a completely different mechanism here —
+model capacity/training instability, not a count-formula bug) — plausibly
+the same underlying domain gap (real B73's affinity profile, computed
+from actual reads since B73 is the literal reference genome, sits
+somewhere no simulated founder's profile ever represents, since
+`--indel-ref-founder` was never set during this corpus's generation)
+getting re-exposed whenever a model change perturbs the network's
+existing (apparently fragile) calibration for that one founder's slot.
+Not confirmed against that specific mechanism this round — noted as a
+plausible connection, not a demonstrated cause.
+
+**Verdict: not promoted.** More capacity did not help — it introduced
+real training instability that additional training didn't resolve, and
+the resulting model is meaningfully worse than Branch B on the metric
+that matters (HYB accuracy), with a B73-specific pattern reminiscent of
+(but mechanistically distinct from) the original bug this whole
+investigation started from. Branch B (5.07M params, d_model=256/
+n_layers=6) remains the best result found across every variant tried.
+If model capacity is revisited, the training instability (rising
+spike-skip counts, non-monotonic val_pair_acc) would need to be
+addressed first (e.g. longer warmup, lower LR, or other stabilization)
+before capacity itself could be fairly evaluated — this round couldn't
+separate "bigger doesn't help" from "bigger needs different training
+hyperparameters to reach a fair comparison."
+
+**Environment note for future runs on this host**: the shared pixi env
+at `.pixi/envs/default` intermittently resolves `libstdc++.so.6` to the
+OLD system copy (`/lib64/libstdc++.so.6`, missing `GLIBCXX_3.4.30`)
+instead of its own newer bundled one when `pytorch_lightning`/
+`torchmetrics`/`scipy.fft` import, causing a reproducible
+`ImportError: ... GLIBCXX_3.4.30 not found` — seen here on eval script
+invocations even though training's own launch (same python binary,
+same import order) didn't hit it. Fix: explicitly set
+`LD_LIBRARY_PATH=<pixi-env>/lib` before invoking python. Root cause not
+fully pinned down (training succeeding without the same fix suggests
+it's import-order/timing sensitive, not a hard misconfiguration), but
+the explicit `LD_LIBRARY_PATH` set is a reliable workaround.
