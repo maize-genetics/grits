@@ -954,7 +954,7 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
 def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   match1, match2, gamete_balance, coverage, ins_read_per_bp,
                   max_stack, anchor_thresh, ref_founder, dist_scale,
-                  coverage_model="linear", read_len=150):
+                  coverage_model="linear", read_len=150, collapse_rows=False):
     """Assemble one chunk's indel-mode output:
     `(tern, dist, count [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T]
     int32, short [n] bool, n_either int, n_hemi int, n_null int)`. `count`
@@ -967,6 +967,17 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
     indexed over the T-row OUTPUT -- a plain prefix of the R-site region's
     real rows, in reference order (PLAN.md's row-assembly note; see
     `_sample_rows`).
+
+    `collapse_rows` (branch indel-readcount-row-collapse, requires
+    `--emit-read-counts`/count computed): collapses each site's SAME-KIND
+    row stack (colinear on1/on2 are already boolean -- never stacked; only
+    insertion evidence c1/c2 genuinely stacks, up to `max_stack`) into ONE
+    row per kind-group before sampling, with that row's count set to the
+    real number of reads the stack represented. Windows then span more
+    distinct reference sites for the same T-row budget (closer to real
+    refmap-exported windows' one-row-per-site convention) instead of
+    burning T-slots on identical duplicate rows. Default False: rows are
+    sampled one-per-read exactly as before, byte-identical output.
 
     Ternary derivation mirrors `rb3_lift_ternary_state` exactly: `tern=1`
     if this row's read matched founder k (from `match1`/`match2`,
@@ -1040,7 +1051,31 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                                          gamete_balance, coverage,
                                          ins_read_per_bp, max_stack,
                                          coverage_model, read_len)
-    w, t, r, o, short = _sample_rows(cnt, T)
+    if collapse_rows:
+        # branch indel-readcount-row-collapse: collapse SAME-KIND row stacks
+        # at a site into ONE row before sampling, instead of after (the
+        # sibling indel-readcount-grouped-count design). Colinear reads
+        # (on1/on2) are already boolean -- at most 1 row each per site,
+        # never stacked -- so only insertion evidence (c1/c2, a real
+        # Binomial stack up to max_stack) ever produces duplicate rows, and
+        # every row within ONE stack shares the identical ternary vector by
+        # construction (match1/match2/lineage are drawn once per site, not
+        # per stacked copy -- see the count_out comment below). groupcnt
+        # clamps c1/c2 to their PRESENCE (0/1) so _sample_rows allocates one
+        # row slot per DISTINCT kind-group instead of one per individual
+        # stacked read -- windows span more distinct reference sites for
+        # the same T-row budget, closer to real (refmap-exported) windows'
+        # one-row-per-site convention, at the cost of no longer being able
+        # to represent more than 4 distinct patterns at one site (on1, on2,
+        # insertion-H1, insertion-H2) -- a documented simplification, see
+        # the plan doc for the cross-kind-coincidence case this doesn't
+        # merge (two DIFFERENT kinds landing on the same pattern by chance
+        # stay as separate rows, unlike the grouped-count sibling design).
+        groupcnt = (on1.astype(np.int32) + on2.astype(np.int32) +
+                    (c1 > 0).astype(np.int32) + (c2 > 0).astype(np.int32))
+        w, t, r, o, short = _sample_rows(groupcnt, T)
+    else:
+        w, t, r, o, short = _sample_rows(cnt, T)
 
     tern_out = np.full((n, T, K), TERN_PAD, dtype=np.int8)
     dist_out = np.full((n, T, K), DIST_PAD, dtype=np.int8)
@@ -1052,7 +1087,10 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
     if w.size:
         b1 = on1[w, t].astype(np.int64)
         b2 = b1 + on2[w, t].astype(np.int64)
-        b3 = b2 + c1[w, t].astype(np.int64)
+        if collapse_rows:
+            b3 = b2 + (c1[w, t] > 0).astype(np.int64)   # o ranges over GROUPS, not reads
+        else:
+            b3 = b2 + c1[w, t].astype(np.int64)
         kind = np.where(o < b1, 0, np.where(o < b2, 1, np.where(o < b3, 2, 3)))
 
         tern_rows = np.zeros((w.size, K), dtype=np.int8)
@@ -1087,22 +1125,35 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
         # on a DIVERGED/deleted call. A full-scale retrain with that design
         # broke real-data accuracy broadly (not just for the affected
         # founder) -- see depth_confidence_fix_2026-09-18.md's "RESOLVED"
-        # section. This is the corrected design: group rows by (window,
-        # site, their own EXACT K-length ternary vector) and use each row's
-        # own group size as its count -- "how many reads showed this exact
-        # observed pattern here," which is always >0 (a row is always a
-        # member of its own group) and meaningful for DEL/DIVERGED patterns
-        # too, not just MATCH. The scalar is broadcast across all K columns
-        # of its own row (not other rows at the site) purely to keep the
-        # on-disk width/model wiring (K-wide, per-cell count_proj) unchanged
-        # -- semantically this is now a per-ROW quantity, not per-founder.
-        # Deterministic from already-drawn tern_rows -- no new RNG draws.
-        site_key = w.astype(np.int64) * R + t.astype(np.int64)
-        group_key = np.concatenate([site_key[:, None], tern_rows.astype(np.int64)], axis=1)
-        _, group_id, group_sizes = np.unique(group_key, axis=0, return_inverse=True,
-                                              return_counts=True)
-        row_group_size = group_sizes[group_id]                # [Rows]
-        count_rows = np.repeat(row_group_size[:, None], K, axis=1)  # [Rows,K]
+        # section.
+        if collapse_rows:
+            # branch indel-readcount-row-collapse: the row IS the group (the
+            # collapse already happened upstream, when groupcnt/_sample_rows
+            # allocated one row slot per kind-group instead of one per read)
+            # -- so its weight is just how many real reads that kind's
+            # stack represented: 1 for on1/on2 (never stacked -- boolean
+            # presence), the real c1/c2 draw for insertion-derived rows.
+            weight = np.where(kind <= 1, 1,
+                               np.where(kind == 2, c1[w, t], c2[w, t])).astype(np.int64)
+            count_rows = np.repeat(weight[:, None], K, axis=1)          # [Rows,K]
+        else:
+            # Corrected design (indel-readcount-grouped-count): group rows
+            # by (window, site, their own EXACT K-length ternary vector)
+            # and use each row's own group size as its count -- "how many
+            # reads showed this exact observed pattern here," which is
+            # always >0 (a row is always a member of its own group) and
+            # meaningful for DEL/DIVERGED patterns too, not just MATCH. The
+            # scalar is broadcast across all K columns of its own row (not
+            # other rows at the site) purely to keep the on-disk width/
+            # model wiring (K-wide, per-cell count_proj) unchanged --
+            # semantically this is now a per-ROW quantity, not per-founder.
+            # Deterministic from already-drawn tern_rows -- no new RNG draws.
+            site_key = w.astype(np.int64) * R + t.astype(np.int64)
+            group_key = np.concatenate([site_key[:, None], tern_rows.astype(np.int64)], axis=1)
+            _, group_id, group_sizes = np.unique(group_key, axis=0, return_inverse=True,
+                                                  return_counts=True)
+            row_group_size = group_sizes[group_id]                      # [Rows]
+            count_rows = np.repeat(row_group_size[:, None], K, axis=1)  # [Rows,K]
         count_out[w, r] = _encode_dist(count_rows, dist_scale)
 
     return (tern_out, dist_out, count_out, lab1_out, lab2_out, refpos_out, short,
@@ -1130,7 +1181,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              indel_overlay_rate=2.3e-3, indel_overlay_mean_len=300.0,
              indel_overlay_founder_freq=1.0, subst_model="dense",
              subst_rate=0.018, coverage_model="linear", read_len=150,
-             emit_read_counts=False):
+             emit_read_counts=False, collapse_rows=False):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
     (default) behavior, including rng draw order, is byte-for-byte
@@ -1141,12 +1192,21 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
     (2K+2 columns: [ternary(K) | H1 | H2 | distance(K)]) instead of the
     binary K+2 (or K+3 with the eval-only recomb-rate column) layout.
     `emit_read_counts` (experiments/depth-confidence-fix/) widens this to
-    3K+2 by appending a 4th per-founder block: [ternary(K) | H1 | H2 |
-    distance(K) | count(K)], count = the site's total real read count
-    wherever that founder's ternary state is MATCH, else 0, log-coded via
-    the same `_encode_dist` scheme as distance (no new RNG draws). Off by
-    default (`ncol` stays 2K+2, byte-identical to before this param
-    existed).
+    3K+2 by appending a 4th block: [ternary(K) | H1 | H2 | distance(K) |
+    count(K)] -- count is a per-ROW quantity (broadcast across all K
+    columns of its own row), the size of the group of rows sharing this
+    row's own (site, exact K-length ternary vector), log-coded via the
+    same `_encode_dist` scheme as distance (no new RNG draws; see
+    `_indel_chunk`'s count_out comment for why this replaced an earlier,
+    broken per-founder-tally design). Off by default (`ncol` stays 2K+2,
+    byte-identical to before this param existed).
+
+    `collapse_rows` (branch indel-readcount-row-collapse, requires
+    `emit_read_counts=True`): instead of computing count via post-hoc
+    grouping, collapses each site's same-kind row stack into ONE row
+    BEFORE sampling -- see `_indel_chunk`'s docstring. Windows then span
+    more distinct reference sites per T-row budget. Off by default,
+    byte-identical to the emit_read_counts-only behavior above.
     Windows still have exactly `sites` OUTPUT rows (PLAN.md's row-
     assembly note: a window is "the next T real rows in reference
     order," not "rows covering a fixed reference-bp span" -- no padding
@@ -1187,6 +1247,11 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
     if emit_read_counts and not simulate_indels:
         raise ValueError("emit_read_counts requires simulate_indels=True "
                           "(the count block only exists in that mode)")
+    if collapse_rows and not emit_read_counts:
+        raise ValueError("collapse_rows requires emit_read_counts=True "
+                          "(collapsing rows without exposing the count that "
+                          "explains what got merged would silently discard "
+                          "depth information)")
     if indel_model not in ("tracts", "lineage", "overlay"):
         raise ValueError(f"indel_model must be one of tracts/lineage/overlay, "
                           f"got {indel_model!r}")
@@ -1338,7 +1403,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 rng, n, R, T, K, h1, h2, lineage_indel, del_lin, ins_lin,
                 match1, match2, gamete_balance, indel_coverage,
                 indel_ins_read_per_bp, indel_max_stack, indel_anchor_thresh,
-                indel_ref_founder, DIST_LOG_SCALE, coverage_model, read_len)
+                indel_ref_founder, DIST_LOG_SCALE, coverage_model, read_len,
+                collapse_rows)
 
             out[sl, :, :K] = tern
             out[sl, :, K] = lab1
@@ -1715,12 +1781,24 @@ def parse_args():
                         "founder in this panel (all K founders carry indels).")
     p.add_argument("--emit-read-counts", action="store_true",
                    help="--simulate-indels only: widen the output from 2K+2 to 3K+2 "
-                        "by appending a 4th per-founder block -- per-cell real "
-                        "read-support count (the site's total real read count "
-                        "wherever that founder's ternary state is MATCH, else 0), "
-                        "log-coded via _encode_dist. Deterministic from "
-                        "already-drawn cnt/tern -- no new RNG draws. Off by "
+                        "by appending a 4th block -- per-ROW real read-support count "
+                        "(the size of the group of rows sharing this row's own exact "
+                        "K-length ternary vector at its site, broadcast across all K "
+                        "columns), log-coded via _encode_dist. Deterministic from "
+                        "already-drawn tern -- no new RNG draws. Off by "
                         "default. See experiments/depth-confidence-fix/.")
+    p.add_argument("--collapse-rows", action="store_true",
+                   help="Requires --emit-read-counts. Instead of sampling one row per "
+                        "individual read then computing count via post-hoc grouping, "
+                        "collapses each site's same-kind row stack (only insertion "
+                        "evidence genuinely stacks -- colinear on1/on2 are already "
+                        "boolean, never stacked) into ONE row before sampling, with "
+                        "that row's count set to the real number of reads the stack "
+                        "represented. Windows then span more distinct reference sites "
+                        "for the same T-row budget instead of burning slots on "
+                        "duplicate rows. Off by default, byte-identical to "
+                        "--emit-read-counts alone. See "
+                        "experiments/depth-confidence-fix/.")
 
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -1959,6 +2037,7 @@ def main():
         subst_model=args.subst_model, subst_rate=args.subst_rate,
         coverage_model=args.indel_coverage_model, read_len=args.indel_read_len_bp,
         emit_read_counts=args.emit_read_counts,
+        collapse_rows=args.collapse_rows,
         indel_density=args.indel_density, indel_ins_frac=args.indel_ins_frac,
         indel_large_frac=args.indel_large_frac,
         indel_small_alpha=args.indel_small_alpha,

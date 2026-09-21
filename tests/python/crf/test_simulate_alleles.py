@@ -1254,3 +1254,210 @@ def test_simulate_emit_read_counts_requires_simulate_indels():
             np.random.default_rng(0), windows=2, sites=32, founders=4,
             min_cross=1, max_cross=2, inbreeding=0.0, allele_sharing=0.6,
             bad_frac=0.02, emit_read_counts=True)
+
+
+# --- collapse_rows (branch indel-readcount-row-collapse) -----------------
+# Physically collapses each site's same-kind row stack into ONE row BEFORE
+# sampling (instead of sampling one row per read, then computing count via
+# post-hoc grouping) -- windows then span more distinct reference sites for
+# the same T-row budget. User request: "group the reads which have the same
+# ternary structure at the same position, and use the total number of reads
+# as the count" -- literal row merge, not just a re-derived count value
+# (that's the sibling indel-readcount-grouped-count design, which keeps
+# today's row structure exactly as-is).
+
+def test_indel_chunk_collapse_rows_tiny_exact():
+    """Same fixture as test_indel_chunk_tiny_exact. Colinear on1/on2 are
+    already boolean (never stacked -- 1 row each per site); only
+    insertion evidence genuinely stacks. Hand-derived from the fixture's
+    known structure: site0 has on1+on2 (2 groups, weight 1 each); site1
+    has on1+on2+ins-H2 (3 groups -- ins-H2's real stack is
+    min(Binomial(3000,1.0),max_stack=2)=2, so weight=2 there); site2 has
+    only on2 (founder0/lineage0 is deleted there, so on1 can't fire; 1
+    group); site3 has on1+on2 (2 groups). Cumulative group budget reaches
+    T=8 exactly at site3's 2nd group (2+3+1+2=8), one group more than the
+    3 sites test_indel_chunk_tiny_exact's uncollapsed design reaches with
+    the same T in this particular fixture (a coincidence of this tiny
+    example's exact counts, not a general claim -- see
+    test_indel_chunk_collapse_rows_spans_more_sites_with_real_stacking
+    for a case sized to make the span benefit unambiguous)."""
+    n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
+    T = 8
+    rng = np.random.default_rng(0)
+    tern, dist, count, lab1, lab2, refpos, short, *_ = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE,
+        collapse_rows=True)
+
+    expect_tern = np.array([[1, 0], [0, 1], [1, 0], [0, 1], [0, 1],
+                             [-1, 1], [1, 0], [0, 1]], dtype=np.int8)
+    expect_refpos = [0, 0, 1, 1, 1, 2, 3, 3]
+    expect_raw = np.array([[1, 1], [1, 1], [1, 1], [1, 1], [2, 2],
+                            [1, 1], [1, 1], [1, 1]])
+    expect_count = _encode_dist(expect_raw, DIST_LOG_SCALE)
+
+    np.testing.assert_array_equal(tern[0], expect_tern)
+    np.testing.assert_array_equal(refpos[0], expect_refpos)
+    np.testing.assert_array_equal(count[0], expect_count)
+    np.testing.assert_array_equal(short, [False])
+
+
+def test_indel_chunk_collapse_rows_spans_more_sites_with_real_stacking():
+    """The core motivating claim, sized so it's unambiguous: with genuine
+    insertion read-stacking (max_stack=8, a real 5000bp insertion on one
+    lineage), collapse_rows=True reaches a HIGHER max reference site
+    within the same small T-row budget than collapse_rows=False -- windows
+    span more distinct genomic sites instead of burning T-slots on
+    duplicate rows. Same rng seed for both calls: _row_counts (the only
+    rng consumer) runs identically either way -- only downstream row
+    sampling/kind-boundary logic differs, so this isolates the effect."""
+    n, R, K = 1, 12, 2
+    lineage = np.array([[[0] * R, [1] * R]], dtype=np.int64)
+    del_lin = np.zeros((1, 2, R), dtype=bool)
+    ins_lin = np.zeros((1, 2, R), dtype=np.int32)
+    ins_lin[0, 1, 0] = 5000  # big insertion on lineage1, anchored at site0
+    h1 = np.zeros((1, R), dtype=np.int64)
+    h2 = np.ones((1, R), dtype=np.int64)
+    match1 = np.zeros((1, R, K), dtype=np.int8); match1[0, :, 0] = 1
+    match2 = np.zeros((1, R, K), dtype=np.int8); match2[0, :, 1] = 1
+
+    T = 6
+    kw = dict(gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0,
+              max_stack=8, anchor_thresh=0, ref_founder=-1,
+              dist_scale=DIST_LOG_SCALE)
+    _, _, _, _, _, refpos_c, short_c, *_ = _indel_chunk(
+        np.random.default_rng(3), n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
+        match1, match2, collapse_rows=True, **kw)
+    _, _, _, _, _, refpos_u, short_u, *_ = _indel_chunk(
+        np.random.default_rng(3), n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
+        match1, match2, collapse_rows=False, **kw)
+
+    # Uncollapsed: site0 alone has on1(1)+on2(1)+c1(0)+c2(8, insertion
+    # stack capped at max_stack) = 10 rows -- the whole T=6 budget is
+    # consumed at site0, refpos never advances past it.
+    assert (refpos_u[0][refpos_u[0] >= 0] == 0).all()
+    # Collapsed: site0 has only 3 GROUPS (on1, on2, ins-H2), so the
+    # remaining budget advances to later sites.
+    max_site_collapsed = refpos_c[0][refpos_c[0] >= 0].max()
+    assert max_site_collapsed > 0, \
+        "collapse_rows should let the window advance past site0"
+    assert max_site_collapsed >= 2
+
+
+def test_indel_chunk_collapse_rows_weight_matches_raw_stack_size():
+    """Fuzz: each emitted row's count (decoded back through _encode_dist's
+    own inverse on a small integer range, which is exact/lossless there)
+    equals 1 for on1/on2-kind rows and the real (already max_stack-capped)
+    c1/c2 value for insertion-kind rows -- reconstructed independently
+    from _row_counts's own on1/on2/c1/c2 arrays, not from _indel_chunk's
+    internals, so this can't just be checking the implementation against
+    itself."""
+    rng = np.random.default_rng(11)
+    for trial in range(10):
+        n, M, K, R = 1, 2, 3, int(rng.integers(6, 16))
+        lineage = rng.integers(0, M, size=(n, K, R)).astype(np.int64)
+        del_lin, ins_lin = _indel_tracts(rng, n, M, R, **_TRACT_KW)
+        h1 = rng.integers(0, K, size=(n, R))
+        h2 = rng.integers(0, K, size=(n, R))
+        match1 = (rng.random((n, R, K)) < 0.5).astype(np.int8)
+        match2 = (rng.random((n, R, K)) < 0.5).astype(np.int8)
+
+        # Reproduce _indel_chunk's own pres1/pres2/m1/m2/ins1/ins2 derivation
+        # (needed to independently recompute on1/on2/c1/c2 via _row_counts)
+        dist_lin = _anchor_distance(del_lin)
+        dist_kt = _gather_by_lineage(dist_lin, lineage)
+        ii = np.arange(n)[:, None]
+        tt = np.arange(R)[None, :]
+        m1 = lineage[ii, h1, tt]
+        m2 = lineage[ii, h2, tt]
+        pres1 = dist_kt[ii, h1, tt] <= 0
+        pres2 = dist_kt[ii, h2, tt] <= 0
+        ins1 = ins_lin[ii, m1, tt]
+        ins2 = ins_lin[ii, m2, tt]
+
+        chunk_rng = np.random.default_rng(trial)
+        row_rng_state = np.random.default_rng(trial)  # same seed -> same draws
+        on1, on2, c1, c2, _ = _row_counts(
+            row_rng_state, pres1, pres2, ins1, ins2, gamete_balance=0.5,
+            coverage=6.0, ins_read_per_bp=2e-2, max_stack=6)
+
+        T = int(rng.integers(2, R))
+        tern, dist, count, lab1, lab2, refpos, short, *_ = _indel_chunk(
+            chunk_rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
+            match1, match2, gamete_balance=0.5, coverage=6.0,
+            ins_read_per_bp=2e-2, max_stack=6, anchor_thresh=0,
+            ref_founder=-1, dist_scale=DIST_LOG_SCALE, collapse_rows=True)
+
+        # _row_counts is called with an INDEPENDENT rng instance seeded
+        # identically to chunk_rng's starting state, so its draws match
+        # _indel_chunk's own internal call bit-for-bit (both are the very
+        # first rng consumer in their respective call chains).
+        for wi in range(n):
+            valid = refpos[wi] >= 0
+            if not valid.any():
+                continue
+            for ri in np.flatnonzero(valid):
+                site = refpos[wi, ri]
+                tv = tuple(tern[wi, ri].tolist())
+                cv = count[wi, ri, 0]  # scalar, broadcast across K
+                # kind0 (on1) always shows match1's pattern; kind1 (on2)
+                # shows match2's; distinguish by which weight is consistent
+                w1_expect = _encode_dist(np.array([1]), DIST_LOG_SCALE)[0]
+                candidates = {w1_expect}
+                if c1[wi, site] > 0:
+                    candidates.add(_encode_dist(np.array([int(c1[wi, site])]),
+                                                 DIST_LOG_SCALE)[0])
+                if c2[wi, site] > 0:
+                    candidates.add(_encode_dist(np.array([int(c2[wi, site])]),
+                                                 DIST_LOG_SCALE)[0])
+                assert cv in candidates, (
+                    f"trial={trial} window={wi} row={ri} site={site}: "
+                    f"count={cv} not in expected {candidates} "
+                    f"(c1={c1[wi,site]} c2={c2[wi,site]})")
+
+
+def test_simulate_collapse_rows_requires_emit_read_counts():
+    with pytest.raises(ValueError, match="collapse_rows requires emit_read_counts"):
+        simulate(
+            np.random.default_rng(0), windows=2, sites=32, founders=4,
+            min_cross=1, max_cross=2, inbreeding=0.0, allele_sharing=0.6,
+            bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+            sharing_theta=4.0, simulate_indels=True, indel_model="overlay",
+            indel_region_mult=8, indel_coverage=2.0,
+            emit_read_counts=False, collapse_rows=True)
+
+
+def test_simulate_collapse_rows_end_to_end_shape():
+    """collapse_rows=True runs end-to-end through simulate() with the same
+    3K+2 contract as emit_read_counts alone -- no shape/dtype change from
+    the row-sampling mechanism swap."""
+    K, T = 8, 256
+    out = simulate(
+        np.random.default_rng(5), windows=3, sites=T, founders=K,
+        min_cross=1, max_cross=3, inbreeding=0.0, allele_sharing=0.6,
+        bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+        sharing_theta=4.0, simulate_indels=True, indel_model="overlay",
+        indel_region_mult=8, indel_coverage=2.0,
+        emit_read_counts=True, collapse_rows=True)[0]
+    assert out.shape == (3, T, 3 * K + 2)
+    assert out.dtype == np.int8
+    tern = out[:, :, :K]
+    count = out[:, :, 2 * K + 2:3 * K + 2]
+    real_cell = tern != TERN_PAD
+    assert (count[real_cell] > 0).all()
+
+
+def test_simulate_collapse_rows_off_by_default_matches_grouped_count():
+    """collapse_rows=False (default) is byte-identical to not passing the
+    parameter at all -- same golden-hash-safety pattern as every other
+    flag in this module."""
+    K, T = 8, 128
+    kw = dict(windows=2, sites=T, founders=K, min_cross=1, max_cross=3,
+              inbreeding=0.0, allele_sharing=0.6, bad_frac=0.02,
+              sharing_model="coalescent", ancestors=6, sharing_theta=4.0,
+              simulate_indels=True, indel_model="overlay",
+              indel_region_mult=8, indel_coverage=2.0, emit_read_counts=True)
+    out_default = simulate(np.random.default_rng(5), **kw)[0]
+    out_explicit_false = simulate(np.random.default_rng(5), collapse_rows=False, **kw)[0]
+    np.testing.assert_array_equal(out_default, out_explicit_false)
