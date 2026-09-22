@@ -762,3 +762,107 @@ this investigation.
    this doc for the exact motivation.
 5. `indel-density-features` (`window_density`) remains a separate,
    still-unresolved, untouched hypothesis on its own branch.
+
+## Region-buffering crossover-rate fix (branch `indel-region-buffer-fix`)
+
+Diagnosed separately from the held-out (OUT) investigation: `simulate_alleles.py`
+draws each training individual's crossover path uniformly across the full
+internal buffer `R = indel_region_mult * sites` (4 * 60,000 = 240,000 sites),
+but only the leading ~19.4% of that region ends up emitted as real training
+rows — ~80% of drawn crossovers land in the discarded tail and are never
+observed. Measured effect on Branch B's actual training data: nominal mean
+6.0 crossovers/individual (uniform draw over `--min/max-crossovers 2/10`)
+collapses to an observed mean of 1.16/individual, and only ~0.99% of T=512
+training windows contain any switch at all.
+
+### Phase 1 — sweep and pre-training verification
+
+`indel_region_mult` sweep (n=200, `inbreeding=1.0`, everything else at
+Branch B's exact recipe), measuring `short%` (must stay ~0%) and realized
+crossovers/individual:
+
+| `indel_region_mult` | short% | crossovers/individual |
+|---|---|---|
+| 1 | 0.500% (unsafe) | 4.355 |
+| **2** | **0.000%** | **2.410** |
+| 3 | 0.000% | 1.535 |
+| 4 (current) | 0.000% | 1.280 |
+
+`indel_region_mult=2` is the smallest safe value — confirmed again at full
+production scale (n=500 each sub-population): short%=0.000% (0/500) for
+both `inb1.0` and `inb0.0`. That alone only recovers ~2.3/individual
+(survival fraction ~38%, up from ~19%), still short of the intended 6.0, so
+`--min-crossovers`/`--max-crossovers` were also calibrated upward using the
+measured survival fraction: `8`/`23` (nominal mean 15.5) → verified at
+n=500 to land at 6.10-6.18/individual, matching the target almost exactly.
+
+Final settings (`indel_region_mult=2`, `--min-crossovers 8 --max-crossovers 23`),
+verified at full production scale before committing to training:
+
+| | short% | crossovers/individual | het_frac | switches/T512-window |
+|---|---|---|---|---|
+| inb1.0 (INBRED) | 0.000% (0/500) | 6.096 | 0.0000 | mean 0.05195 (94.94% zero, 4.92% one, 0.14% two+) |
+| inb0.0 (HYB) | 0.000% (0/500) | 5.870 | 0.9572 | mean 0.05003 (95.13% zero, 4.73% one, 0.13% two+) |
+
+Sanity-checked against real structure: the fixed rate (~0.05/window) is
+~3.8x higher than IDX-RIL2's own real rate (~0.013/window, from 28 true
+crossovers genome-wide) but still ~60-80x short of baseline's OUT-implied
+requirement (~3-4/window) — expected, this fix was never meant to close
+that gap, only recover the recipe's own intended in-panel calibration.
+
+### Phase 2 — full retrain and real-data result
+
+Full-scale regenerate (500+500 individuals) with the validated settings,
+sliced to `(117000, 512, 77)` (`G=117`, matching Branch B exactly), warm-started
+from the ORIGINAL baseline checkpoint (not Branch B's), 5 epochs.
+`val_pair_acc` trajectory: epoch1=0.3699, epoch2=0.4104, epoch4=0.4190 —
+clearly flattening (epoch0→2 gained +0.0426, epoch2→4 gained only +0.0086),
+not the non-monotonic instability pattern seen in the bigger-model variants.
+Note this val set itself now has the recovered high crossover rate too, so
+the lower absolute number vs Branch B's 0.6542 reflects a harder validation
+task, not worse learning — not directly comparable across the two runs.
+
+Real 15-sample × 5-depth eval, baseline vs Branch B vs regionfix-fullscale:
+
+| kind | metric | 0.01x | 0.1x | 0.5x | 1.0x | 2.0x |
+|---|---|---|---|---|---|---|
+| INBRED | baseline / branchB / regionfix pair_acc | 100.00 / 100.00 / **100.00** | 100.00 / 100.00 / **99.95** | 100.00 / 99.996 / **99.85** | 100.00 / 99.994 / **99.70** | 100.00 / 99.993 / **99.32** |
+| HYB | baseline pair_acc | 100.00 | 99.23 | 97.73 | 96.95 | 96.16 |
+| HYB | branchB pair_acc | 100.00 | 99.31 | 97.69 | 96.56 | 95.32 |
+| HYB | **regionfix pair_acc** | **96.37** | **90.16** | **85.76** | **83.93** | **81.75** |
+| HYB | branchB ibd_adj | 100.00 | 100.00 | 99.98 | 99.97 | 99.95 |
+| HYB | **regionfix ibd_adj** | 99.09 | 97.36 | 96.19 | 95.43 | 94.30 |
+| RIL2 | baseline pair_acc | 96.67 | 98.83 | 98.59 | 98.49 | 98.30 |
+| RIL2 | branchB pair_acc | 96.61 | 98.95 | 98.84 | 98.71 | 98.57 |
+| RIL2 | regionfix pair_acc | 98.42 | 98.99 | 98.57 | 98.15 | 97.14 |
+
+**HYB regresses substantially and uniformly across all 5 pairs** (checked
+individually, not just the mean — B73xOh43 71.59%, B73xCML103 69.20%,
+Oh43xIl14H 88.57%, B97xCML103 91.59%, Il14HxB97 87.82% at 2.0x, every one
+of them well below both baseline and Branch B at every depth). INBRED shows
+a smaller but real, depth-growing regression (99.32% at 2.0x vs ~100%
+before). RIL2 is a mixed wash (slightly better at 0.01x, slightly worse at
+1.0x/2.0x).
+
+**Why, mechanistically**: real IDX-INBRED and IDX-HYB individuals in this
+corpus are literal pure lines / F1 hybrids — **zero true recombination
+within the individual** (H1 is 100% one parent, H2 is 100% the other, or
+both 100% one parent for inbred). Only IDX-RIL2 has any real recombination
+at all. Recovering the recipe's "intended" ~6 crossovers/individual made
+training *more* mismatched with what most real in-panel samples actually
+need (near-zero), not less — the old suppressed ~1.16/individual rate,
+while an unintended side effect of the buffering bug, happened to sit
+closer to what real IDX-INBRED/IDX-HYB data needs than the recipe's own
+nominal target does. RIL2 (which does have real, nonzero recombination)
+is the one case that doesn't regress, consistent with this explanation.
+
+**Verdict: not promoted.** This is a real, clean, well-evidenced negative
+result, not a neutral fix. The region-buffering waste is still a genuine
+inefficiency in what the CLI flags nominally intend, but "fixing" it by
+recovering the nominal rate actively hurts real HYB/INBRED accuracy more
+than it helps anything else measured. Branch B remains the better
+checkpoint. If revisited, the right lever is probably tuning
+`--min/max-crossovers` down from their current nominal 2-10 default
+(closer to what real zero-recombination IDX-INBRED/HYB data actually
+needs) rather than up — a different, untested direction from what this
+round tried.
