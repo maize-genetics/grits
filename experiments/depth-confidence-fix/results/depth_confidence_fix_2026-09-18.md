@@ -899,3 +899,81 @@ same import order) didn't hit it. Fix: explicitly set
 fully pinned down (training succeeding without the same fix suggests
 it's import-order/timing sensitive, not a hard misconfiguration), but
 the explicit `LD_LIBRARY_PATH` set is a reliable workaround.
+
+### Bigger model + more data (d_model 384, n_layers 8, 234k windows) — branch `indel-collapse-bigmodel-moredata`
+
+Follow-up to the section above: same bigger architecture (d_model=384,
+n_heads=8, n_layers=8, 14,939,146 params) but trained on 2x the data —
+234,000 windows (1000+1000 individuals) instead of 117,000, reusing a
+sibling "more training data" experiment's raw generation
+(`maize_v3_collapse_moredata_mixed.npy`), sliced fresh for this run.
+Hypothesis: the bigger model's training instability (non-monotonic
+`val_pair_acc`, climbing gradient-skip counts) was a capacity/data-ratio
+mismatch that more data would fix.
+
+**Training was hit by two environmental crashes**, both `RuntimeError:
+DataLoader worker ... killed by signal: Terminated` — traced to a
+concurrent, unrelated sibling job's `ropebwt3` process getting OOM-killed
+by the kernel (`dmesg`: `total-vm:335176692kB anon-rss:318560596kB`),
+which collaterally took down this run's DataLoader workers as collateral
+damage of the same OOM sweep — not a bug in this recipe. Recovered both
+times via `--resume` from the last good checkpoint (full trainer state,
+not a fresh warm-start) rather than losing progress. Final epoch-by-epoch
+`val_pair_acc`: **0.6028 (epoch0) → [epoch1 lost to the first crash] →
+0.6519 (epoch2) → 0.6677 (epoch3, best) → 0.636 (epoch4)**.
+
+**Answer to the hypothesis: partial, not a fix.** Unlike the bigmodel-only
+run (peaked epoch2 then dropped for epochs 3-4), this run climbs
+monotonically through epoch 3 — genuinely healthier early training. But
+it still drops at the final epoch (0.6677→0.636), and its OWN peak
+(0.6677) is higher than the bigmodel-only run's peak (0.6377) despite
+performing *worse* on real data (below) — the same val-accuracy-vs-real-
+accuracy divergence this investigation already found with Branch A. More
+data delayed and dampened the instability; it did not eliminate it.
+
+Real 15-sample × 5-depth eval (best checkpoint, epoch 3, `val_pair_acc=0.6677`):
+
+| kind | metric | 0.01x | 0.1x | 0.5x | 1.0x | 2.0x |
+|---|---|---|---|---|---|---|
+| INBRED | baseline / this pair_acc | 100.00 / 100.00 | 100.00 / 100.00 | 100.00 / 99.997 | 100.00 / 100.00 | 100.00 / 99.988 |
+| HYB | baseline pair_acc | 100.00 | 99.23 | 97.73 | 96.95 | 96.16 |
+| HYB | **this run pair_acc** | 94.19 | 85.55 | 78.90 | 75.84 | **72.84** |
+| HYB | baseline ibd_adj | 100.00 | 99.87 | 99.69 | 99.66 | 99.63 |
+| HYB | this run ibd_adj | 99.73 | 99.01 | 98.85 | 98.69 | 98.65 |
+| RIL2 | baseline pair_acc | 96.67 | 98.83 | 98.59 | 98.49 | 98.30 |
+| RIL2 | this run pair_acc | 97.55 | 97.04 | 95.90 | 95.41 | 94.56 |
+
+**Worse than the bigmodel-only run on real data** (HYB 2.0x: 72.84% here
+vs 87.51% there, a -23.3pp gap vs baseline vs bigmodel-only's -8.65pp) —
+despite a higher peak `val_pair_acc`. More data made the SIMULATED
+validation metric look better while making REAL generalization worse.
+
+**Even more severely B73-specific than the bigmodel-only run.** Per-pair
+HYB detail at 2.0x: B73xOh43 **44.37%**, B73xCML103 **37.88%** — both
+catastrophic — vs Oh43xIl14H 93.74%, B97xCML103 95.05%, Il14HxB97 93.18%,
+all close to baseline. RIL2 shows the identical shape: B73xOh43 82.32%
+and B73xCML103 92.51% regressed, the three non-B73 RIL2 pairs at 99%+.
+This is now the **third** distinct mechanism this investigation has
+produced a B73-specific collapse from — the original broken count-tally
+formula, bigger capacity alone, and bigger capacity + more data. Three
+different root causes converging on the same symptom (B73, founder index
+0, the literal reference genome) is a real pattern worth flagging even
+though none of the three mechanisms are confirmed to share a root cause —
+worth investigating directly if this model family gets revisited (start
+from the reference-founder-treatment idea noted earlier in this doc:
+no simulated founder ever gets genuine `--indel-ref-founder` treatment
+during generation, so real B73's affinity profile may sit somewhere the
+simulator never produces for any founder, and larger/more-trained models
+may be extrapolating into that gap more aggressively).
+
+**Verdict: not promoted.** More data does not rescue the bigger
+architecture — if anything the real-data result is worse than capacity
+alone, while training-time metrics alone would have suggested the
+opposite. Branch B (5.07M params, 117k windows) remains the best result
+across every variant tried this session, now confirmed across four
+capacity/data combinations (baseline size × normal data = Branch B;
+baseline size × 2x data = the sibling "more data" experiment, pending;
+3x size × normal data = bigmodel-only; 3x size × 2x data = this run).
+
+Committed: `experiments/depth-confidence-fix/scripts/eval_collapse_bigmodel_moredata.py`,
+this section of the results doc, on branch `indel-collapse-bigmodel-moredata`.
