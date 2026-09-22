@@ -742,20 +742,110 @@ have diverged from genotype-level reality before this session — but
 this is by a wide margin the strongest result of everything tried under
 this investigation.
 
-### Current status / next steps (2026-09-21)
+## Genotype-level SNP+RefCall confirmation (IDX/OUT/MIX, 0.1x)
 
-1. **Genotype-level confirmation for Branch B** — genome-wide SNP+RefCall
-   rescore (`compare_gvcf_truth_diploid.py --snp-refcall-metrics`) against
-   `diploid-indel-v3-collapse-fullscale`, required before any real
-   promotion decision. Not yet run.
+2026-09-22. Verification item 5, run to completion: genome-wide
+`compare_gvcf_truth_diploid.py --snp-refcall-metrics --partial-credit
+--class-breakdown` for `diploid-indel-v3-collapse-fullscale` (Branch B)
+across all 8 dataset classes in the simulated-validation corpus
+(IDX/OUT/MIX x INBRED/HYB/RIL2, 5 individuals/pairs each, 0.1x only —
+matches this project's established SNP+RefCall scoring-cost precedent),
+40 rows total. New driver: `simval_eval_indel.py`, reusing every
+model-agnostic piece of `simval_eval_one.py`/`heldout_assembly_eval.py`
+(refmap alignment, BED-write, bed-to-vcf, bgzip+tabix,
+`compare_gvcf_truth_diploid.py`) and swapping in
+`GRITSCRFDiploidIndel`/`infer_real_founder_pairs` (K25, no drop) for
+inference — the alignment step itself uses refmap's `--anchor-dist-npy`
+export (the `lift-ridx-ternary-dist-map` branch binary, not the plain
+`--npy` export `nam_baseline.py`'s own `BIN` points at), matching the one
+verified-working real-data command from
+`experiments/simulator-indels/results/real_anchor_dist_npy_oh43xil14h.md`.
+Sanity check before trusting any row: IDX-INBRED B73 0.1x came back
+`error_rate=0.0` exactly, matching the established in-panel-inbred
+pattern — pipeline confirmed correct before scaling up.
+
+Baseline (`diploid-affinity-sim512-h3`, the old non-indel model) INBRED/HYB
+numbers are reused from the pre-existing `results/simval_results.tsv`
+cache (not recomputed here); baseline RIL2 numbers (new this session —
+OUT-RIL2/MIX-RIL2 didn't exist before) were freshly run via the
+unmodified `simval_eval_one.py --kind ril2` in this same pass. Both use
+the same comparator script; baseline runs did not request
+`--snp-refcall-metrics`, so only Branch B has an snprc column below.
+
+| class | n | baseline error % (site) | Branch B error % (site) | Branch B error % (snprc) |
+|---|---|---|---|---|
+| IDX-INBRED | 5 | 0.000 | 0.000 | 0.000 |
+| IDX-HYB | 5 | 7.237 | **0.234** | 0.149 |
+| IDX-RIL2 | 5 | 0.064 | 0.199 | 0.058 |
+| OUT-INBRED | 5 | 15.074 | **26.776** | 11.809 |
+| OUT-HYB | 5 | 41.039 | **47.420** | 24.226 |
+| OUT-RIL2 | 5 | 14.090 | **29.537** | 12.984 |
+| MIX-HYB | 5 | 29.520 | **46.653** | 24.844 |
+| MIX-RIL2 | 5 | 7.095 | **13.412** | 5.041 |
+
+(bold = >2pp worse than baseline at the site level; all mean-of-5 per
+class; per-row JSON in `results/simval_indel_sweep/`, driver script
+`experiments/simval-corpus/scripts/run_indel_snprc_sweep.py`.)
+
+**Verdict: the founder-decode win does NOT hold up at the genotype
+level for held-out-involving classes — exactly the failure mode this
+check exists to catch.** The picture splits cleanly by whether B73 (or
+any in-panel founder) is genuinely absent from the pair:
+
+- **IDX (both founders in-panel):** Branch B is a clear win. IDX-HYB
+  goes from 7.24% to 0.23% (site) / 0.15% (snprc) — a ~30x reduction,
+  consistent with the founder-pair-accuracy gains this whole investigation
+  was chasing. IDX-INBRED is flat at 0%. IDX-RIL2 is close either way
+  (0.06% vs 0.20% site, 0.06% snprc) — noise-level at these absolute
+  magnitudes, not a real regression.
+- **OUT/MIX (one or both founders held out):** Branch B is worse than
+  baseline at the site level in all 5 classes, by 6-17 percentage
+  points (OUT-INBRED +11.7pp, OUT-HYB +6.4pp, OUT-RIL2 +15.4pp, MIX-HYB
+  +17.1pp, MIX-RIL2 +6.3pp). Restricting to SNP+RefCall sites only
+  (Branch B's own snprc column) roughly halves the raw number in every
+  class, but there's no baseline snprc number to compare against for
+  a true apples-to-apples read on whether the SAME restriction would
+  similarly halve baseline's error — so the honest comparison is the
+  site-level one, where Branch B is unambiguously worse everywhere a
+  held-out founder is involved.
+
+**Interpretation:** Branch B's read-count fix and its founder-affinity/
+homo_scale machinery were built and validated almost entirely against
+in-panel real data (every prior real-data check this session, and the
+IDX-only baseline precedent before it). It generalizes very well to
+IDX and is a genuine, large win there. It does not generalize to
+held-out founders — if anything it's a regression relative to the
+older non-indel model on that axis. **Do not promote Branch B as a
+blanket replacement for the old checkpoint without addressing OUT/MIX
+first** — for in-panel-only use cases (IDX) it's a clear promote; for
+any pipeline that must handle held-out or partially-held-out samples,
+the old checkpoint currently generalizes better despite being the
+technically inferior (non-indel-aware) model on its home turf.
+
+### Current status / next steps (2026-09-22)
+
+1. **Genotype-level confirmation for Branch B — DONE (2026-09-22, see
+   section above).** In-panel (IDX) confirms the founder-decode win
+   (IDX-HYB 7.24%→0.23%). Held-out-involving classes (OUT/MIX) show a
+   real, substantial regression (+6 to +17pp site-level error) that
+   founder-pair accuracy alone never surfaced. Next: understand why
+   Branch B doesn't generalize to held-out founders before considering
+   it a blanket promotion — candidate hypotheses (not yet investigated):
+   the read-count feature or homo_scale-from-affinity estimator may be
+   overfit to in-panel read-support patterns that don't transfer to a
+   held-out founder's necessarily-different (lower, noisier) support
+   signature.
 2. **Branch A (`indel-readcount-grouped-count`) is not promoted** — real,
    depth-growing HYB regression, no path forward identified. Keep the
    branch for its test coverage of the corrected count formula (a real
    fix over the original bug), but the checkpoint itself is dead.
-3. **Branch B (`indel-readcount-row-collapse`) is the promote candidate**
-   — closest-to-baseline (and in places better-than-baseline) real-data
+3. **Branch B (`indel-readcount-row-collapse`) is a promote candidate
+   for IDX (in-panel) only, not a blanket replacement** — closest-to-
+   baseline (and in most in-panel cases better-than-baseline) real-data
    result of every variant tried across both rounds of this
-   investigation. Pending item 1 above.
+   investigation, confirmed at the genotype level for IDX (item 1). The
+   OUT/MIX regression found in item 1 blocks promoting it as a full
+   replacement for the old checkpoint until that's understood.
 4. **On-disk layout cleanup** (H1/H2 truth labels moved to the end of the
    array) — still unblocked, still not done, still worth doing before
    either format is considered final/published. See the earlier note in

@@ -215,6 +215,23 @@ def run_inference_diploid(data_path, device, ckpt_path, kind, batch_size=128, nu
             all_pj.append(model.pj[pred].cpu().numpy())
     print(f"  affinity={needs_affinity}  kind={kind}  homo_scale={het_scale_val:.4f}  "
           f"het_scale_diagnostic={het_scale_diagnostic:.4f}  windows={len(ds):,}")
+
+    # Release GPU memory NOW, not at process exit -- this process stays alive
+    # for the long (~25-45min) CPU-only comparator phase afterward, and
+    # PyTorch's CUDA caching allocator does not return memory to the driver
+    # on its own. all_pi/all_pj are already plain numpy (.cpu().numpy()
+    # above), so nothing downstream references the model/GPU tensors after
+    # this point. Without this, N concurrent workers each hold their model's
+    # GPU memory for their ENTIRE row lifetime (not just their inference
+    # window), oversubscribing the GPU under real parallelism (confirmed:
+    # CUDA OOM under 10-way parallelism here, same bug as simval_eval_indel.py).
+    del model
+    if ext_t is not None:
+        del ext_t
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     return (np.concatenate(all_pi, axis=0), np.concatenate(all_pj, axis=0),
             het_scale_val, het_scale_diagnostic)
 
