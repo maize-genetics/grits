@@ -161,6 +161,71 @@ def relabel_for_heldout(data, ibd, refpos, K, hidden_idx=None, rng=None):
     return out, n_hidden_labels, n_unlabelable
 
 
+def permute_founders_per_individual(data, ibd, rng):
+    """Founders are exchangeable in simulate_alleles.py's generative model
+    (no founder index carries any special identity -- lineage/crossover
+    draws are i.i.d. across the founder axis), so relabel_for_heldout's
+    convention of always hiding the LAST column (index K, i.e. the (K+1)-th
+    simulated founder) would, left alone, make the model see column K
+    excluded from every single augmented training example -- a systematic
+    "this column position is always suppressed" artifact that has nothing
+    to do with the actual held-out-tracking skill being taught, and would
+    bias inference on real data (where every column position is used
+    normally). Fix: apply an INDEPENDENT random permutation of the Ktot
+    founder columns per individual, consistently across `data`'s
+    ternary/distance/count blocks (leaving lab1/lab2 correctly repointed
+    through the same permutation) and `ibd`, before calling
+    relabel_for_heldout -- so which REAL founder ends up hidden (column
+    index Ktot-1 after permuting) varies per individual.
+
+    data: [n,T,3*Ktot+2] int8 (Ktot founders, pre-relabel). ibd: [n,R,Ktot]
+    int8. Returns (data_permuted, ibd_permuted) -- ready to feed into
+    relabel_for_heldout unchanged (hidden_idx still defaults to Ktot-1).
+    """
+    n, T, ncol = data.shape
+    Ktot = ibd.shape[2]
+    assert ncol == 3 * Ktot + 2
+
+    tern = data[:, :, :Ktot]
+    lab1 = data[:, :, Ktot]
+    lab2 = data[:, :, Ktot + 1]
+    dist = data[:, :, Ktot + 2:2 * Ktot + 2]
+    count = data[:, :, 2 * Ktot + 2:3 * Ktot + 2]
+
+    tern_p = np.empty_like(tern)
+    dist_p = np.empty_like(dist)
+    count_p = np.empty_like(count)
+    lab1_p = np.empty_like(lab1)
+    lab2_p = np.empty_like(lab2)
+    ibd_p = np.empty_like(ibd)
+
+    for i in range(n):
+        perm = rng.permutation(Ktot)          # perm[new_col] = old_col
+        inv = np.empty(Ktot, dtype=np.int64)  # inv[old_col] = new_col
+        inv[perm] = np.arange(Ktot)
+
+        tern_p[i] = tern[i][:, perm]
+        dist_p[i] = dist[i][:, perm]
+        count_p[i] = count[i][:, perm]
+        ibd_p[i] = ibd[i][:, perm]
+
+        l1 = lab1[i]
+        l2 = lab2[i]
+        real1 = l1 != LABEL_PAD
+        real2 = l2 != LABEL_PAD
+        out1 = l1.copy()
+        out2 = l2.copy()
+        out1[real1] = inv[l1[real1]]
+        out2[real2] = inv[l2[real2]]
+        lab1_p[i] = out1
+        lab2_p[i] = out2
+
+    out = np.concatenate(
+        [tern_p, lab1_p[:, :, None], lab2_p[:, :, None], dist_p, count_p],
+        axis=2).astype(np.int8)
+    return out, ibd_p
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)

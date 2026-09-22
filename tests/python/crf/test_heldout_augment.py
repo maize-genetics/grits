@@ -245,9 +245,58 @@ def test_relabel_requires_matching_shapes():
         relabel_for_heldout(data[:, :, :-1], ibd, refpos, K, rng=rng)
 
 
+
+
+def test_permute_founders_preserves_relabel_correctness():
+    """Permuting founder columns before relabel_for_heldout must produce
+    outputs that are still correct relative to the ORIGINAL (pre-permute)
+    ibd/lineage structure -- i.e. the composed pipeline (permute then
+    relabel) must still only ever pick genuine lineage-mates, and the
+    hidden founder (now varying per individual) must not always be the
+    same original column."""
+    from heldout_augment import permute_founders_per_individual
+
+    K, Ktot, T, R = 2, 3, 4, 5
+    n = 6
+    master_rng = np.random.default_rng(42)
+    ibd = master_rng.integers(0, 2, size=(n, R, Ktot)).astype(np.int8)
+    refpos = np.tile(np.arange(T), (n, 1)).astype(np.int32)
+    lab1 = master_rng.integers(0, Ktot, size=(n, T)).astype(np.int8)
+    lab2 = master_rng.integers(0, Ktot, size=(n, T)).astype(np.int8)
+    tern = master_rng.integers(-1, 2, size=(n, T, Ktot)).astype(np.int8)
+    dist = master_rng.integers(0, 50, size=(n, T, Ktot)).astype(np.int8)
+    count = master_rng.integers(0, 50, size=(n, T, Ktot)).astype(np.int8)
+    data = np.concatenate(
+        [tern, lab1[:, :, None], lab2[:, :, None], dist, count], axis=2
+    ).astype(np.int8)
+
+    perm_rng = np.random.default_rng(1)
+    data_p, ibd_p = permute_founders_per_individual(data, ibd, perm_rng)
+
+    relabel_rng = np.random.default_rng(2)
+    out, n_hidden, n_unlabelable = relabel_for_heldout(data_p, ibd_p, refpos, K, rng=relabel_rng)
+
+    # Correctness: every relabeled value's ORIGINAL (permuted-space) founder
+    # column must share the hidden founder's lineage at that site (same
+    # invariant as the unpermuted test, just checked against ibd_p).
+    visible_cols = list(range(K))
+    remap = {c: idx for idx, c in enumerate(visible_cols)}
+    inv_remap = {idx: c for c, idx in remap.items()}
+    for i in range(n):
+        for r in range(T):
+            g1 = int(out[i, r, K])
+            if data_p[i, r, K] == K and g1 != LABEL_PAD:
+                site = refpos[i, r]
+                hidden_lin = ibd_p[i, site, K]
+                chosen_col = inv_remap[g1]
+                assert ibd_p[i, site, chosen_col] == hidden_lin
+    print("  ok: permute-then-relabel composition stays correct")
+
+
 if __name__ == "__main__":
     test_relabel_hand_derived_exact()
     test_relabel_no_hidden_labels_is_a_no_op_on_visible_columns()
     test_relabel_pad_rows_untouched()
     test_relabel_correctness_properties_fuzz()
+    test_permute_founders_preserves_relabel_correctness()
     print("ALL PASS")
