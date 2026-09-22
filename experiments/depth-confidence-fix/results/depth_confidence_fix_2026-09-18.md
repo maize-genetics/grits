@@ -762,3 +762,73 @@ this investigation.
    this doc for the exact motivation.
 5. `indel-density-features` (`window_density`) remains a separate,
    still-unresolved, untouched hypothesis on its own branch.
+
+## More training data (2x individuals) — branch `indel-collapse-moredata`
+
+Tests whether scaling up training data further improves on Branch B's
+already-strong real-data result. Same recipe as Branch B exactly
+(`--collapse-rows --emit-read-counts`, `indel_model=overlay`,
+`--sites 60000`, warm-started from the ORIGINAL `diploid-indel-v3-k25-overlay-affinity`
+baseline, not from Branch B's own checkpoint, to keep this a clean
+scale-only comparison), but 1000+1000 individuals instead of 500+500 —
+double the total training windows after slicing (234,000 vs 117,000,
+`G=117` confirmed unchanged since it's bounded by `sites/T` not
+individual count). 5 epochs, best checkpoint at epoch 3
+(`val_pair_acc=0.7136`, vs Branch B's epoch-4 best of 0.6542 — higher
+val accuracy again, same caveat as Branch A about not trusting that
+number directly given it's measured on the same single-coverage
+simulated distribution the model trained on).
+
+Mean pair_acc / ibd_adj by kind and depth, baseline vs Branch B vs this run:
+
+| depth | INBRED pa/ia | HYB pa/ia | RIL2 pa/ia |
+|---|---|---|---|
+| | **baseline** | | |
+| 0.01x | 100.00/100.00 | 100.00/100.00 | 96.67/96.76 |
+| 0.1x | 100.00/100.00 | 99.23/99.87 | 98.83/99.59 |
+| 0.5x | 100.00/100.00 | 97.73/99.69 | 98.59/99.74 |
+| 1.0x | 100.00/100.00 | 96.95/99.66 | 98.49/99.76 |
+| 2.0x | 100.00/100.00 | 96.16/99.63 | 98.30/99.75 |
+| | **Branch B (500+500)** | | |
+| 0.01x | 100.00/100.00 | 100.00/100.00 | 96.61/96.79 |
+| 0.1x | 100.00/100.00 | 99.31/100.00 | 98.95/99.63 |
+| 0.5x | 100.00/100.00 | 97.69/99.98 | 98.84/99.89 |
+| 1.0x | 99.99/100.00 | 96.55/99.97 | 98.71/99.93 |
+| 2.0x | 99.99/100.00 | 95.32/99.95 | 98.57/99.93 |
+| | **More data (1000+1000)** | | |
+| 0.01x | 100.00/100.00 | **95.72/98.80** | 98.26/98.35 |
+| 0.1x | 100.00/100.00 | **93.67/98.79** | 98.73/99.70 |
+| 0.5x | 99.96/100.00 | 95.70/99.51 | 98.38/99.89 |
+| 1.0x | 99.97/100.00 | 96.42/99.71 | 98.35/99.91 |
+| 2.0x | 99.97/100.00 | **96.26**/99.76 | 98.28/99.93 |
+
+**Not a clean win — a real trade-off.** At 2.0x this run edges slightly
+*above* both baseline and Branch B on HYB (96.26% vs 96.16%/95.32%),
+which looked promising at first glance. But the full depth range tells
+a different story: at **low depth (0.01x/0.1x) HYB is markedly worse**
+than both baseline (100.00%/99.23%) and Branch B (100.00%/99.31%) —
+95.72%/93.67%, a 4-6pp drop. Checked all 5 HYB pairs individually
+(`experiments/depth-confidence-fix/scripts/eval_collapse_moredata.py`'s
+full log): every single pair shows this exact same shape — worst at
+0.01x-0.1x, recovering by 1.0x-2.0x — so this is a real, uniform effect
+of the 2x-data recipe, not one bad pair skewing the mean. RIL2 and
+INBRED stay close to both baseline and Branch B throughout, no similar
+low-depth effect there.
+
+**Interpretation**: doubling the data pushed the model to specialize
+more on the higher end of its training distribution (recall training
+itself is single-coverage, `indel_coverage=2.0`) at some cost to
+low-depth generalization — plausible if more data let the model fit
+that regime's specific patterns harder, the same general
+overfit-to-training-distribution mechanism flagged for Branch A, just
+manifesting as a depth-direction trade-off here rather than a uniform
+regression.
+
+**Verdict: not a clear improvement over Branch B.** Branch B remains the
+best result of this investigation — close to baseline across the ENTIRE
+depth range, not just at one end of it. More data trades away Branch
+B's low-depth strength for a marginal high-depth gain that's within
+noise of baseline anyway (+0.10pp at 2.0x, not meaningful). Not
+promoted. Branch `indel-collapse-moredata` kept for the record; no
+further action planned unless a specific reason to revisit low-depth
+degradation emerges.
