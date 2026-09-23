@@ -238,12 +238,18 @@ def main():
                           "--founders K+1)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-permute", action="store_true",
+                     help="skip the per-individual founder-column permutation "
+                          "(default: on -- avoids the fixed-hidden-column artifact)")
     args = ap.parse_args()
 
     data = np.load(args.in_npy)
     ibd = np.load(args.ibd_npy)
     refpos = np.load(args.refpos_npy)
     rng = np.random.default_rng(args.seed)
+
+    if not args.no_permute:
+        data, ibd = permute_founders_per_individual(data, ibd, rng)
 
     out, n_hidden, n_unlabelable = relabel_for_heldout(
         data, ibd, refpos, args.num_parents, rng=rng)
