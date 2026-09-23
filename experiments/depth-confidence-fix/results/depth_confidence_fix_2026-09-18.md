@@ -866,3 +866,95 @@ checkpoint. If revisited, the right lever is probably tuning
 (closer to what real zero-recombination IDX-INBRED/HYB data actually
 needs) rather than up — a different, untested direction from what this
 round tried.
+
+## Region-buffer-fix at the old model's undiluted crossover magnitude (2.5 vs 6.0)
+
+2026-09-23. Motivation: the old pre-indel model (`diploid-affinity-sim512-h3`,
+trained 2026-07-23, `--min-crossovers 1 --max-crossovers 4` applied directly
+with no buffering — confirmed via `git log -S "indel_region_mult"` that this
+mechanism didn't exist until 2026-09-11, two months after that checkpoint was
+trained) beats every indel-v3 descendant on real OUT-of-index data despite
+losing badly in-panel. Its nominal mean of 2.5 crossovers/individual, applied
+undiluted, is far below indel-v3's own diluted-then-region-fixed history
+(1.16 actual pre-fix, 6.0 nominal post-fix). This round tests the specific,
+narrow hypothesis the prior section's closing note pointed at: keep the
+already-validated dilution fix (`indel_region_mult=2`) but do NOT also raise
+`--min/max-crossovers` to compensate — leave them at the ORIGINAL v3-K25
+nominal defaults (2/10). Phase 1 calibration (n=500, same recipe as
+`regionfix_final_check.py` otherwise) confirmed this lands at
+**2.366 actual crossovers/individual**, 0% short-windows — closely matching
+the old model's 2.5, with zero recalibration needed.
+
+Full-scale generation (1000 individuals, 500 each inbreeding=1.0/0.0, same
+seeds 401/402 as the region-fix precedent) and warm-start retrain from the
+original baseline (`diploid-indel-v3-k25-overlay-affinity`,
+`d-epoch=04-val_pair_acc=0.6820.ckpt`) produced a result unlike either prior
+experiment on this thread. Region-fix (raising the rate to 6.0) degraded
+*gracefully* (val_pair_acc 0.37-0.42, real accuracy down a few points
+everywhere but still recognizably functional). This run instead **collapsed
+catastrophically** within a single epoch and did not recover:
+
+| epoch | val_pair_acc |
+|---|---|
+| 0 | 0.0265 |
+| 1 | 0.0276 |
+| 2 | 0.0284 (best) |
+
+(Training was killed by an external SIGTERM partway through epoch 3 — cause
+unknown, possibly host-level, not a crash in this run itself — but the
+epoch-0→2 trend is already flat at the collapse floor, not still descending
+from a healthy start, so further epochs were unlikely to change the
+qualitative picture.)
+
+**Data integrity was verified clean before concluding this was a real
+result, not a generation bug**: reshape-to-training-window correctness
+checked row-for-row against the pre-slice array (exact match), label range
+valid (0-24, no unexpected PAD), ternary/distance/count-feature ranges all
+within established norms, 0% short-windows at full production scale. This
+is a genuine training-dynamics outcome, not corrupted input.
+
+**A quick real-data founder-decode spot check isolated the failure
+precisely — it is not a general collapse:**
+
+| class | sample | depth | pair_acc | ibd_adj |
+|---|---|---|---|---|
+| IDX-INBRED | B73 | 0.1x | **100.00%** | 100.00% |
+| IDX-INBRED | B73 | 2.0x | **99.89%** | 99.97% |
+| IDX-HYB | B73xOh43 | 0.1x | **0.00%** | 96.12% |
+| IDX-HYB | B73xOh43 | 2.0x | **0.00%** | 89.55% |
+
+Homozygous (INBRED) decode is untouched — perfect, matching every other
+checkpoint on this thread. Heterozygous (HYB) decode collapses to an exact
+0% pair match at both depths, while `ibd_adj` (which tolerates a
+closely-related substitute founder) stays high — meaning the model isn't
+guessing randomly, it's confidently landing on the *wrong specific* founder
+pair, most consistent with a systematic homozygous-leaning miscalibration
+(likely predicting the same founder on both haplotypes for genuinely
+heterozygous individuals) rather than noise. This matches a precedented
+failure mode from earlier in this project
+(`tier1_breedpop_sparse_retrain`/memory: "learned-het head undercalibrated
+at het=100%/0%, never in training") — plausibly, this specific lower
+crossover-rate regime shifts the heterozygosity-pattern distribution the
+model's homo/het calibration sees during training just enough to break it,
+even though the raw switch-rate itself moved in the "more realistic"
+direction. This is a hypothesis, not confirmed root-cause — not
+investigated further this round.
+
+**Verdict: NOT PROMOTED, and not comparable to region-fix's failure mode.**
+Given HYB decode is completely non-functional (0% exact pair match), the
+full IDX-regression-check and OUT-target sweeps that every other checkpoint
+on this thread received were skipped as not informative — this checkpoint
+is not viable to eval further as-is. The result does NOT confirm or refute
+the "match the old model's absolute crossover magnitude" hypothesis on its
+own terms, because a different, precedented failure mode (het/homo
+miscalibration) intervened before that hypothesis could be tested cleanly.
+If revisited: fix or bypass the het-calibration sensitivity first (e.g. feed
+ground-truth `homo_scale` during training the way `tier1` attempted, or
+retrain the `learned_het` head specifically at this crossover magnitude)
+before re-running this comparison — the crossover-magnitude question itself
+remains open.
+
+Branch: `indel-region-buffer-fix-lowrate` (cut from `indel-region-buffer-fix`
+at `72cce04`). Generation script: `/tmp/gen_lowrate_fullscale.py` (not
+committed — ad hoc, reproducible from the recipe/seeds documented above).
+Checkpoint: `diploid-indel-v3-lowrate-fullscale/d-epoch=02-val_pair_acc=0.0284.ckpt`.
