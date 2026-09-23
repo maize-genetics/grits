@@ -958,3 +958,48 @@ Branch: `indel-region-buffer-fix-lowrate` (cut from `indel-region-buffer-fix`
 at `72cce04`). Generation script: `/tmp/gen_lowrate_fullscale.py` (not
 committed — ad hoc, reproducible from the recipe/seeds documented above).
 Checkpoint: `diploid-indel-v3-lowrate-fullscale/d-epoch=02-val_pair_acc=0.0284.ckpt`.
+
+### Update: het-calibration hypothesis disconfirmed; stability guards tried, did NOT fix it
+
+The het-calibration hypothesis above was investigated and **disconfirmed by
+direct code inspection**: none of region-fix, held-out-augment, or low-rate's
+training commands ever pass `--learned-het` or `--homo-penalty` (both default
+off/0.0), and `GRITSCRFDiploidIndel.forward()` shows neither branch executes
+when they're off — there is no homo/het calibration mechanism active in this
+checkpoint family at all, so it cannot be what broke.
+
+The better-evidenced hypothesis was plain training instability: the old
+pre-indel model's own successful July recipe used `--spike-skip
+--cosine-decay` as bf16-stability guards; none of this session's indel-v3
+retrains (region-fix, held-out-augment, low-rate) had ever enabled them.
+
+**Third attempt, same recipe (including `collapse_rows=True`, which is
+actually part of the standard region-fix-family recipe already — not a
+training-time CLI flag, so it never showed up in a `ps aux` check; the
+earlier "verified not present" claim was checking the wrong place), plus
+`--spike-skip --cosine-decay` added:**
+
+- Epoch 0: **val_pair_acc = 0.0443** — still collapsed, barely different
+  from the no-guards attempt's 0.0265.
+- Loss distribution across the epoch: min=1.11, median=2.21 (comparable to
+  other checkpoints' stable baseline), **max=98.60** — loss is still
+  spiking just as hard as before. No spike-skip diagnostic output appeared
+  in the log to confirm it's intervening at all.
+- Killed immediately per the mandatory early-epoch check rather than
+  continuing — this is not a viable run.
+
+**Verdict: the stability-guard fix does NOT resolve this on its own either.**
+Both of the two evidence-backed hypotheses tried so far (het-calibration,
+missing stability guards) are now ruled out or ineffective. The real root
+cause of why this specific crossover-rate/composition combination — and
+only this one, not region-fix's higher-rate version or held-out-augment's
+IBD-relabeling version — destabilizes training this severely is still
+unknown. Recommend: bisect which single change (crossover magnitude itself,
+vs. `founders=25`/`ancestors=6`/`sharing_theta=4.0` composition, vs.
+`indel_region_mult=2` vs. the specific seed pair) actually triggers it,
+rather than another blind retrain attempt.
+
+Data/scripts this round: `/home/zrm22/.claude/jobs/lowrate_v3/gen_lowrate_v3_fullscale.py`,
+data at `maize_v3_lowratev3_*.npy`. Training log:
+`results/lowrate_v3_train.log`. Killed checkpoint (not a valid result, kept
+only for reference): `diploid-indel-v3-lowrate-v3-fullscale/d-epoch=00-val_pair_acc=0.0443.ckpt`.
