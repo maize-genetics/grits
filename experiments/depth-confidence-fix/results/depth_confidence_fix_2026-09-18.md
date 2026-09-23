@@ -30,6 +30,73 @@ flowchart LR
     class E bad
 ```
 
+## Investigation summary and naming convention (2026-09-23)
+
+This doc has grown into many per-experiment sections written across several
+parallel branches. **The sections below are NOT all present on every
+branch** — each experiment was committed on its own branch and none have
+been merged together, so the full picture requires checking multiple
+branches' copies of this file. This summary is written to be accurate and
+findable regardless of which branch you're reading it from.
+
+### Naming convention (replaces earlier ambiguous "Branch A/B", "Option B" names)
+
+| name | checkpoint | branch | status |
+|---|---|---|---|
+| `diploid-affinity` (real baseline) | `diploid-affinity-sim512-h3/d-epoch=04-val_pair_acc=0.6179.ckpt` | pre-dates this investigation (trained July 23) | reference point, pre-ternary architecture |
+| `ternary-baseline` | `diploid-indel-v3-k25-overlay-affinity/d-epoch=04-val_pair_acc=0.6820.ckpt` | root of all indel-v3 work | everything below warm-starts from this |
+| `row-collapse` (was "Branch B") | `diploid-indel-v3-collapse-fullscale/d-epoch=04-val_pair_acc=0.6542.ckpt` | `indel-readcount-row-collapse` | best real-data result of the ternary family on IDX; promoted for in-panel use |
+| `region-fix` | `diploid-indel-v3-regionfix-fullscale` | `indel-region-buffer-fix` | **NOT PROMOTED, dead end** — regresses both IDX and OUT |
+| `held-out-augment` (was "Option B") | `diploid-indel-v3-heldout-augment-fullscale/d-epoch=02-val_pair_acc=0.7314.ckpt` | mechanism on `heldout-calibration`; real-data result section on `regionfix-out-snprc-check` (not yet reconciled onto `heldout-calibration`) | best OUT-INBRED/OUT-RIL2 result so far, worse than others on OUT-HYB |
+| `low-rate` | `diploid-indel-v3-lowrate-v3-fullscale` (dead — training destabilizes) | `indel-region-buffer-fix-lowrate` | **PAUSED, unresolved** after 3 attempts — see below |
+
+### Master comparison table — genotype-level OUT error rate, 0.1x
+
+| class | diploid-affinity | ternary-baseline | row-collapse | region-fix | held-out-augment |
+|---|---|---|---|---|---|
+| OUT-INBRED | 15.1% | 28.78% | 26.8% | 30.70% | **22.81%** (best of ternary family) |
+| OUT-HYB | 41.0% | 48.07% | **47.4%** (best of ternary family) | 51.11% | 52.00% |
+| OUT-RIL2 | — (not run comparably) | 31.79% | 29.5% | 34.38% | **22.52%** (best of ternary family) |
+
+**diploid-affinity (the real baseline) still beats every ternary-family checkpoint on every
+class measured** — the ternary/indel architecture has narrowed this gap in places
+(held-out-augment on INBRED/RIL2) but has not closed it anywhere.
+
+### Why diploid-affinity generalizes better — two verified mechanisms, neither sufficient alone
+
+1. **Undiluted crossover draws.** diploid-affinity trained on `--min-crossovers 1
+   --max-crossovers 4` (nominal mean 2.5/individual) applied directly, because it predates
+   the `indel_region_mult` region-buffering mechanism entirely (introduced 2026-09-11,
+   confirmed via `git log -S "indel_region_mult" -- src/python/crf/simulate_alleles.py`).
+   ternary-baseline's own nominal target (6.0) was silently diluted by that bug to an actual
+   ~1.16/individual.
+2. **bf16-stability guards.** diploid-affinity's training used `--spike-skip
+   --cosine-decay`; no ternary-family retrain (region-fix, held-out-augment, low-rate) has
+   used them.
+
+The `low-rate` experiment tried to replicate BOTH factors together (undiluted ~2.5
+crossover rate + `--spike-skip --cosine-decay`) and **still failed to train stably** across
+3 attempts (loss spikes to 38-98 vs. a stable ~2-4 baseline, regardless of the stability
+guards; a het-calibration hypothesis, modeled on this project's earlier
+`tier1_breedpop_sparse_retrain` precedent, was directly disconfirmed by code inspection —
+neither `--learned-het` nor `--homo-penalty` is even active in this checkpoint family).
+**Root cause of the low-rate instability is unresolved** — recommended next step is a
+systematic bisection (crossover magnitude vs. founder/ancestor composition vs.
+`indel_region_mult` vs. random seed) rather than another blind retry.
+
+### Methodology note: diploid-affinity vs. ternary-family isn't a controlled ablation
+
+The two families run through genuinely different real-data pipelines: diploid-affinity's
+eval doesn't need `--anchor-dist-npy`/`-l 19`/`--anchor-dist-thresh` (it doesn't consume
+ternary/distance/count features), and it's given the TRUE zygosity (`homo_scale` from the
+manifest) rather than inferring it. Both are **necessary infrastructure differences, not
+scoring bugs** — the final gVCF-vs-truth comparison logic was directly verified identical
+for both paths. But this means the comparison is "each model through its own correct
+real-world pipeline," not an isolated architecture ablation — the *existence and direction*
+of the gap is well-established across many independent checkpoints and rows, but its exact
+magnitude isn't cleanly decomposed into architecture-vs-tooling causes yet.
+
+
 ## Candidate fixes
 
 Ordered roughly cheapest/fastest-to-test → biggest investment. Inference-
