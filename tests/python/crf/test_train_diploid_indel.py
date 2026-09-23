@@ -19,7 +19,7 @@ from python.crf.crf_kernels import _dcrf_nll, _dcrf_viterbi, build_pair_tables
 from python.crf.train_crf import IndelFounderPathEncoder
 from python.crf.train_diploid_indel import (
     IndelDiploidDataset, GRITSCRFDiploidIndel,
-    TERN_DEL, TERN_DIV, TERN_MATCH, DIST_PAD,
+    TERN_DEL, TERN_DIV, TERN_MATCH, DIST_PAD, warm_start_hparam_mismatches,
 )
 
 torch.manual_seed(0)
@@ -299,6 +299,31 @@ class TestOverfitSmoke(unittest.TestCase):
                            f"hap_acc did not improve: {hap_acc0:.4f} -> {hap_acc1:.4f}")
         self.assertGreaterEqual(pair_acc1, pair_acc0,
                                 f"pair_acc regressed: {pair_acc0:.4f} -> {pair_acc1:.4f}")
+
+
+class TestWarmStartHparamGuard(unittest.TestCase):
+    """--warm-start-ckpt must not silently load weights into a model whose
+    architecture flags differ from the checkpoint's."""
+
+    CKPT = dict(num_parents=25, d_model=256, n_heads=8, n_layers=6,
+                time_local_emis=True, homo_penalty=3.0, learned_het=False,
+                founder_affinity=True, warmup_steps=500, spike_skip=True, lr=1e-4)
+
+    def test_matching_flags_pass(self):
+        self.assertEqual(warm_start_hparam_mismatches(self.CKPT, dict(self.CKPT)), ([], []))
+
+    def test_dropped_recipe_flags_detected(self):
+        # The low-rate / held-out-augment command: recipe flags left at defaults.
+        run = dict(self.CKPT, time_local_emis=False, homo_penalty=0.0,
+                   warmup_steps=0, spike_skip=False)
+        model_mm, sched_mm = warm_start_hparam_mismatches(self.CKPT, run)
+        self.assertEqual({k for k, _, _ in model_mm}, {"time_local_emis", "homo_penalty"})
+        self.assertEqual({k for k, _, _ in sched_mm}, {"warmup_steps", "spike_skip"})
+
+    def test_lr_change_and_missing_keys_ignored(self):
+        old_ckpt = {k: v for k, v in self.CKPT.items() if k != "learned_het"}
+        run = dict(self.CKPT, lr=3e-5, learned_het=True)
+        self.assertEqual(warm_start_hparam_mismatches(old_ckpt, run), ([], []))
 
 
 if __name__ == "__main__":

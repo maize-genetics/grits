@@ -638,6 +638,35 @@ def ibd_adjusted_accuracy(model, data, num_parents, true_lo, true_hi, valid,
                                         raw_counts, row_idx, num_parents, ibd_thresh=ibd_thresh)
 
 
+# Hyperparameters that change what a warm-started checkpoint's weights MEAN
+# (emission-head wiring, pair-emission offset, feature conditioning, shapes):
+# a mismatch silently fine-tunes the weights under a different model. Found
+# the hard way -- every low-rate and held-out-augment retrain warm-started
+# diploid-indel-v3-k25-overlay-affinity (time_local_emis=True,
+# homo_penalty=3.0) without those flags, and the bisection in
+# experiments/depth-confidence-fix/ showed that alone collapses training
+# (val_pair_acc 0.03 vs 0.50) regardless of the data.
+WARM_START_MODEL_HPARAMS = ("num_parents", "d_model", "n_heads", "n_layers",
+                            "time_local_emis", "homo_penalty", "learned_het",
+                            "founder_affinity")
+# Optimization-schedule hparams: legitimately changeable, but worth a warning.
+WARM_START_SCHEDULE_HPARAMS = ("warmup_steps", "spike_skip")
+
+
+def warm_start_hparam_mismatches(ckpt_hparams, run_hparams):
+    """Compare a warm-start checkpoint's saved hyper_parameters against this
+    run's. Returns (model_mismatches, schedule_mismatches), each a list of
+    (name, ckpt_value, run_value). Keys absent from the checkpoint (older
+    checkpoints predating a flag) are skipped rather than guessed."""
+    model_mm, sched_mm = [], []
+    for keys, out in ((WARM_START_MODEL_HPARAMS, model_mm),
+                      (WARM_START_SCHEDULE_HPARAMS, sched_mm)):
+        for k in keys:
+            if k in ckpt_hparams and k in run_hparams and ckpt_hparams[k] != run_hparams[k]:
+                out.append((k, ckpt_hparams[k], run_hparams[k]))
+    return model_mm, sched_mm
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True)
@@ -734,6 +763,11 @@ def parse_args():
                         "train fresh (new optimizer/scheduler/epoch state) -- unlike "
                         "--resume, which requires an exact architecture match and "
                         "restores full trainer state. Mutually exclusive with --resume.")
+    p.add_argument("--allow-hparam-mismatch", action="store_true",
+                   help="Proceed even if --warm-start-ckpt was trained with different "
+                        "model hparams (time_local_emis, homo_penalty, ...) than this "
+                        "run's flags. Off by default: such a mismatch silently changes "
+                        "what the loaded weights mean.")
     return p.parse_args()
 
 
@@ -782,7 +816,20 @@ def main():
         # init (zero, for density_proj) rather than being an error. Optimizer/
         # scheduler/epoch state is intentionally NOT restored -- this is a
         # fresh training run seeded with old weights, not a resumed one.
-        sd = torch.load(args.warm_start_ckpt, map_location="cpu", weights_only=False)["state_dict"]
+        ck = torch.load(args.warm_start_ckpt, map_location="cpu", weights_only=False)
+        model_mm, sched_mm = warm_start_hparam_mismatches(
+            ck.get("hyper_parameters", {}), dict(model.hparams))
+        fmt = lambda mm: ", ".join(f"{k}: ckpt={a!r} run={b!r}" for k, a, b in mm)
+        if sched_mm:
+            print(f"WARNING --warm-start-ckpt schedule hparams differ: {fmt(sched_mm)}")
+        if model_mm:
+            msg = (f"--warm-start-ckpt model hparams differ from this run's flags: "
+                   f"{fmt(model_mm)}")
+            if not args.allow_hparam_mismatch:
+                raise SystemExit(msg + " (pass the checkpoint's flags, or "
+                                 "--allow-hparam-mismatch if intentional)")
+            print("WARNING " + msg)
+        sd = ck["state_dict"]
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"--warm-start-ckpt {args.warm_start_ckpt}: "
               f"missing={missing} unexpected={unexpected}")
