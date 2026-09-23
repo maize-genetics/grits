@@ -866,3 +866,78 @@ checkpoint. If revisited, the right lever is probably tuning
 (closer to what real zero-recombination IDX-INBRED/HYB data actually
 needs) rather than up — a different, untested direction from what this
 round tried.
+
+## Synthetic leave-one-out held-out training (Option B): first full result
+
+**Checkpoint:** `diploid-indel-v3-heldout-augment-fullscale/d-epoch=02-val_pair_acc=0.7314.ckpt`
+(warm-started from the original `diploid-indel-v3-k25-overlay-affinity`
+baseline; `max_epochs=5` reached, epoch 2 was the best checkpoint by
+val_pair_acc -- 0.7267/0.7301/0.7314 across epochs 0/1/2, later epochs did
+not improve). Trained on the relabeled leave-one-out data
+(`heldout_augment.py`, commits `626ebfc`/`725270d` on
+`indel-heldout-augment`) combined with the normal in-panel splits.
+
+**Real-bug fix required first.** This checkpoint's K+1=26-state
+architecture can legitimately decode the null/no-visible-lineage-mate
+state (index 25) on real data -- something no prior checkpoint's training
+distribution ever incentivized, so it was never exercised before. This
+crashed `heldout_assembly_eval.py::k_target_to_name` (`IndexError: list
+index out of range`, indexing straight into the 25-element `gamete_names`
+list) on every non-RIL2 row. Fixed in `write_imputed_bed` (the fixing
+fork's own diff, restored/continued here): skip sites where the predicted
+index falls outside `gamete_names` rather than crash or fabricate a
+founder guess -- downstream scoring already tolerates BED gaps (this
+project's existing "no-fill" gVCF convention). A matching GPU-memory-leak
+fix was also carried over into `simval_eval_one.py` (same pattern already
+fixed in `simval_eval_indel.py` this session).
+
+**Method note:** OUT/MIX samples have no true panel-founder-identity label
+(they're genuinely held-out assemblies, not equal to any panel member), so
+founder-level `pair_acc`/`ibd_adj` is undefined for them by construction --
+this is why every OUT/MIX accuracy check this session (region-fix's own
+OUT sweep, Branch B's genotype sweep) used genotype-level SNP+RefCall
+`error_rate` instead, and this check does too, for direct comparability.
+
+**Result -- mixed, but real and directionally consistent within each
+class** (0.1x, mean genotype-level error_rate, OUT-only; n=5/5/3 of 5 rows
+scored for INBRED/HYB/RIL2 respectively, RIL2's remaining 2 rows still
+finishing at write time):
+
+| class | baseline (v3-K25) | region-fix | Option B |
+|---|---|---|---|
+| OUT-INBRED | 28.78% | 30.70% | **22.81%** |
+| OUT-HYB | 48.07% | 51.11% | 52.00% |
+| OUT-RIL2 | 23.81% | 24.58% | **21.80%** |
+
+OUT-INBRED: Option B wins on **all 5/5 rows**, by 1-20pp each (Tx303 is
+the standout: 43.33%->23.19%, more than halved). OUT-RIL2: wins on all
+3/3 scored so far, by 1.4-4.6pp each. OUT-HYB: **loses on all 5/5 rows**,
+by 1-6pp each (worse than both baseline and even region-fix, the other
+already-failed approach).
+
+**Interpretation.** Option B's mechanism -- learning to recognize "no
+visible founder matches, defer to IBD-relatedness structure" -- helps
+exactly where a single true ancestry needs tracking (INBRED: one true
+lineage throughout; RIL2: one lineage per haplotype block, no
+simultaneous heterozygous decision). It hurts HYB, where the true state
+is two DIFFERENT founders simultaneously and the null-leaning bias this
+training instills likely costs precision on whichever of the two slots
+is harder to pin down, compounding across both. This is the same
+predicted shape as the diploid indel model's general homo/het asymmetry
+seen elsewhere this session, now showing up as a training-composition
+effect rather than a decode-time homo_scale one.
+
+**Verdict:** first genuinely-positive result for OUT-of-index decode this
+investigation has produced (both region-buffer-fix and Branch B alone
+regressed on every OUT/MIX class). Not a clean win -- HYB regresses
+meaningfully -- but INBRED and RIL2 both improve by a real, consistent
+margin. Promising enough to warrant a HYB-focused follow-up (e.g.
+combining Option B's augmentation with an explicit two-founder
+calibration term, or simply weighting HYB-like compositions higher in
+the augmented training mix) rather than abandoning the approach.
+
+Per-row JSON: `results/heldout_augment_out_snprc/`. Driver:
+`experiments/simval-corpus/scripts/heldout_augment_out_snprc_check.py`
+(original sweep) + `heldout_augment_remaining.py` (this round's
+resume-after-crash driver, GPU-1-pinned to run alongside the 3 rows that
+had already survived as orphaned processes from the crashed run).

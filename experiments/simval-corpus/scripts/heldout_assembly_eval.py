@@ -397,15 +397,38 @@ def write_imputed_bed(sample, pi_arr, pj_arr, dropped_idx, gamete_names, bins_pa
         pi_c = pi_flat[cursor: cursor + n_rows]
         pj_c = pj_flat[cursor: cursor + n_rows]
         cursor += n_rows
-        rows = [{
-            "chrom": contig, "start": int(pos), "end": int(pos) + 1,
-            "parent1": k_target_to_name(int(p1), dropped_idx, gamete_names),
-            "parent2": k_target_to_name(int(p2), dropped_idx, gamete_names),
-        } for pos, p1, p2 in zip(positions, pi_c, pj_c)]
+        # A checkpoint trained with a genuine null/no-visible-lineage-mate
+        # target (experiments/depth-confidence-fix/, synthetic leave-one-out
+        # held-out augmentation) can legally decode a predicted index >=
+        # len(gamete_names) -- the null state -- which k_target_to_name has
+        # no real founder name for (unlike every prior checkpoint this
+        # pipeline has scored, whose training never incentivized predicting
+        # "no call"). Skip those sites rather than crash or fabricate a
+        # founder guess; downstream scoring already tolerates BED gaps (the
+        # project's existing "no-fill" gVCF convention).
+        n_gamete = len(gamete_names)
+        rows = []
+        n_skipped = 0
+        for pos, p1, p2 in zip(positions, pi_c, pj_c):
+            p1, p2 = int(p1), int(p2)
+            src1 = p1 + 1 if dropped_idx is not None and p1 >= dropped_idx else p1
+            src2 = p2 + 1 if dropped_idx is not None and p2 >= dropped_idx else p2
+            if src1 >= n_gamete or src2 >= n_gamete:
+                n_skipped += 1
+                continue
+            rows.append({
+                "chrom": contig, "start": int(pos), "end": int(pos) + 1,
+                "parent1": gamete_names[src1],
+                "parent2": gamete_names[src2],
+            })
         out_bed = bed_dir / f"{sample}_{contig}_imputed.bed"
         output_collapse_bed(pd.DataFrame(rows), str(out_bed))
         written.append(out_bed)
-        print(f"  {contig}: wrote {len(rows):,} sites -> {out_bed}")
+        if n_skipped:
+            print(f"  {contig}: wrote {len(rows):,} sites -> {out_bed} "
+                  f"({n_skipped:,} null-state sites skipped)")
+        else:
+            print(f"  {contig}: wrote {len(rows):,} sites -> {out_bed}")
     return written
 
 
