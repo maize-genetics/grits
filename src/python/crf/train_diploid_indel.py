@@ -174,21 +174,41 @@ class IndelDiploidIndividualDataset(IndelDiploidDataset):
         return out
 
 
+def individual_split_rows(n_ind, G, val_frac, test_frac, seed=0, legacy_tail=False):
+    """Row indices (train, val, test) for an individual-aligned split. Whole
+    individuals (blocks of G windows) go to one split. Seeded shuffle by
+    default: every training .npy is a file-order concatenation of inbred and
+    outbred blocks, so the old tail split (legacy_tail=True) gave val/test a
+    single individual type -- 100% het for lowrate/regionfix, 100%
+    homozygous for heldout_augment -- making val_pair_acc (and checkpoint
+    selection) one-class. Indices are sorted within each split so memmap
+    reads stay sequential."""
+    n_test = int(n_ind * test_frac)
+    n_val = int(n_ind * val_frac)
+    n_tr = n_ind - n_val - n_test
+    order = (np.arange(n_ind) if legacy_tail
+             else np.random.default_rng(seed).permutation(n_ind))
+    to_rows = lambda ids: (np.sort(ids)[:, None] * G + np.arange(G)).ravel()
+    return (to_rows(order[:n_tr]), to_rows(order[n_tr:n_tr + n_val]),
+            to_rows(order[n_tr + n_val:]))
+
+
 def make_indel_diploid_individual_splits(path, num_parents, val_frac, test_frac, G,
-                                         het_inbred=0.23, het_outbred=0.50, limit_n=0):
+                                         het_inbred=0.23, het_outbred=0.50, limit_n=0,
+                                         split_seed=0, legacy_tail_split=False):
     data = np.load(path, allow_pickle=True, mmap_mode="r")
     _check_width(path, data, num_parents)
     if limit_n:
         data = data[:(limit_n // G) * G]
     N = len(data)
     n_ind = N // G
-    n_test = int(n_ind * test_frac) * G
-    n_val = int(n_ind * val_frac) * G
-    n_tr = N - n_val - n_test
-    mk = lambda a: IndelDiploidIndividualDataset(a, num_parents, G, het_inbred, het_outbred)
+    splits = individual_split_rows(n_ind, G, val_frac, test_frac, split_seed, legacy_tail_split)
+    mk = lambda rows: IndelDiploidIndividualDataset(data[rows], num_parents, G,
+                                                    het_inbred, het_outbred)
     print(f"IndelDiploid(individual) {Path(path).name}: N={N:,} individuals={n_ind} "
-          f"train={n_tr:,} val={n_val:,} test={n_test:,}")
-    return mk(data[:n_tr]), mk(data[n_tr:n_tr + n_val]), mk(data[n_tr + n_val:])
+          f"train={len(splits[0]):,} val={len(splits[1]):,} test={len(splits[2]):,} "
+          f"split={'legacy-tail' if legacy_tail_split else f'shuffled(seed={split_seed})'}")
+    return tuple(mk(r) for r in splits)
 
 
 class IndelDiploidAffinityDataset(IndelDiploidDataset):
@@ -214,7 +234,8 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
         return out
 
 
-def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G, limit_n=0):
+def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G, limit_n=0,
+                                       split_seed=0, legacy_tail_split=False):
     """Individual-aligned split, same boundaries as
     make_indel_diploid_individual_splits (mirrors train_diploid.py's
     make_diploid_affinity_splits intent)."""
@@ -224,13 +245,12 @@ def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G
         data = data[:(limit_n // G) * G]
     N = len(data)
     n_ind = N // G
-    n_test = int(n_ind * test_frac) * G
-    n_val = int(n_ind * val_frac) * G
-    n_tr = N - n_val - n_test
-    mk = lambda a: IndelDiploidAffinityDataset(a, num_parents, G)
+    splits = individual_split_rows(n_ind, G, val_frac, test_frac, split_seed, legacy_tail_split)
+    mk = lambda rows: IndelDiploidAffinityDataset(data[rows], num_parents, G)
     print(f"IndelDiploid(affinity) {Path(path).name}: N={N:,} individuals={n_ind} "
-          f"train={n_tr:,} val={n_val:,} test={n_test:,}")
-    return mk(data[:n_tr]), mk(data[n_tr:n_tr + n_val]), mk(data[n_tr + n_val:])
+          f"train={len(splits[0]):,} val={len(splits[1]):,} test={len(splits[2]):,} "
+          f"split={'legacy-tail' if legacy_tail_split else f'shuffled(seed={split_seed})'}")
+    return tuple(mk(r) for r in splits)
 
 
 # --------------------------------------------------------------------------- #
@@ -367,7 +387,28 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         t_lo = torch.minimum(h1, h2)
         t_hi = torch.maximum(h1, h2)
         hap_acc = ((pred_lo == t_lo).float() + (pred_hi == t_hi).float()).mean() / 2
+        # [homo_correct, homo_n, het_correct, het_n, pred_homo, n], summed over
+        # the epoch: val_pair_acc alone hides a one-class val set or a model
+        # that always calls homozygous (the original held-out-augment).
+        correct, homo = (pred == pair_true), (h1 == h2)
+        if getattr(self, "_val_class_counts", None) is None:
+            self._val_class_counts = torch.zeros(6, dtype=torch.float64, device=pred.device)
+        self._val_class_counts += torch.stack([
+            (correct & homo).sum(), homo.sum(), (correct & ~homo).sum(), (~homo).sum(),
+            (pred_lo == pred_hi).sum(), torch.tensor(pred.numel(), device=pred.device),
+        ]).double()
         return pair_acc, hap_acc
+
+    def on_validation_epoch_start(self):
+        self._val_class_counts = torch.zeros(6, dtype=torch.float64, device=self.device)
+
+    def on_validation_epoch_end(self):
+        hc, hn, tc, tn, ph, n = self._val_class_counts.tolist()
+        nan = float("nan")
+        self.log("val/pair_acc_homo", hc / hn if hn else nan)
+        self.log("val/pair_acc_het", tc / tn if tn else nan)
+        self.log("val/homo_frac", hn / n if n else nan)
+        self.log("val/pred_homo_frac", ph / n if n else nan)
 
     def validation_step(self, batch, _):
         loss, crf, g, c, emis_p, _ = self._step(batch)
@@ -675,6 +716,12 @@ def parse_args():
     p.add_argument("--val-frac", type=float, default=0.10)
     p.add_argument("--test-frac", type=float, default=0.10)
     p.add_argument("--limit-n", type=int, default=0)
+    p.add_argument("--split-seed", type=int, default=0,
+                   help="Seed for the individual-level train/val/test shuffle.")
+    p.add_argument("--legacy-tail-split", action="store_true",
+                   help="Old unshuffled split (val/test = file-order tail). Only for "
+                        "reproducing pre-2026-09-23 runs: on concatenated inbred+outbred "
+                        "data it makes val a single individual type.")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--accumulate-grad-batches", type=int, default=1,
                    help="Accumulate gradients over N micro-batches per optimizer "
@@ -784,12 +831,14 @@ def main():
     if args.founder_affinity:
         train_ds, val_ds, _ = make_indel_diploid_affinity_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
-            args.windows_per_individual, limit_n=args.limit_n)
+            args.windows_per_individual, limit_n=args.limit_n,
+            split_seed=args.split_seed, legacy_tail_split=args.legacy_tail_split)
     elif args.adaptive_homo:
         train_ds, val_ds, _ = make_indel_diploid_individual_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
             args.windows_per_individual, het_inbred=args.het_inbred,
-            het_outbred=args.het_outbred, limit_n=args.limit_n)
+            het_outbred=args.het_outbred, limit_n=args.limit_n,
+            split_seed=args.split_seed, legacy_tail_split=args.legacy_tail_split)
     else:
         train_ds, val_ds, _ = make_indel_diploid_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,

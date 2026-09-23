@@ -20,6 +20,7 @@ from python.crf.train_crf import IndelFounderPathEncoder
 from python.crf.train_diploid_indel import (
     IndelDiploidDataset, GRITSCRFDiploidIndel,
     TERN_DEL, TERN_DIV, TERN_MATCH, DIST_PAD, warm_start_hparam_mismatches,
+    individual_split_rows, make_indel_diploid_affinity_splits,
 )
 
 torch.manual_seed(0)
@@ -324,6 +325,65 @@ class TestWarmStartHparamGuard(unittest.TestCase):
         old_ckpt = {k: v for k, v in self.CKPT.items() if k != "learned_het"}
         run = dict(self.CKPT, lr=3e-5, learned_het=True)
         self.assertEqual(warm_start_hparam_mismatches(old_ckpt, run), ([], []))
+
+
+class TestIndividualSplit(unittest.TestCase):
+    """Val/test must not be the file-order tail of concatenated
+    [inbred; outbred] data (that gave single-class val sets)."""
+
+    def test_disjoint_whole_individuals_cover_all(self):
+        G = 7
+        tr, va, te = individual_split_rows(100, G, 0.1, 0.1, seed=0)
+        allr = np.concatenate([tr, va, te])
+        self.assertEqual(sorted(allr.tolist()), list(range(100 * G)))
+        for rows in (tr, va, te):
+            ids, counts = np.unique(rows // G, return_counts=True)
+            self.assertTrue((counts == G).all())
+        self.assertEqual((len(va) // G, len(te) // G), (10, 10))
+
+    def test_shuffled_val_mixes_concatenated_blocks(self):
+        # individuals 0-49 "inbred", 50-99 "outbred": the tail split puts only
+        # outbred in val; the shuffled split must see both.
+        _, va_tail, _ = individual_split_rows(100, 1, 0.1, 0.1, legacy_tail=True)
+        _, va, _ = individual_split_rows(100, 1, 0.1, 0.1, seed=0)
+        self.assertTrue((va_tail >= 50).all())
+        self.assertTrue((va < 50).any() and (va >= 50).any())
+
+    def test_seed_reproducible_and_legacy_matches_old_tail(self):
+        a = individual_split_rows(50, 3, 0.1, 0.1, seed=5)
+        b = individual_split_rows(50, 3, 0.1, 0.1, seed=5)
+        for x, y in zip(a, b):
+            np.testing.assert_array_equal(x, y)
+        tr, va, te = individual_split_rows(50, 3, 0.1, 0.1, legacy_tail=True)
+        np.testing.assert_array_equal(tr, np.arange(40 * 3))
+        np.testing.assert_array_equal(va, np.arange(40 * 3, 45 * 3))
+
+    def test_affinity_splits_on_disk(self):
+        import tempfile, os
+        K, G, T = 6, 4, 16
+        arr, _, _ = make_indel_fixture(n_windows=40 * G, T=T, K=K, seed=1)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x.npy")
+            np.save(path, arr)
+            tr, va, te = make_indel_diploid_affinity_splits(path, K, 0.1, 0.1, G, split_seed=3)
+            self.assertEqual((len(tr), len(va), len(te)), (32 * G, 4 * G, 4 * G))
+            _, va_rows, _ = individual_split_rows(40, G, 0.1, 0.1, seed=3)
+            np.testing.assert_array_equal(va.data, arr[va_rows])
+
+
+class TestValClassCounts(unittest.TestCase):
+    def test_counts_partition_positions(self):
+        K = 4
+        m = GRITSCRFDiploidIndel(num_parents=K, d_model=16, n_heads=2, n_layers=1)
+        m.on_validation_epoch_start()
+        B, T = 3, 10
+        h1 = torch.randint(0, K, (B, T)); h2 = h1.clone(); h2[1] = (h1[1] + 1) % K
+        emis = torch.randn(B, T, m.pi.numel())
+        c = torch.zeros(B, T)
+        m._accuracy(emis, c, h1, h2)
+        hc, hn, tc, tn, ph, n = m._val_class_counts.tolist()
+        self.assertEqual((hn, tn, n), (2 * T, T, B * T))
+        self.assertTrue(0 <= hc <= hn and 0 <= tc <= tn and 0 <= ph <= n)
 
 
 if __name__ == "__main__":
