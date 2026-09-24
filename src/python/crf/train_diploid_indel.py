@@ -465,7 +465,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         return {"optimizer": opt, "lr_scheduler": sched, "monitor": "val/loss"}
 
 
-def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=256):
+def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=256,
+                             homo_scale=None):
     """THE single real-data inference recipe for GRITSCRFDiploidIndel --
     every eval script (real-data unit tests, depth sweeps, per-checkpoint
     comparisons) should call this instead of re-deriving the ext_emb /
@@ -489,7 +490,10 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
     homo_scale_from_affinity (train_diploid.py, the p90-of-per-window-
     inbreeding-estimate classifier) as homo_scale. No other variant/
     override point -- if a different homo_scale is ever needed, change it
-    here, once, not in each caller.
+    here, once, not in each caller. The one exception is the explicit
+    homo_scale= argument, for diagnostics only (e.g. an oracle inbred/hybrid
+    call, to measure what the p90 classifier's mistakes cost on held-out
+    samples); None = the normal classifier.
 
     Returns (pred_lo, pred_hi): [N,T] int arrays, the low/high founder
     index of the predicted pair at every real site."""
@@ -508,7 +512,10 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
                           dtype=torch.float32) if has_count else None)
     M = (tern == TERN_MATCH).astype(np.float32)
     affinity = _founder_affinity(M.reshape(-1, K))
-    homo_scale = homo_scale_from_affinity(M)
+    auto_scale = homo_scale_from_affinity(M)
+    if homo_scale is None:
+        homo_scale = auto_scale
+    print(f"  homo_scale={homo_scale} (p90 classifier chose {auto_scale})", flush=True)
     ext_emb = torch.tensor(affinity, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
 
     preds_lo, preds_hi = [], []
