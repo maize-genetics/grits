@@ -49,8 +49,8 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import Dataset, DataLoader
 
 from python.crf.train_crf import IndelFounderPathEncoder
-from python.crf.crf_kernels import _dcrf_nll, _dcrf_viterbi, build_pair_tables
-from python.crf.train_diploid import _founder_affinity, homo_scale_from_affinity
+from python.crf.crf_kernels import _dcrf_marginal, _dcrf_nll, _dcrf_viterbi, build_pair_tables
+from python.crf.train_diploid import _estimate_inbreeding_coef_batch, _founder_affinity, homo_scale_from_affinity
 from python.crf.callbacks import EMACallback
 
 # --- Indel-mode sentinels, mirroring simulate_alleles.py's contract -------
@@ -465,8 +465,54 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         return {"optimizer": opt, "lr_scheduler": sched, "monitor": "val/loss"}
 
 
+# Sample router thresholds -- midpoints of the gaps seen on the 30 real 0.1x
+# IDX/OUT simval samples (2026-09-24): same-bin disjoint fraction homozygous
+# <= 0.272 vs hybrid >= 0.370; p90 IDX homozygous >= 0.723, IDX hybrid <= 0.323,
+# every OUT sample 0.43-0.64. Validate on MIX / other depths before trusting.
+ROUTE_DISJ_HYBRID = 0.32
+ROUTE_P90_INPANEL_HOMO = 0.68
+ROUTE_P90_INPANEL_HYB = 0.375
+ROUTE_OUT_SWITCH_SCALE = 0.03
+
+
+def route_real_sample(M, row_bin, informative_max=12):
+    """Per-sample decode settings from two read-level statistics.
+
+    disj: among consecutive rows in the SAME refmap bin that each match
+    1..informative_max founders, the fraction whose matching-founder sets are
+    disjoint. Nearby reads of an inbred (in-panel or held-out) come from one
+    haplotype and share founders; in a hybrid half the pairs straddle the two
+    haplotypes. Unlike p90 it does not depend on any panel founder matching
+    the sample closely, so it works for held-out lines.
+
+    p90: homo_scale_from_affinity's statistic. In-panel samples have windows
+    where one founder (inbred, high p90) or two founders (hybrid, low p90)
+    explain nearly every read; held-out samples sit in between.
+
+    Returns dict(disj, p90, hybrid, in_panel, homo_scale, switch_scale):
+    homo_scale 1 for hybrids else 0; switch_scale 1.0 in-panel, else
+    ROUTE_OUT_SWITCH_SCALE (held-out genomes are fine mosaics of the panel and
+    need many more founder switches than the model's in-panel prior allows).
+    M: [N,T,K] bool MATCH view; row_bin: [N,T] int64 key unique per
+    (contig, refmap bin)."""
+    Mf = M.reshape(-1, M.shape[-1]).astype(bool)
+    b = np.asarray(row_bin).reshape(-1)
+    nm = Mf.sum(1)
+    inf = (nm >= 1) & (nm <= informative_max)
+    pair = (b[1:] == b[:-1]) & inf[1:] & inf[:-1]
+    disj = float(((Mf[1:] & Mf[:-1]).sum(1) == 0)[pair].mean()) if pair.any() else float("nan")
+    win_rate = M.astype(np.float32).mean(axis=1)
+    p90 = float(np.percentile(_estimate_inbreeding_coef_batch(win_rate), 90))
+    hybrid = bool(disj > ROUTE_DISJ_HYBRID)
+    in_panel = bool(p90 < ROUTE_P90_INPANEL_HYB) if hybrid else bool(p90 > ROUTE_P90_INPANEL_HOMO)
+    return dict(disj=disj, p90=p90, hybrid=hybrid, in_panel=in_panel,
+                homo_scale=1.0 if hybrid else 0.0,
+                switch_scale=1.0 if in_panel else ROUTE_OUT_SWITCH_SCALE)
+
+
 def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=256,
-                             homo_scale=None, switch_scale=1.0):
+                             homo_scale=None, switch_scale=None, route=False,
+                             row_bin=None, decode="viterbi"):
     """THE single real-data inference recipe for GRITSCRFDiploidIndel --
     every eval script (real-data unit tests, depth sweeps, per-checkpoint
     comparisons) should call this instead of re-deriving the ext_emb /
@@ -496,7 +542,12 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
     samples); None = the normal classifier. switch_scale (diagnostic, default
     1.0 = as trained) multiplies the whole transition score (the encoder's
     per-site switch cost c AND stay_bonus), making founder switches cheaper
-    (<1) or dearer (>1) at decode time only.
+    (<1) or dearer (>1) at decode time only; None = 1.0. route=True picks
+    both from route_real_sample (needs row_bin); explicit homo_scale /
+    switch_scale arguments still override it. decode="marginal" takes the
+    per-site posterior argmax (_dcrf_marginal) instead of the Viterbi path --
+    it maximizes expected per-site accuracy, the quantity the genotype score
+    measures.
 
     Returns (pred_lo, pred_hi): [N,T] int arrays, the low/high founder
     index of the predicted pair at every real site."""
@@ -516,9 +567,20 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
     M = (tern == TERN_MATCH).astype(np.float32)
     affinity = _founder_affinity(M.reshape(-1, K))
     auto_scale = homo_scale_from_affinity(M)
+    if route:
+        if row_bin is None:
+            raise ValueError("route=True needs row_bin")
+        r = route_real_sample(M == 1, row_bin)
+        print(f"  route: disj={r['disj']:.4f} p90={r['p90']:.3f} hybrid={r['hybrid']} "
+              f"in_panel={r['in_panel']}", flush=True)
+        homo_scale = r["homo_scale"] if homo_scale is None else homo_scale
+        switch_scale = r["switch_scale"] if switch_scale is None else switch_scale
     if homo_scale is None:
         homo_scale = auto_scale
-    print(f"  homo_scale={homo_scale} (p90 classifier chose {auto_scale})", flush=True)
+    if switch_scale is None:
+        switch_scale = 1.0
+    print(f"  homo_scale={homo_scale} (p90 classifier chose {auto_scale}) "
+          f"switch_scale={switch_scale}", flush=True)
     ext_emb = torch.tensor(affinity, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
 
     preds_lo, preds_hi = [], []
@@ -529,8 +591,9 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
             hs = torch.full((xb.shape[0],), homo_scale, device=device)
             cb = count[s:s + batch_size].to(device) if count is not None else None
             emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs, count=cb)
-            pred = _dcrf_viterbi(emis_p, c * switch_scale, model.nsw_pair,
-                                 model.stay_bonus * switch_scale)
+            dec = _dcrf_marginal if decode == "marginal" else _dcrf_viterbi
+            pred = dec(emis_p, c * switch_scale, model.nsw_pair,
+                       model.stay_bonus * switch_scale)
             preds_lo.append(model.pi[pred].cpu().numpy())
             preds_hi.append(model.pj[pred].cpu().numpy())
     return np.concatenate(preds_lo), np.concatenate(preds_hi)
