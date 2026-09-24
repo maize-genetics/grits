@@ -50,7 +50,7 @@ def load_cached_baseline(rows):
     return results
 
 
-def run_one(row, tag, ckpt, gpu, out_root, results_dir):
+def run_one(row, tag, ckpt, gpu, out_root, results_dir, oracle_homo=False):
     ds, ind = row["dataset_id"], row["individual"]
     row_key = f"{tag}__{ds}__{ind}__{DEPTH}x"
     json_path = results_dir / f"{row_key}.json"
@@ -68,6 +68,8 @@ def run_one(row, tag, ckpt, gpu, out_root, results_dir):
            "--dataset-id", ds, "--coverage", DEPTH,
            "--dataset-class", CLASS_OF[ds.split("-")[0]],
            "--kind", KIND_OF[ds.split("-")[1]], "--ckpt", ckpt]
+    if oracle_homo:
+        cmd += ["--homo-scale-override", "1" if ds.endswith("-HYB") else "0"]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
     t0 = time.time()
     with open(outdir / "driver.log", "w") as logf:
@@ -90,6 +92,10 @@ def main():
     p.add_argument("--gpu", default="0")
     p.add_argument("--workers", type=int, default=5)
     p.add_argument("--scope", choices=sorted(SCOPES), default="out")
+    p.add_argument("--oracle-homo", action="store_true",
+                   help="Force the true inbred/hybrid homo_scale (diagnostic).")
+    p.add_argument("--only", nargs="*", default=None,
+                   help="Restrict to these DATASET__INDIVIDUAL keys.")
     args = p.parse_args()
     classes = SCOPES[args.scope]
 
@@ -99,12 +105,15 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
 
     rows = load_rows(classes)
+    if args.only:
+        rows = [r for r in rows if f"{r['dataset_id']}__{r['individual']}" in args.only]
     print(f"{len(rows)} manifest rows matched (expect {len(classes) * 5}); ckpt={args.ckpt}",
           flush=True)
     results = load_cached_baseline(rows)
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(run_one, r, args.tag, args.ckpt, args.gpu, out_root, results_dir): r
+        futs = {ex.submit(run_one, r, args.tag, args.ckpt, args.gpu, out_root, results_dir,
+                          args.oracle_homo): r
                 for r in rows}
         for fut in as_completed(futs):
             r = futs[fut]

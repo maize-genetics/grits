@@ -124,7 +124,7 @@ def window_k25_wcount(raw_npy, outdir):
     return out_path, bins_path, gametes_path
 
 
-def run_inference_indel(data_path, device, ckpt_path):
+def run_inference_indel(data_path, device, ckpt_path, homo_scale=None):
     """Canonical real-data inference path (matches eval_common.py exactly) --
     infer_real_founder_pairs already handles homo_scale adaptively/
     per-window internally (the "unified homo_scale fix" this project already
@@ -136,7 +136,8 @@ def run_inference_indel(data_path, device, ckpt_path):
     model = GRITSCRFDiploidIndel.load_from_checkpoint(
         str(ckpt_path), map_location=device, strict=False).eval().to(device)
     data = np.load(data_path)
-    pred_lo, pred_hi = infer_real_founder_pairs(model, data, K, device=device)
+    pred_lo, pred_hi = infer_real_founder_pairs(model, data, K, device=device,
+                                                homo_scale=homo_scale)
     print(f"  windows={pred_lo.shape[0]:,}")
 
     # Release GPU memory NOW, not at process exit. This process stays alive
@@ -197,7 +198,8 @@ def do_align(args):
 
     import torch
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pred_lo, pred_hi = run_inference_indel(windowed_npy, device, ckpt_path=args.ckpt)
+    pred_lo, pred_hi = run_inference_indel(windowed_npy, device, ckpt_path=args.ckpt,
+                                           homo_scale=args.homo_scale_override)
     t_infer = time.time()
 
     bed_dir = outdir / "bed"
@@ -306,6 +308,9 @@ def main():
     ap.add_argument("--coverage", default=None)
     ap.add_argument("--dataset-class", default=None)
     ap.add_argument("--kind", default=None)
+    ap.add_argument("--homo-scale-override", type=float, default=None,
+                    help="Diagnostic only: force homo_scale (0=inbred/RIL, 1=hybrid) "
+                         "instead of the p90 classifier.")
     args = ap.parse_args()
 
     t_wall0 = time.time()
