@@ -425,7 +425,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
 
 
 def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=256,
-                             homo_scale=None):
+                             homo_scale=None, switch_scale=1.0):
     """THE single real-data inference recipe for GRITSCRFDiploidIndel --
     every eval script (real-data unit tests, depth sweeps, per-checkpoint
     comparisons) should call this instead of re-deriving the ext_emb /
@@ -452,7 +452,10 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
     here, once, not in each caller. The one exception is the explicit
     homo_scale= argument, for diagnostics only (e.g. an oracle inbred/hybrid
     call, to measure what the p90 classifier's mistakes cost on held-out
-    samples); None = the normal classifier.
+    samples); None = the normal classifier. switch_scale (diagnostic, default
+    1.0 = as trained) multiplies the whole transition score (the encoder's
+    per-site switch cost c AND stay_bonus), making founder switches cheaper
+    (<1) or dearer (>1) at decode time only.
 
     Returns (pred_lo, pred_hi): [N,T] int arrays, the low/high founder
     index of the predicted pair at every real site."""
@@ -485,7 +488,8 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
             hs = torch.full((xb.shape[0],), homo_scale, device=device)
             cb = count[s:s + batch_size].to(device) if count is not None else None
             emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs, count=cb)
-            pred = _dcrf_viterbi(emis_p, c, model.nsw_pair, model.stay_bonus)
+            pred = _dcrf_viterbi(emis_p, c * switch_scale, model.nsw_pair,
+                                 model.stay_bonus * switch_scale)
             preds_lo.append(model.pi[pred].cpu().numpy())
             preds_hi.append(model.pj[pred].cpu().numpy())
     return np.concatenate(preds_lo), np.concatenate(preds_hi)

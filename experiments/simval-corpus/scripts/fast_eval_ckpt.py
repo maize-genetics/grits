@@ -58,6 +58,8 @@ def main():
     ap.add_argument("--scope", nargs="+", choices=sorted(SCOPES), default=["out", "idx"])
     ap.add_argument("--oracle-homo", action="store_true",
                     help="force the true inbred/hybrid homo_scale (diagnostic)")
+    ap.add_argument("--switch-scale", type=float, default=1.0,
+                    help="scale the decoder's transition score (diagnostic; 1.0 = as trained)")
     args = ap.parse_args()
 
     import torch
@@ -83,7 +85,8 @@ def main():
             hs = (1.0 if ds.endswith("-HYB") else 0.0) if args.oracle_homo else None
             with contextlib.redirect_stdout(io.StringIO()) as buf:
                 pred_lo, pred_hi = infer_real_founder_pairs(model, data, sei.K, device=device,
-                                                            homo_scale=hs)
+                                                            homo_scale=hs,
+                                                            switch_scale=args.switch_scale)
                 bed_dir = out_root / key / "bed"
                 hae.write_imputed_bed(ind, pred_lo, pred_hi, None,
                                       hae.load_gamete_names(src / "raw.npy.gametes.tsv"),
