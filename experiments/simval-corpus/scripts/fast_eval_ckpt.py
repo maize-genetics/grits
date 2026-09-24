@@ -37,11 +37,11 @@ import heldout_assembly_eval as hae  # noqa: E402
 WORK = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir")
 MANIFEST = "/workdir/shared_files/grits_crf_evaluation/reads/maize/simulated_validation/manifest.tsv"
 SCOPES = {"out": ["OUT-INBRED", "OUT-HYB", "OUT-RIL2"],
-          "idx": ["IDX-INBRED", "IDX-HYB", "IDX-RIL2"]}
-DEPTH = "0.1"
+          "idx": ["IDX-INBRED", "IDX-HYB", "IDX-RIL2"],
+          "mix": ["MIX-HYB", "MIX-RIL", "MIX-RIL2"]}
 
 
-def source_dir(ds, ind):
+def source_dir(ds, ind, DEPTH):
     """Any existing row dir for this sample with a complete model input."""
     for d in sorted(glob.glob(str(WORK / f"scratch/*_snprc/*__{ds}__{ind}__{DEPTH}x"))):
         d = Path(d)
@@ -58,8 +58,13 @@ def main():
     ap.add_argument("--scope", nargs="+", choices=sorted(SCOPES), default=["out", "idx"])
     ap.add_argument("--oracle-homo", action="store_true",
                     help="force the true inbred/hybrid homo_scale (diagnostic)")
-    ap.add_argument("--switch-scale", type=float, default=1.0,
-                    help="scale the decoder's transition score (diagnostic; 1.0 = as trained)")
+    ap.add_argument("--switch-scale", type=float, default=None,
+                    help="scale the decoder's transition score (diagnostic; unset = 1.0, "
+                         "or the router's choice with --route)")
+    ap.add_argument("--decode", choices=["viterbi", "marginal"], default="viterbi")
+    ap.add_argument("--depth", default="0.1")
+    ap.add_argument("--route", action="store_true",
+                    help="pick homo_scale and switch_scale per sample with route_real_sample")
     args = ap.parse_args()
 
     import torch
@@ -67,6 +72,7 @@ def main():
     model = GRITSCRFDiploidIndel.load_from_checkpoint(
         args.ckpt, map_location=device, strict=False).eval().to(device)
     panel = fss.Panel()
+    DEPTH = args.depth
     rows = [r for r in csv.DictReader(open(MANIFEST), delimiter="\t") if r["coverage"] == DEPTH]
 
     summary = {}
@@ -79,24 +85,38 @@ def main():
             if ds not in SCOPES[scope]:
                 continue
             t0 = time.time()
-            src = source_dir(ds, ind)
+            try:
+                src = source_dir(ds, ind, DEPTH)
+            except FileNotFoundError as e:
+                print(f"SKIP {e}", flush=True)
+                continue
             key = f"{args.tag}__{ds}__{ind}__{DEPTH}x"
             data = np.load(src / "windowed_k25native_wcount.npy")
-            hs = (1.0 if ds.endswith("-HYB") else 0.0) if args.oracle_homo else None
+            # oracle kind: MIX-RIL keeps heterozygous stretches, so it has no single true call
+            hs = ((1.0 if ds.endswith("-HYB") else None if ds.endswith("-RIL") else 0.0)
+                  if args.oracle_homo else None)
+            row_bin = None
+            if args.route:
+                layout = hae.load_contig_layout(src / "raw.npy.bins.tsv", data.shape[1], bin_size=256)
+                row_bin = np.concatenate([np.asarray(pos, np.int64) + (ci << 40)
+                                          for ci, (_c, pos, _n) in enumerate(layout)]
+                                         ).reshape(data.shape[0], data.shape[1])
             with contextlib.redirect_stdout(io.StringIO()) as buf:
                 pred_lo, pred_hi = infer_real_founder_pairs(model, data, sei.K, device=device,
                                                             homo_scale=hs,
-                                                            switch_scale=args.switch_scale)
+                                                            switch_scale=args.switch_scale,
+                                                            route=args.route, row_bin=row_bin,
+                                                            decode=args.decode)
                 bed_dir = out_root / key / "bed"
                 hae.write_imputed_bed(ind, pred_lo, pred_hi, None,
                                       hae.load_gamete_names(src / "raw.npy.gametes.tsv"),
                                       src / "raw.npy.bins.tsv", bed_dir, bin_size=256)
-            chosen = [l for l in buf.getvalue().splitlines() if "homo_scale=" in l]
+            chosen = [l for l in buf.getvalue().splitlines() if "homo_scale=" in l or "route:" in l]
             f1, f2 = fss.pair_from_bed(panel, bed_dir)
             res = fss.score_arrays(panel, fss.load_truth(r["truth_h1"]),
                                    fss.load_truth(r["truth_h2"]), f1, f2)
             res.update(row_key=key, status="ok", source_input=str(src),
-                       homo_scale_log=chosen[0].strip() if chosen else None,
+                       homo_scale_log=" | ".join(c.strip() for c in chosen) if chosen else None,
                        wall_seconds=round(time.time() - t0, 1))
             (res_dir / f"{key}.json").write_text(json.dumps(res, indent=1))
             summary.setdefault(ds, []).append(res["error_rate"])
