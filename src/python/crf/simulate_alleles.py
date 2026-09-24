@@ -287,6 +287,27 @@ def _gem_lineages(rng, n, K, T, theta, M, anc_nc, rate_rep):
     return np.take_along_axis(lin_seg, seg, axis=2).astype(np.int32)
 
 
+def _mosaic_last_founder(rng, lineage, breaks_mean, private_frac):
+    """In place: rebuild the LAST founder's lineage track [n, R] as a fine-scale
+    mosaic of the visible founders' tracks -- Poisson(breaks_mean) breakpoints
+    per individual, each segment copying one uniformly drawn visible donor's
+    lineage (IBD with that donor), or, with prob private_frac, keeping its own
+    GEM lineage. For the held-out augmentation (scripts/heldout_augment.py
+    hides this founder): a real held-out line is a mosaic of short IBD tracts
+    with many different panel lines, not a founder with the same few long
+    lineage tracts as the panel. Measured on real 0.1x data: the best-matching
+    panel founder changes between adjacent 128-row chunks at rate ~0.59 for
+    OUT inbreds vs ~0.11 for the unmodified simulated held-out founder."""
+    n, K, R = lineage.shape
+    nb = rng.poisson(breaks_mean, n).clip(0, R - 1).astype(np.int64)
+    seg = _segment_index(rng, n, R, nb)
+    max_seg = int(seg.max()) + 1
+    donor = np.take_along_axis(rng.integers(0, K - 1, (n, max_seg)), seg, axis=1)
+    private = np.take_along_axis(rng.random((n, max_seg)) < private_frac, seg, axis=1)
+    copied = lineage[np.arange(n)[:, None], donor, np.arange(R)[None, :]]
+    lineage[:, K - 1, :] = np.where(private, lineage[:, K - 1, :], copied)
+
+
 def _good_mask(rng, n, T, bad_frac, block):
     """Boolean [n, T] of 'good' (uncorrupted) sites.
 
@@ -1181,7 +1202,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              indel_overlay_rate=2.3e-3, indel_overlay_mean_len=300.0,
              indel_overlay_founder_freq=1.0, subst_model="dense",
              subst_rate=0.018, coverage_model="linear", read_len=150,
-             emit_read_counts=False, collapse_rows=False):
+             emit_read_counts=False, collapse_rows=False,
+             heldout_mosaic_breaks=0.0, heldout_mosaic_private=0.1):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
     (default) behavior, including rng draw order, is byte-for-byte
@@ -1327,6 +1349,9 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             lineage, M = _draw_lineages(rng, n, R, K, ancestors,
                                          ancestor_crossovers, rmap_R,
                                          sharing_theta, max_lin)
+            if heldout_mosaic_breaks > 0:
+                _mosaic_last_founder(rng, lineage, heldout_mosaic_breaks,
+                                     heldout_mosaic_private)
             if indel_model == "tracts":
                 del_lin, ins_lin = _indel_tracts(
                     rng, n, M, R, indel_density, indel_ins_frac,
@@ -1557,6 +1582,12 @@ def parse_args():
                         "singleton-dominated, tail to K) instead of A fixed "
                         "ancestors. Larger ⇒ more singletons / less sharing. "
                         "Also writes <out>.ibd.npy (per-site IBD lineage labels).")
+    p.add_argument("--heldout-mosaic-breaks", type=float, default=0.0,
+                   help="Indel mode: rebuild the LAST founder's lineage as a mosaic of the "
+                        "visible founders with Poisson(this) breakpoints per individual "
+                        "(for scripts/heldout_augment.py --keep-hidden-last). 0 = off.")
+    p.add_argument("--heldout-mosaic-private", type=float, default=0.1,
+                   help="Fraction of mosaic segments that keep the founder's own lineage.")
     p.add_argument("--ancestor-crossovers", type=int, default=8,
                    help="Coalescent mode: mean ancestor switches per founder per window")
     p.add_argument("--derived-sfs", type=float, default=0.3,
@@ -2038,6 +2069,8 @@ def main():
         coverage_model=args.indel_coverage_model, read_len=args.indel_read_len_bp,
         emit_read_counts=args.emit_read_counts,
         collapse_rows=args.collapse_rows,
+        heldout_mosaic_breaks=args.heldout_mosaic_breaks,
+        heldout_mosaic_private=args.heldout_mosaic_private,
         indel_density=args.indel_density, indel_ins_frac=args.indel_ins_frac,
         indel_large_frac=args.indel_large_frac,
         indel_small_alpha=args.indel_small_alpha,

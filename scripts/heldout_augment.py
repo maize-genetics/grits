@@ -60,14 +60,61 @@ Usage:
 """
 import argparse
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/local/workdir/zrm22/HackathonJun2026/grits_workdir/indel-v3-simulator-wt/src")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import numpy as np
+from numba import njit
 
 from python.crf.simulate_alleles import LABEL_PAD
 
 
-def relabel_for_heldout(data, ibd, refpos, K, hidden_idx=None, rng=None):
+@njit(cache=True)
+def _sticky_resolve(hit_sites, ibd_i, hidden_idx, visible_cols, u, shared_with, prev_choice):
+    """Sequential (genome-order) lineage-mate choice for one haplotype of one
+    individual. Keeps the current mate while it still shares the hidden
+    founder's lineage at the site; only when it stops does it draw a new mate
+    uniformly (u[j] in [0,1)) among the current candidates. A fresh draw per
+    site (the old behavior) flips the label between founders that are
+    identical at that site -- pure label noise the model can't learn from
+    (measured: 86-215 label switches per 512 sites for carrier individuals vs
+    <=0.1 normally). shared_with[j] >= 0 forces the choice to that founder
+    when it is a valid candidate (used to give H2 the same mate as H1 when
+    both haplotypes are the hidden founder, i.e. the individual is
+    homozygous for it). Returns resolved visible-founder indices (old
+    numbering), -1 where no candidate exists."""
+    H = hit_sites.shape[0]
+    out = np.full(H, -1, np.int64)
+    cur = prev_choice
+    nv = visible_cols.shape[0]
+    cand = np.empty(nv, np.int64)
+    for j in range(H):
+        t = hit_sites[j]
+        hl = ibd_i[t, hidden_idx]
+        nc = 0
+        cur_ok = False
+        forced_ok = False
+        for v in range(nv):
+            c = visible_cols[v]
+            if ibd_i[t, c] == hl:
+                cand[nc] = c
+                nc += 1
+                if c == cur:
+                    cur_ok = True
+                if c == shared_with[j]:
+                    forced_ok = True
+        if nc == 0:
+            cur = -1
+            continue
+        if forced_ok:
+            cur = shared_with[j]
+        elif not cur_ok:
+            cur = cand[min(int(u[j] * nc), nc - 1)]
+        out[j] = cur
+    return out
+
+
+def relabel_for_heldout(data, ibd, refpos, K, hidden_idx=None, rng=None, sticky=True):
     """data: [n,T,3*(K+1)+2] int8 (emit_read_counts=True output, K+1 founders
     simulated). ibd: [n,R,K+1] int8 (.ibd.npy sidecar, R-indexed). refpos:
     [n,T] int32 (.refpos.npy sidecar, maps each output row to its site in
@@ -111,6 +158,30 @@ def relabel_for_heldout(data, ibd, refpos, K, hidden_idx=None, rng=None):
         rows = np.flatnonzero(valid)
         sites = rp[rows]
         ibd_i = ibd[i]  # [R, Ktot]
+
+        if sticky:
+            h1_hit = lab1[i, rows] == hidden_idx
+            h2_hit = lab2[i, rows] == hidden_idx
+            vis = np.array(visible_cols, dtype=np.int64)
+            ibd_c = np.ascontiguousarray(ibd_i)
+            res1 = np.full(rows.size, -2, dtype=np.int64)       # -2 = not a hidden row
+            for lab, hit, res, other in ((lab1, h1_hit, res1, None),
+                                         (lab2, h2_hit, None, res1)):
+                if not hit.any():
+                    continue
+                hit_idx = np.flatnonzero(hit)
+                n_hidden_labels += hit_idx.size
+                shared = (np.full(hit_idx.size, -9, dtype=np.int64) if other is None
+                          else np.where(other[hit_idx] >= 0, other[hit_idx], -9))
+                resolved = _sticky_resolve(sites[hit_idx].astype(np.int64), ibd_c,
+                                           hidden_idx, vis, rng.random(hit_idx.size),
+                                           shared, -1)
+                n_unlabelable += int((resolved < 0).sum())
+                resolved = np.where(resolved < 0, LABEL_PAD, resolved)
+                if res is not None:
+                    res[hit_idx] = resolved
+                lab[i, rows[hit_idx]] = resolved
+            continue
 
         for lab in (lab1, lab2):
             hit = lab[i, rows] == hidden_idx
@@ -161,7 +232,7 @@ def relabel_for_heldout(data, ibd, refpos, K, hidden_idx=None, rng=None):
     return out, n_hidden_labels, n_unlabelable
 
 
-def permute_founders_per_individual(data, ibd, rng):
+def permute_founders_per_individual(data, ibd, rng, keep_hidden_last=False):
     """Founders are exchangeable in simulate_alleles.py's generative model
     (no founder index carries any special identity -- lineage/crossover
     draws are i.i.d. across the founder axis), so relabel_for_heldout's
@@ -200,7 +271,10 @@ def permute_founders_per_individual(data, ibd, rng):
     ibd_p = np.empty_like(ibd)
 
     for i in range(n):
-        perm = rng.permutation(Ktot)          # perm[new_col] = old_col
+        # keep_hidden_last: the simulator's --heldout-mosaic founder is the
+        # LAST one and must stay the hidden one; only visible columns shuffle.
+        perm = (np.append(rng.permutation(Ktot - 1), Ktot - 1) if keep_hidden_last
+                else rng.permutation(Ktot))  # perm[new_col] = old_col
         inv = np.empty(Ktot, dtype=np.int64)  # inv[old_col] = new_col
         inv[perm] = np.arange(Ktot)
 
@@ -241,6 +315,13 @@ def main():
     ap.add_argument("--no-permute", action="store_true",
                      help="skip the per-individual founder-column permutation "
                           "(default: on -- avoids the fixed-hidden-column artifact)")
+    ap.add_argument("--keep-hidden-last", action="store_true",
+                     help="permute only the visible columns; the last simulated "
+                          "founder stays hidden (required with --heldout-mosaic-breaks, "
+                          "whose mosaic founder is the last one)")
+    ap.add_argument("--no-sticky", action="store_true",
+                     help="old per-site independent lineage-mate draw (label noise; "
+                          "only for reproducing pre-2026-09-24 data)")
     args = ap.parse_args()
 
     data = np.load(args.in_npy)
@@ -249,10 +330,11 @@ def main():
     rng = np.random.default_rng(args.seed)
 
     if not args.no_permute:
-        data, ibd = permute_founders_per_individual(data, ibd, rng)
+        data, ibd = permute_founders_per_individual(data, ibd, rng,
+                                                     keep_hidden_last=args.keep_hidden_last)
 
     out, n_hidden, n_unlabelable = relabel_for_heldout(
-        data, ibd, refpos, args.num_parents, rng=rng)
+        data, ibd, refpos, args.num_parents, rng=rng, sticky=not args.no_sticky)
 
     print(f"input shape: {data.shape}  output shape: {out.shape}")
     print(f"hidden-founder label instances: {n_hidden}")

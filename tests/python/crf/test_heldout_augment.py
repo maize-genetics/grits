@@ -300,3 +300,75 @@ if __name__ == "__main__":
     test_relabel_correctness_properties_fuzz()
     test_permute_founders_preserves_relabel_correctness()
     print("ALL PASS")
+
+
+def _all_mates_fixture(n_sites=200, Ktot=6):
+    """Hidden founder (last) shares its lineage with visible founders 0, 1, 2 at
+    every site, so the relabel has 3 valid candidates everywhere. Inbred row:
+    both haplotypes are the hidden founder at every site."""
+    K = Ktot - 1
+    ibd = np.zeros((1, n_sites, Ktot), dtype=np.int8)
+    ibd[0, :, :] = np.arange(Ktot, dtype=np.int8) + 10
+    ibd[0, :, [0, 1, 2]] = 5
+    ibd[0, :, K] = 5
+    data = np.zeros((1, n_sites, 3 * Ktot + 2), dtype=np.int8)
+    data[0, :, Ktot] = K
+    data[0, :, Ktot + 1] = K
+    refpos = np.arange(n_sites, dtype=np.int32)[None, :]
+    return data, ibd, refpos, K
+
+
+def test_sticky_relabel_has_no_spurious_switches_and_inbred_stays_homozygous():
+    data, ibd, refpos, K = _all_mates_fixture()
+    out, n_hidden, n_unlab = relabel_for_heldout(data, ibd, refpos, K,
+                                                 rng=np.random.default_rng(0))
+    lab1, lab2 = out[0, :, K], out[0, :, K + 1]
+    assert n_unlab == 0
+    assert len(np.unique(lab1)) == 1, "sticky choice must not flip between tied mates"
+    assert lab1[0] in (0, 1, 2)
+    np.testing.assert_array_equal(lab1, lab2)
+
+
+def test_non_sticky_reproduces_old_label_noise():
+    data, ibd, refpos, K = _all_mates_fixture()
+    out, _, _ = relabel_for_heldout(data, ibd, refpos, K, rng=np.random.default_rng(0),
+                                    sticky=False)
+    assert (np.diff(out[0, :, K]) != 0).sum() > 50
+
+
+def test_sticky_switches_only_when_current_mate_stops_sharing():
+    data, ibd, refpos, K = _all_mates_fixture()
+    first, _, _ = relabel_for_heldout(data.copy(), ibd, refpos, K, rng=np.random.default_rng(1))
+    chosen = int(first[0, 0, K])
+    ibd2 = ibd.copy()
+    ibd2[0, 100:, chosen] = 99                      # chosen mate diverges from site 100 on
+    out, _, _ = relabel_for_heldout(data.copy(), ibd2, refpos, K, rng=np.random.default_rng(1))
+    lab = out[0, :, K]
+    assert (lab[:100] == chosen).all()
+    assert (lab[100:] != chosen).all() and len(np.unique(lab[100:])) == 1
+    assert (np.diff(lab) != 0).sum() == 1
+
+
+def test_keep_hidden_last_permutation_keeps_last_founder_hidden():
+    from heldout_augment import permute_founders_per_individual
+    data, ibd, refpos, K = _all_mates_fixture()
+    ibd[0, :, K] = 77                               # make the hidden column identifiable
+    _, ibd_p = permute_founders_per_individual(data, ibd, np.random.default_rng(3),
+                                               keep_hidden_last=True)
+    assert (ibd_p[0, :, K] == 77).all()
+
+
+def test_mosaic_last_founder_copies_visible_donors():
+    from python.crf.simulate_alleles import _mosaic_last_founder
+    rng = np.random.default_rng(0)
+    n, K, R = 4, 6, 5000
+    # disjoint per-founder lineage ranges, so a copied site identifies its donor uniquely
+    lineage = (rng.integers(0, 50, (n, K, R)) + 1000 * np.arange(K)[None, :, None]).astype(np.int32)
+    before_visible = lineage[:, :K - 1].copy()
+    _mosaic_last_founder(np.random.default_rng(1), lineage, breaks_mean=40.0, private_frac=0.0)
+    np.testing.assert_array_equal(lineage[:, :K - 1], before_visible)
+    shares = (lineage[:, :K - 1] == lineage[:, K - 1][:, None, :]).any(axis=1)
+    assert shares.all(), "with private_frac=0 every site copies some visible donor"
+    donor = (lineage[:, :K - 1] == lineage[:, K - 1][:, None, :]).argmax(axis=1)
+    n_changes = (np.diff(donor, axis=1) != 0).sum(axis=1)
+    assert (n_changes > 10).all() and (n_changes < 200).all()
