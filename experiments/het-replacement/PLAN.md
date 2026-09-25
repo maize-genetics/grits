@@ -13,6 +13,13 @@
 - **2026-09-25** — Plan written. No code changed yet. Branch `out-het-replacement`
   (cut from `warmstart-hparam-guard`, the tip of the indel-training line with
   the warm-start flag guard and shuffled split; `develop` has no training code).
+- **2026-09-25** — §2.1 started. Calibration generator copied to
+  `.../reads/maize/simulated_calibration/scripts/` (only `config.py` changed; it
+  asserts no overlap with the evaluation corpus's lines). New held-out lines
+  DK105, F7, K0326Y, PHB47, CML442 building truth gVCFs + anchorspro under
+  `grits_workdir/data/maize_v2_calib/` (AnchorWave, per-sample work dirs). IDX
+  datasets (CML247, Ki3, M162W, Tzi8, NC350) building now; OUT/MIX follow once
+  the truth builds finish.
 
 ## 1. Why
 
