@@ -203,6 +203,103 @@ def feature_stats(windowed):
     return out
 
 
+# ---------------------------------------------------------------- refmap ternary vs truth
+LEN_EDGES_BP = [0, 100, 500, 1000, 4000, 20000, 10 ** 12]
+BIN_BP = 256
+
+
+def _del_runlen(dele, pos):
+    """Per panel record and founder: bp length of the contiguous deleted run covering it (0 if present)."""
+    out = np.zeros(dele.shape, np.int64)
+    for f in range(dele.shape[1]):
+        dx = np.diff(np.r_[0, dele[:, f].astype(np.int8), 0])
+        s, e = np.where(dx == 1)[0], np.where(dx == -1)[0]
+        if len(s):
+            L = pos[e - 1] - pos[s] + 1
+            idx = np.concatenate([np.arange(a, b) for a, b in zip(s, e)])
+            out[idx, f] = np.repeat(L, e - s)
+    return out
+
+
+def ternary_obs_stats(dirs, P):
+    """Pooled over aligned rows (refmap raw.npy, flat [n_bins, 3K+2]): refmap's per-founder
+    ternary state at each row's bin vs the panel truth (founder lacks the B73 sequence at
+    >= 50% of the bin's panel records = deleted; 0% = present; otherwise skipped), split
+    by deleted-run length, plus distance-code histograms per (truth, state). Truth here is
+    the index panel's own assemblies, the same for every sample, so only the calibration
+    rows' positions enter. Returns raw counts so rows pool by addition."""
+    nb = len(LEN_EDGES_BP) - 1
+    cnt_del = np.zeros((nb, 3), np.int64)            # [len bucket, state -1/0/1]
+    cnt_pres = np.zeros(3, np.int64)
+    hist = {f"{tr}|{st}": np.zeros(DIST_CODES, np.int64) for tr in ("del", "present") for st in (-1, 0, 1)}
+    srcs = []
+    for d in dirs:
+        raw = np.load(d / "raw.npy", mmap_mode="r")
+        bins = pd.read_csv(d / "raw.npy.bins.tsv", sep="\t")
+        gam = pd.read_csv(d / "raw.npy.gametes.tsv", sep="\t").sort_values("gameteIndex").sampleName.tolist()
+        srcs.append((raw, bins, [P.fidx[g] for g in gam]))
+    for ci, c in enumerate(fss.AUTOSOMES):
+        lo, hi = P.bounds[ci]
+        pos = P.pos[lo:hi]
+        fa = np.asarray(P.fa[lo:hi])
+        ac = np.asarray(P.acls[lo:hi])
+        valid = fa >= 0
+        dele = valid & (np.take_along_axis(ac, np.clip(fa, 0, None), 1) == 3)
+        runlen = _del_runlen(dele, pos)
+        cv = np.vstack([np.zeros((1, K), np.int32), np.cumsum(valid, 0, dtype=np.int32)])
+        cd = np.vstack([np.zeros((1, K), np.int32), np.cumsum(dele, 0, dtype=np.int32)])
+        del valid, fa, ac
+        for raw, bins, col in srcs:
+            sel = np.where(bins.contig.values == c)[0]
+            if not len(sel):
+                continue
+            st = bins.bin.values[sel] * BIN_BP
+            a, b = np.searchsorted(pos, st, "left"), np.searchsorted(pos, st + BIN_BP, "left")
+            mid = np.clip(np.searchsorted(pos, st + BIN_BP // 2), 0, len(pos) - 1)
+            nv, nd = (cv[b] - cv[a])[:, col], (cd[b] - cd[a])[:, col]
+            tern = np.asarray(raw[sel, K:2 * K])
+            code = _dist_code(np.asarray(raw[sel, 2 * K:3 * K]))
+            is_del = (nv > 0) & (nd >= 0.5 * nv)
+            is_pres = (nv > 0) & (nd == 0)
+            bucket = np.clip(np.searchsorted(LEN_EDGES_BP, runlen[mid][:, col], "right") - 1, 0, nb - 1)
+            for si, s in enumerate((-1, 0, 1)):
+                m = tern == s
+                np.add.at(cnt_del[:, si], bucket[m & is_del], 1)
+                cnt_pres[si] += int((m & is_pres).sum())
+                hist[f"del|{s}"] += np.bincount(code[m & is_del] + 1, minlength=DIST_CODES)
+                hist[f"present|{s}"] += np.bincount(code[m & is_pres] + 1, minlength=DIST_CODES)
+        print(f"  ternary obs {c}", flush=True)
+    return {"len_edges_bp": LEN_EDGES_BP, "states": [-1, 0, 1],
+            "del_by_len_counts": cnt_del.tolist(), "present_counts": cnt_pres.tolist(),
+            "dist_hist_offset": 1, "dist_hist": {k: v.tolist() for k, v in hist.items()}}
+
+
+DIST_CODES = 129        # code -1 (no anchor) .. 127, stored at index code + 1
+
+
+def _dist_code(dist_bp, scale=8.0):
+    """refmap bp distance -> the same log code ropebwt_npy_to_matrix.py writes (-1 = no anchor)."""
+    code = np.clip(np.rint(scale * np.log2(1.0 + np.maximum(dist_bp, 0))), 0, 127).astype(np.int64)
+    return np.where(dist_bp < 0, -1, code)
+
+
+def obs_table_from_stats(s):
+    """Simulator observation table (simulate_alleles --obs-table): among NON-matching
+    founders, P(-1) for deleted founders by run length and for present founders, and the
+    distance-code distribution for each (truth, observed state)."""
+    cd = np.asarray(s["del_by_len_counts"], float)
+    cp = np.asarray(s["present_counts"], float)
+    nm_del = cd[:, 0] + cd[:, 1]
+    p_del = np.where(nm_del > 0, cd[:, 0] / np.maximum(nm_del, 1), np.nan)
+    hist = {k: (np.asarray(v, float) / max(sum(v), 1)).tolist() for k, v in s["dist_hist"].items()
+            if not k.endswith("|1")}
+    return {"len_edges_bp": s["len_edges_bp"],
+            "p_minus1_given_del_by_len": p_del.tolist(),
+            "p_minus1_given_present": float(cp[0] / max(cp[0] + cp[1], 1)),
+            "p_match_given_del": float(cd[:, 2].sum() / max(cd.sum(), 1)),
+            "dist_code_offset": 1, "dist_code_pmf": hist}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", default=CALIB_MANIFEST)
@@ -214,6 +311,7 @@ def main():
                          "measured from a small simulate() run if omitted")
     ap.add_argument("--datasets", nargs="*", default=None, help="restrict to these dataset ids")
     ap.add_argument("--allow-eval-lines-for-code-testing", action="store_true")
+    ap.add_argument("--skip-ternary-obs", action="store_true", help="skip the refmap-ternary-vs-truth tables")
     args = ap.parse_args()
 
     rows = [r for r in csv.DictReader(open(args.manifest), delimiter="\t") if r["coverage"] == args.coverage
@@ -238,6 +336,7 @@ def main():
                 res["lines"][Path(tp).name.replace(".g.vcf.gz", "")] = gvcf_blocks(tp)
                 print(f"blocks {Path(tp).name}", flush=True)
 
+    aligned = []
     for r in rows:
         ds, ind = r["dataset_id"], r["individual"]
         d = [Path(p) for p in glob.glob(f"{args.align_root}/*__{ds}__{ind}__{args.coverage}x")
@@ -246,6 +345,8 @@ def main():
             print(f"SKIP {ds} {ind}: not aligned", flush=True)
             continue
         d = d[0]
+        if (d / "raw.npy").exists():
+            aligned.append(d)
         t1, t2 = fss.load_truth(r["truth_h1"]), fss.load_truth(r["truth_h2"])
         d1, o1 = truth_del(t1, ac, idx)
         d2, o2 = truth_del(t2, ac, idx)
@@ -261,6 +362,8 @@ def main():
         res["samples"][f"{ds}__{ind}"] = s
         print(f"sample {ds} {ind}", flush=True)
 
+    if aligned and not args.skip_ternary_obs:
+        res["ternary_obs"] = ternary_obs_stats(aligned, P)
     Path(args.out).write_text(json.dumps(res, indent=1))       # keep measurements even if the next step fails
 
     # ---------- suggested simulator parameters
@@ -305,6 +408,8 @@ def main():
           for s in res["samples"].values() if "2" in s.get("read_mix_by_dosage", {})]
     if cp:
         sug["repl_cross_present"] = float(np.nanmedian(cp))
+    if "ternary_obs" in res and bp_per_site:
+        sug["obs_table"] = dict(obs_table_from_stats(res["ternary_obs"]), bp_per_site=bp_per_site)
     res["suggested_sim_params"] = sug
     Path(args.out).write_text(json.dumps(res, indent=1))
     print(json.dumps(sug, indent=1))

@@ -14,6 +14,7 @@ from python.crf.simulate_alleles import (
     _indel_tracts, _draw_lineages, _coalescent_feats, _good_mask, simulate,
     _indel_suppressed_rate, _row_counts, _sample_rows, _indel_chunk,
     _lineage_indels, _overlay_indels, _lineage_substitutions, _replacement_indels,
+    _run_length, _refmap_observation,
 )
 
 # --- golden hashes: pre-change simulate() output on fixed args/seed, ------
@@ -1510,3 +1511,52 @@ def test_replacement_rows_are_placed_off_site_with_shift():
     a = _repl_sim(repl_shift_sites=0.0)
     b = _repl_sim(repl_shift_sites=200.0)
     assert not np.array_equal(a, b)
+
+
+def _obs_table(p_del=(0.3, 0.3, 0.4, 0.6, 0.7, 0.75), p_pres=0.1):
+    pmf = lambda lo, hi: [0.0] + [1.0 if lo <= c < hi else 0.0 for c in range(128)]
+    return {"len_edges_bp": [0, 100, 500, 1000, 4000, 20000, 10 ** 12],
+            "p_minus1_given_del_by_len": list(p_del), "p_minus1_given_present": p_pres,
+            "bp_per_site": 3000.0, "dist_code_offset": 1,
+            "dist_code_pmf": {"present|0": pmf(40, 60), "present|-1": pmf(90, 100),
+                              "del|0": pmf(70, 80), "del|-1": pmf(100, 110)}}
+
+
+def test_run_length_counts_each_run():
+    m = np.array([[0, 1, 1, 0, 1, 1, 1, 0, 0, 1]], bool)
+    assert _run_length(m).tolist() == [[0, 2, 2, 0, 3, 3, 3, 0, 0, 1]]
+
+
+def test_refmap_observation_rates_and_codes():
+    rng = np.random.default_rng(0)
+    dm = np.zeros((40, 6, 3000), bool)
+    dm[:, :, 100:110] = True                      # 10 sites * 3kb = 30kb run -> last bucket
+    dm[:, :, 500] = True                          # 1 site = 3kb -> 1-4kb bucket
+    od, code = _refmap_observation(rng, dm, 0, _obs_table())
+    assert not od[:, 0].any() and (code[:, 0] == 0).all()          # reference founder
+    long_ = dm[:, 1:, 100:110]
+    assert abs(od[:, 1:, 100:110][long_].mean() - 0.75) < 0.03
+    assert abs(od[:, 1:, 500].mean() - 0.6) < 0.05
+    pres = ~dm[:, 1:]
+    assert abs(od[:, 1:][pres].mean() - 0.1) < 0.01
+    c, o, d = code[:, 1:], od[:, 1:], dm[:, 1:]
+    assert ((c[~d & ~o] >= 40) & (c[~d & ~o] < 60)).all()
+    assert ((c[~d & o] >= 90) & (c[~d & o] < 100)).all()
+    assert ((c[d & o] >= 100) & (c[d & o] < 110)).all()
+
+
+def test_obs_table_changes_only_observation_not_reads():
+    kw = dict(windows=2, sites=6000, founders=12, min_cross=2, max_cross=4, inbreeding=1.0,
+              allele_sharing=0.2, bad_frac=0.05, sharing_model="coalescent", ancestors=4,
+              sharing_theta=4.0, simulate_indels=True, indel_model="overlay", indel_coverage=2.0,
+              indel_region_mult=2)
+    K = 12
+    a = simulate(np.random.default_rng(3), **kw)[0]
+    b = simulate(np.random.default_rng(3), obs_table=_obs_table(), **kw)[0]
+    ta, tb = a[..., :K], b[..., :K]
+    live = ta != TERN_PAD
+    assert np.array_equal(live, tb != TERN_PAD)
+    # rows and matches are the same reads; only -1/0 of non-matching founders and distances change
+    assert np.array_equal(ta == TERN_MATCH, tb == TERN_MATCH)
+    assert np.array_equal(a[..., K:K + 2], b[..., K:K + 2])
+    assert ((tb[live] == TERN_DEL) != (ta[live] == TERN_DEL)).any()

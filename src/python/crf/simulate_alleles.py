@@ -401,6 +401,67 @@ def _gather_by_lineage(a_lin, lineage):
     return np.take_along_axis(a_lin, lineage.astype(np.intp), axis=1)
 
 
+def _run_length(mask):
+    """Length (in sites) of the contiguous True run covering each True cell along the
+    last axis, 0 elsewhere. Runs that touch the array edge count only the visible part."""
+    R = mask.shape[-1]
+    idx = np.arange(R)
+    last = np.maximum.accumulate(np.where(mask, -1, idx), axis=-1)
+    nxt = np.minimum.accumulate(np.where(mask[..., ::-1], R, idx[::-1]), axis=-1)[..., ::-1]
+    return np.where(mask, nxt - last - 1, 0).astype(np.int64)
+
+
+def _load_obs_table(path):
+    """--obs-table JSON: either a bare table or measure_real_stats.py output
+    (suggested_sim_params.obs_table). None -> exact observation (default)."""
+    if not path:
+        return None
+    import json
+    t = json.loads(Path(path).read_text())
+    t = t.get("suggested_sim_params", t)
+    t = t.get("obs_table", t)
+    for k in ("len_edges_bp", "p_minus1_given_del_by_len", "p_minus1_given_present",
+              "dist_code_pmf", "bp_per_site"):
+        if k not in t:
+            raise SystemExit(f"--obs-table {path}: missing '{k}'")
+    return t
+
+
+def _refmap_observation(rng, del_kt, ref_founder, obs):
+    """Real-refmap-like per-(founder, site) observation of the deletion state, from the
+    tables measure_real_stats.py builds on the calibration corpus (`obs_table`).
+
+    refmap does not see deletions directly: a non-matching founder reads -1 when its
+    nearest lift anchor is > 2kb away, which misses many true deletions (short ones,
+    and ones whose sequence the founder carries elsewhere) and fires on some present
+    founders (anchor-poor repeats). So: P(-1) for a truly deleted founder depends on its
+    deletion-run length (sites * bp_per_site, bucketed as in the table), a present
+    founder reads -1 with p_minus1_given_present, and the log-coded anchor distance is
+    drawn from the measured distribution for (truth, observed state). Both are properties
+    of the founder at the site, like refmap's, not of any read.
+
+    Returns obs_del [n,K,R] bool and code [n,K,R] int8.
+    """
+    edges = np.asarray(obs["len_edges_bp"], dtype=np.float64)
+    p_del = np.nan_to_num(np.asarray(obs["p_minus1_given_del_by_len"], dtype=np.float64), nan=0.0)
+    L = _run_length(del_kt) * float(obs["bp_per_site"])
+    b = np.clip(np.searchsorted(edges, L, "right") - 1, 0, p_del.size - 1)
+    p = np.where(del_kt, p_del[b], float(obs["p_minus1_given_present"]))
+    obs_del = rng.random(del_kt.shape) < p
+    off = int(obs.get("dist_code_offset", 1))
+    code = np.zeros(del_kt.shape, dtype=np.int8)
+    u = rng.random(del_kt.shape)
+    for key, m in (("present|0", ~del_kt & ~obs_del), ("present|-1", ~del_kt & obs_del),
+                   ("del|0", del_kt & ~obs_del), ("del|-1", del_kt & obs_del)):
+        cdf = np.cumsum(np.asarray(obs["dist_code_pmf"][key], dtype=np.float64))
+        cdf /= cdf[-1]
+        code[m] = (np.searchsorted(cdf, u[m], "right") - off).clip(-1, DIST_SAT - 1).astype(np.int8)
+    if ref_founder >= 0:
+        obs_del[:, ref_founder, :] = False
+        code[:, ref_founder, :] = 0
+    return obs_del, code
+
+
 def _indel_tracts(rng, n, M, R, density, ins_frac, large_frac, small_alpha,
                    small_max, large_logmean, large_logsd, max_len):
     """Per-LINEAGE indel structure over an R-site generation region
@@ -994,7 +1055,8 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   match1, match2, gamete_balance, coverage, ins_read_per_bp,
                   max_stack, anchor_thresh, ref_founder, dist_scale,
                   coverage_model="linear", read_len=150, collapse_rows=False,
-                  rep_grp=None, rep_shift=0.0, rep_cross_del=0.0, rep_cross_present=0.0):
+                  rep_grp=None, rep_shift=0.0, rep_cross_del=0.0, rep_cross_present=0.0,
+                  obs_table=None):
     """Assemble one chunk's indel-mode output:
     `(tern, dist, count [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T]
     int32, short [n] bool, n_either int, n_hemi int, n_null int)`. `count`
@@ -1144,6 +1206,10 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
     else:
         w, t, r, o, short = _sample_rows(cnt, T)
 
+    obs_del = obs_code = None
+    if obs_table is not None:   # drawn after the reads, so --obs-table changes only the observation
+        obs_del, obs_code = _refmap_observation(rng, dist_kt > anchor_thresh, ref_founder, obs_table)
+
     tern_out = np.full((n, T, K), TERN_PAD, dtype=np.int8)
     dist_out = np.full((n, T, K), DIST_PAD, dtype=np.int8)
     count_out = np.full((n, T, K), 0, dtype=np.int8)   # 0 = no PAD sentinel needed, itself informative
@@ -1199,10 +1265,20 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
         # match founders deleted at the placed site; other kinds keep the
         # original override so their output is unchanged.
         deleted = deleted & ~(is_rep[:, None] & (tern_rows == 1))
-        tern_rows = np.where(deleted, TERN_DEL, tern_rows).astype(np.int8)
+        if obs_del is None:
+            tern_rows = np.where(deleted, TERN_DEL, tern_rows).astype(np.int8)
+            dist_rows = _encode_dist(dist_row, dist_scale)
+        else:
+            # --obs-table: a truly deleted founder still can't match a collinear read, but
+            # whether a non-matching founder reads -1 or 0 (and its distance code) is the
+            # refmap-like observation, not the truth.
+            nonmatch = (tern_rows != 1) | deleted
+            tern_rows = np.where(nonmatch, np.where(obs_del[w, :, t], TERN_DEL, TERN_DIV),
+                                 TERN_MATCH).astype(np.int8)
+            dist_rows = obs_code[w, :, t]
 
         tern_out[w, r] = tern_rows
-        dist_out[w, r] = _encode_dist(dist_row, dist_scale)
+        dist_out[w, r] = dist_rows
         lab1_out[w, r] = h1[w, t].astype(np.int8)
         lab2_out[w, r] = h2[w, t].astype(np.int8)
         refpos_out[w, r] = t
@@ -1276,7 +1352,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              repl_max_share=22, repl_groups_mean=1.5, repl_shift_sites=0.0,
              repl_cross_del=0.0, repl_cross_present=0.0, subst_model="dense",
              subst_rate=0.018, coverage_model="linear", read_len=150,
-             emit_read_counts=False, collapse_rows=False):
+             emit_read_counts=False, collapse_rows=False, obs_table=None):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
     (default) behavior, including rng draw order, is byte-for-byte
@@ -1510,7 +1586,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 collapse_rows,
                 rep_grp=rep_grp if indel_model == "replacement" else None,
                 rep_shift=repl_shift_sites, rep_cross_del=repl_cross_del,
-                rep_cross_present=repl_cross_present)
+                rep_cross_present=repl_cross_present, obs_table=obs_table)
 
             out[sl, :, :K] = tern
             out[sl, :, K] = lab1
@@ -1759,6 +1835,10 @@ def parse_args():
     p.add_argument("--repl-cross-present", type=float, default=0.0,
                    help="--indel-model replacement: chance a replacement read also matches "
                         "a founder that keeps the B73 sequence (TE copies elsewhere)")
+    p.add_argument("--obs-table", default=None,
+                   help="indel mode: JSON observation table from measure_real_stats.py -- draw each "
+                        "non-matching founder's -1/0 state and distance code the way real refmap "
+                        "reports them instead of from the true deletion state (default: exact)")
     p.add_argument("--indel-model", choices=["tracts", "lineage", "overlay", "replacement"],
                    default="tracts",
                    help="How indel structure is generated (v3, "
@@ -2164,6 +2244,7 @@ def main():
         repl_max_share=args.repl_max_share, repl_groups_mean=args.repl_groups_mean,
         repl_shift_sites=args.repl_shift_sites, repl_cross_del=args.repl_cross_del,
         repl_cross_present=args.repl_cross_present,
+        obs_table=_load_obs_table(args.obs_table),
         subst_model=args.subst_model, subst_rate=args.subst_rate,
         coverage_model=args.indel_coverage_model, read_len=args.indel_read_len_bp,
         emit_read_counts=args.emit_read_counts,
