@@ -41,9 +41,9 @@ SCOPES = {"out": ["OUT-INBRED", "OUT-HYB", "OUT-RIL2"],
           "mix": ["MIX-HYB", "MIX-RIL", "MIX-RIL2"]}
 
 
-def source_dir(ds, ind, DEPTH):
+def source_dir(ds, ind, DEPTH, input_glob="scratch/*_snprc"):
     """Any existing row dir for this sample with a complete model input."""
-    for d in sorted(glob.glob(str(WORK / f"scratch/*_snprc/*__{ds}__{ind}__{DEPTH}x"))):
+    for d in sorted(glob.glob(str(WORK / f"{input_glob}/*__{ds}__{ind}__{DEPTH}x"))):
         d = Path(d)
         if all((d / f).exists() for f in ("windowed_k25native_wcount.npy",
                                            "raw.npy.bins.tsv", "raw.npy.gametes.tsv")):
@@ -63,6 +63,9 @@ def main():
                          "or the router's choice with --route)")
     ap.add_argument("--decode", choices=["viterbi", "marginal"], default="viterbi")
     ap.add_argument("--depth", default="0.1")
+    ap.add_argument("--input-glob", default="scratch/*_snprc",
+                    help="row dirs holding the aligned model input, relative to WORK "
+                         "(e.g. scratch/lift_s200_local20k for the -s 200 + adaptive alignment)")
     ap.add_argument("--route", action="store_true",
                     help="pick homo_scale and switch_scale per sample with route_real_sample")
     args = ap.parse_args()
@@ -86,7 +89,7 @@ def main():
                 continue
             t0 = time.time()
             try:
-                src = source_dir(ds, ind, DEPTH)
+                src = source_dir(ds, ind, DEPTH, args.input_glob)
             except FileNotFoundError as e:
                 print(f"SKIP {e}", flush=True)
                 continue

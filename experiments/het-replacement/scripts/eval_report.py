@@ -40,11 +40,11 @@ METRICS = [("error_rate", "all", 100), ("snprc_error_rate", "SNP+RC", 100),
            ("del_event_strict_acc", "DELevents", 100), ("false_del_events", "falseDEL", 1)]
 
 
-def run_eval(tag, ckpt, route, depth, gpu):
+def run_eval(tag, ckpt, route, depth, gpu, input_glob):
     if all(glob.glob(str(WORK / f"results/{tag}_{s}_fast/*.json")) for s in SCOPES):
         return
     cmd = [PY, str(SCRIPTS / "fast_eval_ckpt.py"), "--tag", tag, "--ckpt", ckpt, "--depth", depth,
-           "--scope", *SCOPES] + (["--route"] if route else [])
+           "--scope", *SCOPES, "--input-glob", input_glob] + (["--route"] if route else [])
     subprocess.run(cmd, check=True, env={**__import__("os").environ, "CUDA_VISIBLE_DEVICES": gpu})
 
 
@@ -87,13 +87,15 @@ def main():
     ap.add_argument("--depth", default="0.1")
     ap.add_argument("--gpu", default="0")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--input-glob", default="scratch/lift_s200_local20k",
+                    help="aligned eval-corpus row dirs (default: -s 200 lift + adaptive projection)")
     args = ap.parse_args()
 
     tags = []
     for spec in args.run:
         tag, rest = spec.split("=", 1)
         ckpt, _, flag = rest.partition(":")
-        run_eval(tag, ckpt, flag == "route", args.depth, args.gpu)
+        run_eval(tag, ckpt, flag == "route", args.depth, args.gpu, args.input_glob)
         tags.append(tag)
     tags += args.compare
 

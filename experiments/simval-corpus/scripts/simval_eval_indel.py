@@ -69,7 +69,8 @@ def prep_fastq(r1_gz, r2_gz, out_fastq):
     return out_fastq
 
 
-def run_refmap_anchordist(sample, reads_fastq, outdir, threads="20"):
+def run_refmap_anchordist(sample, reads_fastq, outdir, threads="20", refmap_bin=None, lift=None,
+                          lift_local_win=None):
     """refmap --anchor-dist-npy: writes raw.npy as the FLAT [n_bins, 3K+2]
     (count|ternary|distance|gA,gB) export directly -- the windowed
     [N,512,3K+2] training/eval contract is a SEPARATE second stage
@@ -85,11 +86,13 @@ def run_refmap_anchordist(sample, reads_fastq, outdir, threads="20"):
         print(f"  [{sample}] anchor-dist refmap output already exists, skipping")
         return npy_path
 
-    cmd = [str(ANCHORDIST_BIN), "refmap", "--ref-prefix=B73", "--max-occ=-1", "-l", "19",
-           f"--lift={hae.nb.LIFT}", "-t", threads,
+    cmd = [str(refmap_bin or ANCHORDIST_BIN), "refmap", "--ref-prefix=B73", "--max-occ=-1", "-l", "19",
+           f"--lift={lift or hae.nb.LIFT}", "-t", threads,
            f"--label-bed={labels_path}", f"--ps4g={ps4g_path}", f"--npy={npy_path}",
-           "--anchor-dist-npy", f"--anchor-dist-thresh={ANCHOR_DIST_THRESH}",
-           str(hae.nb.FMD), str(reads_fastq)]
+           "--anchor-dist-npy", f"--anchor-dist-thresh={ANCHOR_DIST_THRESH}"]
+    if lift_local_win:
+        cmd.append(f"--lift-local-win={lift_local_win}")
+    cmd += [str(hae.nb.FMD), str(reads_fastq)]
     print(f"  [{sample}] running: {' '.join(cmd)}")
     t0 = time.time()
     with open(tsv_path, "w") as out_f:
@@ -186,7 +189,9 @@ def do_align(args):
     fastq = prep_fastq(args.r1, args.r2, outdir / "reads.fastq")
     t_prep = time.time()
 
-    raw_npy = run_refmap_anchordist(args.sample, fastq, outdir, threads=str(args.threads))
+    raw_npy = run_refmap_anchordist(args.sample, fastq, outdir, threads=str(args.threads),
+                                    refmap_bin=args.refmap_bin, lift=args.lift,
+                                    lift_local_win=args.lift_local_win)
     t_refmap = time.time()
     if not args.no_cleanup:
         fastq.unlink(missing_ok=True)
@@ -308,6 +313,11 @@ def main():
     ap.add_argument("--coverage", default=None)
     ap.add_argument("--dataset-class", default=None)
     ap.add_argument("--kind", default=None)
+    ap.add_argument("--refmap-bin", default=None, help="refmap binary (default ANCHORDIST_BIN)")
+    ap.add_argument("--lift", default=None, help="lift file (default the -s 2000 v2 lift)")
+    ap.add_argument("--lift-local-win", type=int, default=None,
+                    help="refmap --lift-local-win (adaptive projection; needs the "
+                         "lift-adaptive-projection binary)")
     ap.add_argument("--homo-scale-override", type=float, default=None,
                     help="Diagnostic only: force homo_scale (0=inbred/RIL, 1=hybrid) "
                          "instead of the p90 classifier.")
