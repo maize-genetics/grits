@@ -20,6 +20,14 @@
   `grits_workdir/data/maize_v2_calib/` (AnchorWave, per-sample work dirs). IDX
   datasets (CML247, Ki3, M162W, Tzi8, NC350) building now; OUT/MIX follow once
   the truth builds finish.
+- **2026-09-25** — Priority check (the "does the model fail on simulated data
+  too?" test): ternary-baseline on 40 held-out *simulated* hybrids calls
+  heterozygous deletions right 76.0% of the time (vs 44.5% on real OUT hybrids at
+  the same settings), and simulated data contains **no** homozygous deletions
+  (0.0% of rows vs 24.5% of real hybrid sites) because overlay indels are drawn
+  per founder independently. The data gap dominates, so §2.3 (lineage-shared
+  replacements) now comes before §2.4; §2.4 stays but is re-tested after the
+  simulator change.
 
 ## 1. Why
 
