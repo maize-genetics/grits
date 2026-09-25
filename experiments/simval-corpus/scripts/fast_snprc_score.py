@@ -248,7 +248,38 @@ def score_arrays(panel, t1, t2, f1, f2):
     i_cls = classify_pair(acls[rows, i1[m]], acls[rows, i2[m]])
     snprc = (t_cls <= 1) & (i_cls <= 1)
     compared = int(m.sum())
+    # compare_diploid's class_breakdown: classes by the TRUTH multiset
+    classes = {}
+    for ci, cname in enumerate(("HOMREF", "SNP", "INS", "DEL", "HET_MIXED")):
+        sel = t_cls == ci
+        classes[f"class_total_{cname}"] = int(sel.sum())
+        classes[f"class_mismatch_{cname}"] = int((sel & ~match).sum())
+    # Event view of deletion spans (per-site scoring weights a 50kb replacement
+    # block ~thousands of times): each maximal run of consecutive compared sites
+    # whose TRUTH class is DEL is one event; likewise each run where the IMPUTED
+    # class is DEL but truth is not is one false-deletion event.
+    chrom = panel.chrom[rows]
+
+    def runs(flag):
+        start = flag & ~np.concatenate([[False], flag[:-1] & (chrom[1:] == chrom[:-1])])
+        rid = np.cumsum(start) - 1
+        return rid[flag], int(start.sum())
+
+    tdel = t_cls == 3
+    rid, n_del = runs(tdel)
+    if n_del:
+        tot = np.bincount(rid, minlength=n_del)
+        ok = np.bincount(rid, weights=match[tdel].astype(float), minlength=n_del)
+        del_strict, del_frac = float((ok == tot).mean()), float((ok / tot).mean())
+    else:
+        del_strict = del_frac = None
+    _, n_false_del = runs((i_cls == 3) & ~tdel)
+    nd = ~tdel
+    events = {"del_events": n_del, "del_event_strict_acc": del_strict,
+              "del_event_mean_frac_correct": del_frac, "false_del_events": n_false_del,
+              "error_rate_outside_truth_del": 1 - match[nd].sum() / nd.sum() if nd.any() else None}
     return {
+        **classes, **events,
         "compared_sites": compared,
         "gt_allele_matches": int(match.sum()),
         "partial_credit_sum": float(partial.sum()),
