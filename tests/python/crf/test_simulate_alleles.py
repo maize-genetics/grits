@@ -13,7 +13,7 @@ from python.crf.simulate_alleles import (
     _indel_lengths, _encode_dist, _anchor_distance, _gather_by_lineage,
     _indel_tracts, _draw_lineages, _coalescent_feats, _good_mask, simulate,
     _indel_suppressed_rate, _row_counts, _sample_rows, _indel_chunk,
-    _lineage_indels, _overlay_indels, _lineage_substitutions,
+    _lineage_indels, _overlay_indels, _lineage_substitutions, _replacement_indels,
 )
 
 # --- golden hashes: pre-change simulate() output on fixed args/seed, ------
@@ -1461,3 +1461,52 @@ def test_simulate_collapse_rows_off_by_default_matches_grouped_count():
     out_default = simulate(np.random.default_rng(5), **kw)[0]
     out_explicit_false = simulate(np.random.default_rng(5), collapse_rows=False, **kw)[0]
     np.testing.assert_array_equal(out_default, out_explicit_false)
+
+
+# --- --indel-model replacement (experiments/het-replacement/PLAN.md §2.3) ---
+
+def test_replacement_indels_sharing_and_groups():
+    rng = np.random.default_rng(0)
+    n, K, R = 3, 25, 4000
+    del_mask, rep_grp = _replacement_indels(rng, n, K, R, rate=2e-3, mean_len=40.0,
+                                            max_share=10, groups_mean=2.0, max_len=500)
+    assert del_mask.shape == rep_grp.shape == (n, K, R)
+    np.testing.assert_array_equal(del_mask, rep_grp >= 0)
+    k = del_mask.sum(1)
+    assert k.max() >= 2, "tracts must be shared by several founders"
+    assert np.bincount(k.ravel())[1:].sum() > 0
+
+
+def _repl_sim(**kw):
+    base = dict(windows=4, sites=20000, founders=12, min_cross=2, max_cross=6, inbreeding=0.0,
+                allele_sharing=0.2, bad_frac=0.05, sharing_model="coalescent", ancestors=6,
+                sharing_theta=4.0, simulate_indels=True, indel_coverage=2.0, indel_region_mult=2,
+                indel_model="replacement", repl_rate=5e-3, repl_mean_len=60.0, repl_max_share=8)
+    base.update(kw)
+    return simulate(np.random.default_rng(1), **base)[0]
+
+
+def test_replacement_rows_exist_where_both_founders_are_deleted():
+    K = 12
+    out = _repl_sim()
+    dist, h1, h2 = out[..., K + 2:2 * K + 2], out[..., K].astype(int), out[..., K + 1].astype(int)
+    dele = dist > 0
+    g = lambda f: np.take_along_axis(dele, np.clip(f, 0, K - 1)[..., None], 2)[..., 0]
+    both = g(h1) & g(h2) & (h1 >= 0)
+    assert both.any(), "a site where both haplotypes lack the B73 sequence must still yield rows"
+
+
+def test_replacement_rows_keep_matches_at_deleted_founders():
+    K = 12
+    out = _repl_sim()
+    tern, dist = out[..., :K], out[..., K + 2:2 * K + 2]
+    # overlay/tracts rows never show MATCH at a founder deleted at the row's site;
+    # replacement rows must (refmap marks set members MATCH regardless of distance)
+    assert ((tern == TERN_MATCH) & (dist > 0)).any()
+
+
+def test_replacement_rows_are_placed_off_site_with_shift():
+    K = 12
+    a = _repl_sim(repl_shift_sites=0.0)
+    b = _repl_sim(repl_shift_sites=200.0)
+    assert not np.array_equal(a, b)

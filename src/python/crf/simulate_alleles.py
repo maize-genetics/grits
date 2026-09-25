@@ -575,6 +575,45 @@ def _overlay_indels(rng, n, K, R, rate, mean_len, ins_frac, founder_freq, max_le
     return del_mask, ins_bp
 
 
+def _replacement_indels(rng, n, K, R, rate, mean_len, max_share, groups_mean, max_len):
+    """`--indel-model replacement` (experiments/het-replacement/PLAN.md §2.3):
+    B73 sequence REPLACED in a subset of founders, as in real maize where
+    AnchorWave-derived gVCFs mark ~37-41% of B73 bp deleted and an equal amount
+    inserted at the same loci (TE turnover), not simply missing.
+
+    Each tract (Poisson(rate * R) per window, LogNormal length with median
+    `mean_len`) deletes the B73 sequence in a subset of 1..`max_share` founders
+    drawn UNIFORMLY -- the real panel's sharing spectrum is nearly flat from 1 to
+    ~20 of 25 founders (a random founder pair: 21% both deleted, 34% exactly one,
+    matching real hybrids), unlike the per-founder-independent overlay model
+    (which never yields a shared deletion). The deleted founders are split into
+    1 + Poisson(groups_mean - 1) replacement groups: founders in the same group
+    carry the same replacement sequence, so a replacement read matches them.
+
+    Returns `(del_mask[n,K,R] bool, rep_grp[n,K,R] int8)`, rep_grp = -1 where the
+    founder keeps the B73 sequence. Group ids are only compared between founders
+    at the same site, so they wrap in int8.
+    """
+    del_mask = np.zeros((n, K, R), dtype=bool)
+    rep_grp = np.full((n, K, R), -1, dtype=np.int8)
+    max_share = int(np.clip(max_share, 1, K))
+    n_tr = rng.poisson(rate * R, n)
+    gid = 0
+    for w in range(n):
+        for _ in range(n_tr[w]):
+            L = int(np.clip(np.rint(rng.lognormal(np.log(max(mean_len, 1.0)), 0.7)), 1, max_len))
+            st = int(rng.integers(0, R))
+            en = min(R, st + L)
+            s = int(rng.integers(1, max_share + 1))
+            who = rng.choice(K, s, replace=False)
+            g = int(min(s, 1 + rng.poisson(max(groups_mean - 1.0, 0.0))))
+            lab = rng.integers(0, g, s)
+            del_mask[w, who, st:en] = True
+            rep_grp[w, who, st:en] = ((gid + lab) % 120).astype(np.int8)[:, None]
+            gid += g
+    return del_mask, rep_grp
+
+
 def _indel_suppressed_rate(rate, del_mask, ins_bp, suppress, flank):
     """Recomb-rate map [n, R] with crossover locally suppressed near
     indels (PLAN.md SS2.6), reusing the EXISTING `--recomb-span` rate-map
@@ -954,7 +993,8 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
 def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   match1, match2, gamete_balance, coverage, ins_read_per_bp,
                   max_stack, anchor_thresh, ref_founder, dist_scale,
-                  coverage_model="linear", read_len=150, collapse_rows=False):
+                  coverage_model="linear", read_len=150, collapse_rows=False,
+                  rep_grp=None, rep_shift=0.0, rep_cross_del=0.0, rep_cross_present=0.0):
     """Assemble one chunk's indel-mode output:
     `(tern, dist, count [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T]
     int32, short [n] bool, n_either int, n_hemi int, n_null int)`. `count`
@@ -1051,6 +1091,31 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                                          gamete_balance, coverage,
                                          ins_read_per_bp, max_stack,
                                          coverage_model, read_len)
+    # Replacement reads (--indel-model replacement): a haplotype whose founder
+    # lacks the B73 sequence at a site still carries its replacement sequence,
+    # sampled at the colinear coverage. Real refmap PLACES such reads onto B73
+    # via lift anchors -- often shifted (measured 10-100kb) -- and they match the
+    # founders carrying the same replacement. rs1/rs2 = source site of the
+    # replacement read placed at each (window, site), -1 if none.
+    rs1 = rs2 = None
+    if rep_grp is not None:
+        zero = np.zeros_like(c1)
+        g1 = rep_grp[ii, h1, tt]
+        g2 = rep_grp[ii, h2, tt]
+        r1, r2, _, _, _ = _row_counts(rng, ~pres1 & (g1 >= 0), ~pres2 & (g2 >= 0), zero, zero,
+                                      gamete_balance, coverage, 0.0, max_stack,
+                                      coverage_model, read_len)
+
+        def place(r):
+            src = np.full((n, R), -1, dtype=np.int64)
+            wi, ti = np.nonzero(r)
+            dest = ti if rep_shift <= 0 else np.clip(
+                ti + np.rint(rng.laplace(0.0, rep_shift, ti.size)).astype(np.int64), 0, R - 1)
+            src[wi, dest] = ti
+            return src
+
+        rs1, rs2 = place(r1), place(r2)
+        cnt = cnt + (rs1 >= 0) + (rs2 >= 0)
     if collapse_rows:
         # branch indel-readcount-row-collapse: collapse SAME-KIND row stacks
         # at a site into ONE row before sampling, instead of after (the
@@ -1073,6 +1138,8 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
         # stay as separate rows, unlike the grouped-count sibling design).
         groupcnt = (on1.astype(np.int32) + on2.astype(np.int32) +
                     (c1 > 0).astype(np.int32) + (c2 > 0).astype(np.int32))
+        if rs1 is not None:
+            groupcnt = groupcnt + (rs1 >= 0) + (rs2 >= 0)
         w, t, r, o, short = _sample_rows(groupcnt, T)
     else:
         w, t, r, o, short = _sample_rows(cnt, T)
@@ -1092,6 +1159,10 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
         else:
             b3 = b2 + c1[w, t].astype(np.int64)
         kind = np.where(o < b1, 0, np.where(o < b2, 1, np.where(o < b3, 2, 3)))
+        if rs1 is not None:
+            b4 = b3 + ((c2[w, t] > 0) if collapse_rows else c2[w, t]).astype(np.int64)
+            b5 = b4 + (rs1[w, t] >= 0)
+            kind = np.where(o < b4, kind, np.where(o < b5, 4, 5))
 
         tern_rows = np.zeros((w.size, K), dtype=np.int8)
         for k_id, mt in ((0, match1), (1, match2)):
@@ -1104,8 +1175,30 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                 tern_rows[sel] = (lineage[w[sel], :, t[sel]] ==
                                    ml[w[sel], t[sel]][:, None]).astype(np.int8)
 
+        is_rep = np.zeros(w.size, dtype=bool)
+        if rs1 is not None:
+            for k_id, rs, hh in ((4, rs1, h1), (5, rs2, h2)):
+                sel = kind == k_id
+                if not sel.any():
+                    continue
+                ws, src = w[sel], rs[w[sel], t[sel]]
+                gsrc = rep_grp[ws, hh[ws, src], src]
+                grp_at = rep_grp[ws, :, src]                    # [rows,K]
+                m = grp_at == gsrc[:, None]
+                if rep_cross_del > 0:
+                    m |= (grp_at >= 0) & (rng.random(m.shape) < rep_cross_del)
+                if rep_cross_present > 0:
+                    m |= (grp_at < 0) & (rng.random(m.shape) < rep_cross_present)
+                tern_rows[sel] = m.astype(np.int8)
+                is_rep |= sel
+
         dist_row = dist_kt[w, :, t]                           # [Rows,K]
         deleted = dist_row > anchor_thresh
+        # refmap: a founder in the read's matched set is MATCH regardless of its
+        # anchor distance (rb3_lift_ternary_state). Only replacement rows can
+        # match founders deleted at the placed site; other kinds keep the
+        # original override so their output is unchanged.
+        deleted = deleted & ~(is_rep[:, None] & (tern_rows == 1))
         tern_rows = np.where(deleted, TERN_DEL, tern_rows).astype(np.int8)
 
         tern_out[w, r] = tern_rows
@@ -1133,7 +1226,7 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
             # -- so its weight is just how many real reads that kind's
             # stack represented: 1 for on1/on2 (never stacked -- boolean
             # presence), the real c1/c2 draw for insertion-derived rows.
-            weight = np.where(kind <= 1, 1,
+            weight = np.where((kind <= 1) | (kind >= 4), 1,
                                np.where(kind == 2, c1[w, t], c2[w, t])).astype(np.int64)
             count_rows = np.repeat(weight[:, None], K, axis=1)          # [Rows,K]
         else:
@@ -1179,7 +1272,9 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              indel_recomb_flank=32, indel_anchor_thresh=0,
              indel_ref_founder=-1, indel_lineage_frac=0.15,
              indel_overlay_rate=2.3e-3, indel_overlay_mean_len=300.0,
-             indel_overlay_founder_freq=1.0, subst_model="dense",
+             indel_overlay_founder_freq=1.0, repl_rate=2e-4, repl_mean_len=500.0,
+             repl_max_share=22, repl_groups_mean=1.5, repl_shift_sites=0.0,
+             repl_cross_del=0.0, repl_cross_present=0.0, subst_model="dense",
              subst_rate=0.018, coverage_model="linear", read_len=150,
              emit_read_counts=False, collapse_rows=False):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
@@ -1252,8 +1347,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                           "(collapsing rows without exposing the count that "
                           "explains what got merged would silently discard "
                           "depth information)")
-    if indel_model not in ("tracts", "lineage", "overlay"):
-        raise ValueError(f"indel_model must be one of tracts/lineage/overlay, "
+    if indel_model not in ("tracts", "lineage", "overlay", "replacement"):
+        raise ValueError(f"indel_model must be one of tracts/lineage/overlay/replacement, "
                           f"got {indel_model!r}")
     if subst_model not in ("dense", "sparse"):
         raise ValueError(f"subst_model must be 'dense' or 'sparse', got {subst_model!r}")
@@ -1338,6 +1433,14 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                     rng, n, K, M, R, lineage, indel_lineage_frac,
                     indel_ins_frac, indel_max_len)
                 lineage_indel, M_indel = lineage, M
+            elif indel_model == "replacement":
+                del_lin, rep_grp = _replacement_indels(
+                    rng, n, K, R, repl_rate, repl_mean_len, repl_max_share,
+                    repl_groups_mean, indel_max_len)
+                ins_lin = np.zeros((n, K, R), dtype=np.int32)
+                lineage_indel = np.broadcast_to(
+                    np.arange(K, dtype=np.int32)[None, :, None], (n, K, R))
+                M_indel = K
             else:  # "overlay" -- decoupled from the coalescent lineage array
                 del_lin, ins_lin = _overlay_indels(
                     rng, n, K, R, indel_overlay_rate, indel_overlay_mean_len,
@@ -1404,7 +1507,10 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 match1, match2, gamete_balance, indel_coverage,
                 indel_ins_read_per_bp, indel_max_stack, indel_anchor_thresh,
                 indel_ref_founder, DIST_LOG_SCALE, coverage_model, read_len,
-                collapse_rows)
+                collapse_rows,
+                rep_grp=rep_grp if indel_model == "replacement" else None,
+                rep_shift=repl_shift_sites, rep_cross_del=repl_cross_del,
+                rep_cross_present=repl_cross_present)
 
             out[sl, :, :K] = tern
             out[sl, :, K] = lab1
@@ -1633,7 +1739,27 @@ def parse_args():
                         "structure (mean event ~530bp, bp-dominant class 4-64kb) needs "
                         "a much larger --sites (8192+) to be meaningfully represented "
                         "in a single window.")
-    p.add_argument("--indel-model", choices=["tracts", "lineage", "overlay"],
+    p.add_argument("--repl-rate", type=float, default=2e-4,
+                   help="--indel-model replacement: replacement tracts per site (placeholder, "
+                        "calibrate from experiments/het-replacement §2.2)")
+    p.add_argument("--repl-mean-len", type=float, default=500.0,
+                   help="--indel-model replacement: median tract length in sites")
+    p.add_argument("--repl-max-share", type=int, default=22,
+                   help="--indel-model replacement: max founders sharing one tract "
+                        "(sharing count drawn uniformly from 1..this)")
+    p.add_argument("--repl-groups-mean", type=float, default=1.5,
+                   help="--indel-model replacement: mean distinct replacement sequences "
+                        "among a tract's deleted founders")
+    p.add_argument("--repl-shift-sites", type=float, default=0.0,
+                   help="--indel-model replacement: Laplace scale (sites) of the placement "
+                        "shift of replacement reads (0 = placed at the true site)")
+    p.add_argument("--repl-cross-del", type=float, default=0.0,
+                   help="--indel-model replacement: chance a replacement read also matches "
+                        "a deleted founder from a different replacement group")
+    p.add_argument("--repl-cross-present", type=float, default=0.0,
+                   help="--indel-model replacement: chance a replacement read also matches "
+                        "a founder that keeps the B73 sequence (TE copies elsewhere)")
+    p.add_argument("--indel-model", choices=["tracts", "lineage", "overlay", "replacement"],
                    default="tracts",
                    help="How indel structure is generated (v3, "
                         "experiments/simulator-indels/PLAN.md v3 section). "
@@ -2034,6 +2160,10 @@ def main():
         indel_overlay_rate=args.indel_overlay_rate,
         indel_overlay_mean_len=args.indel_overlay_mean_len,
         indel_overlay_founder_freq=args.indel_overlay_founder_freq,
+        repl_rate=args.repl_rate, repl_mean_len=args.repl_mean_len,
+        repl_max_share=args.repl_max_share, repl_groups_mean=args.repl_groups_mean,
+        repl_shift_sites=args.repl_shift_sites, repl_cross_del=args.repl_cross_del,
+        repl_cross_present=args.repl_cross_present,
         subst_model=args.subst_model, subst_rate=args.subst_rate,
         coverage_model=args.indel_coverage_model, read_len=args.indel_read_len_bp,
         emit_read_counts=args.emit_read_counts,

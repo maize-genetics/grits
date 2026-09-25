@@ -28,6 +28,17 @@
   per founder independently. The data gap dominates, so §2.3 (lineage-shared
   replacements) now comes before §2.4; §2.4 stays but is re-tested after the
   simulator change.
+- **2026-09-25** — §2.3 first implementation: `--indel-model replacement`
+  (`_replacement_indels`) draws tracts deleting a uniformly sized subset of
+  1..`repl_max_share` founders (real panel sharing spectrum is ~flat 1..20) split
+  into replacement groups; `_indel_chunk` now emits replacement reads for
+  haplotypes whose founder lacks the B73 sequence (same coverage model), matching
+  the founders in the same replacement group (+ optional cross-matching), placed
+  with an optional Laplace shift, and keeping MATCH at founders deleted at the
+  placed site (as refmap does). Other indel models are byte-identical to before
+  (regression-checked on overlay / tracts / lineage). Small hybrid check:
+  hom-DEL rows now exist (100% replacement reads), het-DEL rows ~50/50
+  collinear/replacement. All `repl_*` parameters are placeholders pending §2.2.
 
 ## 1. Why
 
