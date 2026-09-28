@@ -76,3 +76,15 @@ def test_likelihood_emission_uses_only_input_gate():
         ep2, _, _ = m(X2)
     p0 = int(torch.nonzero(homo & (m.pi == 0))[0]); p1 = int(torch.nonzero(homo & (m.pi == 1))[0])
     assert torch.allclose(ep2[..., p0], ep2[..., p1], atol=1e-6)
+
+
+def test_train_homo_scale_marks_inbreds_zero():
+    from python.crf.train_diploid_indel import IndelDiploidAffinityDataset
+    K, T, G = 5, 8, 2
+    d = np.zeros((4, T, 3 * K + 2), np.int8)
+    d[:, :, 0] = 1
+    d[:2, :, K] = 1; d[:2, :, K + 1] = 1          # individual 0: homozygous
+    d[2:, :, K] = 1; d[2:, :, K + 1] = 3          # individual 1: hybrid
+    ds = IndelDiploidAffinityDataset(d, K, G, train_homo_scale=True)
+    assert float(ds[0]["homo_scale"]) == 0.0 and float(ds[3]["homo_scale"]) == 1.0
+    assert "homo_scale" not in IndelDiploidAffinityDataset(d, K, G)[0]

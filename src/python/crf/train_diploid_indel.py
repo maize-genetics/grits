@@ -230,7 +230,8 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
     from train_diploid._founder_affinity (reused verbatim, bit-identical — it
     has no calibration constants to shift, just mean/centered-mean over the
     MATCH view) attached to every window of the individual."""
-    def __init__(self, data, num_parents, windows_per_individual, lin=None):
+    def __init__(self, data, num_parents, windows_per_individual, lin=None,
+                 train_homo_scale=False):
         super().__init__(data, num_parents, lin)
         G = windows_per_individual
         if len(data) % G:
@@ -241,15 +242,27 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
             len(data) // G, G, data.shape[1], num_parents)
         self.affinity = np.stack(
             [_founder_affinity(M[i]) for i in range(len(M))]).astype(np.float32)
+        # --train-homo-scale: the individual's true kind as its homozygous-penalty scale
+        # (0 = inbred, every labelled row h1==h2; 1 = hybrid), the same 0/1 the router
+        # applies at inference. Without it the full homo_penalty hits inbreds too.
+        self.homo_scale = None
+        if train_homo_scale:
+            h = np.asarray(data[:, :, num_parents:num_parents + 2]).reshape(len(M), -1, 2)
+            lab = (h[..., 0] >= 0) & (h[..., 1] >= 0)
+            het = ((h[..., 0] != h[..., 1]) & lab).any(1)
+            self.homo_scale = het.astype(np.float32)
 
     def __getitem__(self, idx):
         out = super().__getitem__(idx)
         out["ext_emb"] = torch.tensor(self.affinity[idx // self.G], dtype=torch.float32)
+        if self.homo_scale is not None:
+            out["homo_scale"] = torch.tensor(self.homo_scale[idx // self.G], dtype=torch.float32)
         return out
 
 
 def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G, limit_n=0,
-                                       split_seed=0, legacy_tail_split=False, lin_path=None):
+                                       split_seed=0, legacy_tail_split=False, lin_path=None,
+                                       train_homo_scale=False):
     """Individual-aligned split, same boundaries as
     make_indel_diploid_individual_splits (mirrors train_diploid.py's
     make_diploid_affinity_splits intent)."""
@@ -262,7 +275,8 @@ def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G
     splits = individual_split_rows(n_ind, G, val_frac, test_frac, split_seed, legacy_tail_split)
     lin = _load_lineage(lin_path, data)
     mk = lambda rows: IndelDiploidAffinityDataset(data[rows], num_parents, G,
-                                                  None if lin is None else lin[rows])
+                                                  None if lin is None else lin[rows],
+                                                  train_homo_scale=train_homo_scale)
     print(f"IndelDiploid(affinity) {Path(path).name}: N={N:,} individuals={n_ind} "
           f"train={len(splits[0]):,} val={len(splits[1]):,} test={len(splits[2]):,} "
           f"split={'legacy-tail' if legacy_tail_split else f'shuffled(seed={split_seed})'}")
@@ -966,6 +980,10 @@ def parse_args():
                         "train fresh (new optimizer/scheduler/epoch state) -- unlike "
                         "--resume, which requires an exact architecture match and "
                         "restores full trainer state. Mutually exclusive with --resume.")
+    p.add_argument("--train-homo-scale", action="store_true",
+                   help="with --founder-affinity: scale the homozygous penalty per simulated individual "
+                        "by its true kind (0 inbred, 1 hybrid), as the router does at inference; "
+                        "default applies the full penalty to every individual")
     p.add_argument("--emission", choices=["learned", "likelihood"], default="learned",
                    help="CRF emission source: learned (encoder founder scores, default) or likelihood "
                         "(per-row read log-likelihood from the ternary state, 3 shared learned values; "
@@ -1010,7 +1028,7 @@ def main():
             args.data, args.num_parents, args.val_frac, args.test_frac,
             args.windows_per_individual, limit_n=args.limit_n,
             split_seed=args.split_seed, legacy_tail_split=args.legacy_tail_split,
-            lin_path=lin_path)
+            lin_path=lin_path, train_homo_scale=args.train_homo_scale)
     elif args.adaptive_homo:
         train_ds, val_ds, _ = make_indel_diploid_individual_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
