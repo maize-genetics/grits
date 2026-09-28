@@ -77,6 +77,9 @@ def main():
     G = comb.shape[1] // T
     np.save(out / f"{args.prefix}_fullscale_sliced.npy", comb[:, :G * T].reshape(-1, T, comb.shape[2]))
     print(f"wrote {args.prefix}_fullscale_sliced.npy  (--windows-per-individual {G})", flush=True)
+    import subprocess
+    subprocess.run([sys.executable, str(Path(__file__).with_name("lineage_rows.py")), "--dir", str(out),
+                    "--prefix", args.prefix], check=True)      # per-row lineage labels for --tie-aware-loss
 
 
 if __name__ == "__main__":

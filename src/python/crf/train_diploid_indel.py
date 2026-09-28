@@ -78,9 +78,10 @@ class IndelDiploidDataset(Dataset):
     (which wrongly maps LABEL_PAD=-1 onto founder 0), unlabeled positions are
     explicitly remapped to the null-founder index K, matching the convention
     ropebwt_npy_to_matrix.py already uses for real data (gA[gA<0]=K)."""
-    def __init__(self, data, num_parents=24):
+    def __init__(self, data, num_parents=24, lin=None):
         self.data = data
         self.K = num_parents
+        self.lin = lin          # [N,T,K] ancestral lineage per founder at each row (--tie-aware-loss)
 
     def __len__(self):
         return len(self.data)
@@ -101,6 +102,8 @@ class IndelDiploidDataset(Dataset):
         if row.shape[-1] >= 3 * K + 2:
             count = row[:, 2 * K + 2:3 * K + 2].astype(np.float32)
             out["count"] = torch.tensor(count, dtype=torch.float32)
+        if self.lin is not None:
+            out["lin"] = torch.tensor(np.asarray(self.lin[idx], dtype=np.int64))
         return out
 
 
@@ -150,8 +153,8 @@ class IndelDiploidIndividualDataset(IndelDiploidDataset):
     scale, from the genome-wide het proxy over the MATCH view (ternary==1).
     Windows grouped in blocks of G, mirroring DiploidIndividualDataset."""
     def __init__(self, data, num_parents, windows_per_individual,
-                 het_inbred=0.23, het_outbred=0.50):
-        super().__init__(data, num_parents)
+                 het_inbred=0.23, het_outbred=0.50, lin=None):
+        super().__init__(data, num_parents, lin)
         G = windows_per_individual
         if len(data) % G:
             raise ValueError(f"rows {len(data)} not divisible by windows/ind {G}")
@@ -193,9 +196,18 @@ def individual_split_rows(n_ind, G, val_frac, test_frac, seed=0, legacy_tail=Fal
             to_rows(order[n_tr + n_val:]))
 
 
+def _load_lineage(lin_path, data):
+    if lin_path is None:
+        return None
+    lin = np.load(lin_path, mmap_mode="r")
+    if lin.shape[1] != data.shape[1] or len(lin) < len(data):
+        raise ValueError(f"{lin_path}: shape {lin.shape} does not match data rows {data.shape[:2]}")
+    return lin[:len(data)]
+
+
 def make_indel_diploid_individual_splits(path, num_parents, val_frac, test_frac, G,
                                          het_inbred=0.23, het_outbred=0.50, limit_n=0,
-                                         split_seed=0, legacy_tail_split=False):
+                                         split_seed=0, legacy_tail_split=False, lin_path=None):
     data = np.load(path, allow_pickle=True, mmap_mode="r")
     _check_width(path, data, num_parents)
     if limit_n:
@@ -203,8 +215,10 @@ def make_indel_diploid_individual_splits(path, num_parents, val_frac, test_frac,
     N = len(data)
     n_ind = N // G
     splits = individual_split_rows(n_ind, G, val_frac, test_frac, split_seed, legacy_tail_split)
+    lin = _load_lineage(lin_path, data)
     mk = lambda rows: IndelDiploidIndividualDataset(data[rows], num_parents, G,
-                                                    het_inbred, het_outbred)
+                                                    het_inbred, het_outbred,
+                                                    None if lin is None else lin[rows])
     print(f"IndelDiploid(individual) {Path(path).name}: N={N:,} individuals={n_ind} "
           f"train={len(splits[0]):,} val={len(splits[1]):,} test={len(splits[2]):,} "
           f"split={'legacy-tail' if legacy_tail_split else f'shuffled(seed={split_seed})'}")
@@ -216,8 +230,8 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
     from train_diploid._founder_affinity (reused verbatim, bit-identical — it
     has no calibration constants to shift, just mean/centered-mean over the
     MATCH view) attached to every window of the individual."""
-    def __init__(self, data, num_parents, windows_per_individual):
-        super().__init__(data, num_parents)
+    def __init__(self, data, num_parents, windows_per_individual, lin=None):
+        super().__init__(data, num_parents, lin)
         G = windows_per_individual
         if len(data) % G:
             raise ValueError(f"rows {len(data)} not divisible by windows/ind {G}")
@@ -235,7 +249,7 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
 
 
 def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G, limit_n=0,
-                                       split_seed=0, legacy_tail_split=False):
+                                       split_seed=0, legacy_tail_split=False, lin_path=None):
     """Individual-aligned split, same boundaries as
     make_indel_diploid_individual_splits (mirrors train_diploid.py's
     make_diploid_affinity_splits intent)."""
@@ -246,7 +260,9 @@ def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G
     N = len(data)
     n_ind = N // G
     splits = individual_split_rows(n_ind, G, val_frac, test_frac, split_seed, legacy_tail_split)
-    mk = lambda rows: IndelDiploidAffinityDataset(data[rows], num_parents, G)
+    lin = _load_lineage(lin_path, data)
+    mk = lambda rows: IndelDiploidAffinityDataset(data[rows], num_parents, G,
+                                                  None if lin is None else lin[rows])
     print(f"IndelDiploid(affinity) {Path(path).name}: N={N:,} individuals={n_ind} "
           f"train={len(splits[0]):,} val={len(splits[1]):,} test={len(splits[2]):,} "
           f"split={'legacy-tail' if legacy_tail_split else f'shuffled(seed={split_seed})'}")
@@ -256,6 +272,26 @@ def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G
 # --------------------------------------------------------------------------- #
 #  Lightning module                                                            #
 # --------------------------------------------------------------------------- #
+
+def _dcrf_nll_tied(emis, c, nsw, stay_bonus, allowed):
+    """Pair-state CRF NLL crediting every path whose pair state at each row is in
+    `allowed` [B,T,P] (--tie-aware-loss): log Z - log Z_allowed, the second forward
+    pass run with disallowed states masked out. With `allowed` one-hot on the label
+    this equals _dcrf_nll."""
+    emis = emis.float()
+    c = c.float()
+    nsw = nsw.float()
+    stay_bonus = stay_bonus.float()
+    stay_mask = (nsw == 0).float()
+    neg = torch.tensor(-1e9, dtype=emis.dtype, device=emis.device)
+    emis_a = torch.where(allowed, emis, neg)
+    a, b = emis[:, 0], emis_a[:, 0]
+    for t in range(1, emis.shape[1]):
+        tr_t = -c[:, t, None, None] * nsw[None] + stay_bonus * stay_mask[None]
+        a = emis[:, t] + torch.logsumexp(a.unsqueeze(2) + tr_t, dim=1)
+        b = emis_a[:, t] + torch.logsumexp(b.unsqueeze(2) + tr_t, dim=1)
+    return (torch.logsumexp(a, dim=1) - torch.logsumexp(b, dim=1)).mean()
+
 
 class GRITSCRFDiploidIndel(pl.LightningModule):
     """Mirrors GRITSCRFDiploid's structure exactly — same loss, same CRF
@@ -270,9 +306,11 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  warmup_steps=0, homo_penalty=0.0,
                  cosine_decay=False, spike_skip=False, spike_mult=8.0,
                  loss_spike_mult=5.0,
-                 learned_het=False, founder_affinity=False, fast_cells=False):
+                 learned_het=False, founder_affinity=False, fast_cells=False,
+                 tie_aware_loss=False):
         super().__init__()
         self.save_hyperparameters()
+        self.tie_aware_loss = tie_aware_loss
         self.num_parents = num_parents
         self.lr = lr
         self.weight_decay = weight_decay
@@ -351,12 +389,28 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
     def _pair_labels(self, h1, h2):
         return self.pair_table[h1, h2]                           # [B,T]
 
+    def _allowed_pairs(self, h1, h2, lin):
+        """[B,T,P] bool: pair states made of founders sharing the true founders'
+        ancestral lineage at each row (IBD-equivalent, indistinguishable in the
+        input). The null label (K-1) is equivalent only to itself."""
+        Kf = self.num_parents
+        def eq(h):
+            lh = lin.gather(2, h.clamp(max=Kf - 1).unsqueeze(-1))       # [B,T,1]
+            real = (h < Kf).unsqueeze(-1)
+            return torch.cat([(lin == lh) & real, ~real], dim=2)       # [B,T,K]
+        e1, e2 = eq(h1), eq(h2)
+        return (e1[..., self.pi] & e2[..., self.pj]) | (e1[..., self.pj] & e2[..., self.pi])
+
     def _step(self, batch):
         X, h1, h2 = batch["input_embeds"], batch["h1"], batch["h2"]
         emis_p, g, c = self(X, batch.get("homo_scale"), batch.get("ext_emb"),
                             batch.get("count"))
         tags = self._pair_labels(h1, h2)
-        crf = _dcrf_nll(emis_p, c, self.nsw_pair, self.stay_bonus, tags)
+        if self.tie_aware_loss and "lin" in batch:
+            crf = _dcrf_nll_tied(emis_p, c, self.nsw_pair, self.stay_bonus,
+                                 self._allowed_pairs(h1, h2, batch["lin"]))
+        else:
+            crf = _dcrf_nll(emis_p, c, self.nsw_pair, self.stay_bonus, tags)
         loss = crf + self.gate_reg * (1.0 - g).mean()
         return loss, crf, g, c, emis_p, tags
 
@@ -413,6 +467,13 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
     def validation_step(self, batch, _):
         loss, crf, g, c, emis_p, _ = self._step(batch)
         pair_acc, hap_acc = self._accuracy(emis_p, c, batch["h1"], batch["h2"])
+        if "lin" in batch:
+            with torch.no_grad():
+                pred = _dcrf_viterbi(emis_p, c, self.nsw_pair, self.stay_bonus)
+                ok = self._allowed_pairs(batch["h1"], batch["h2"], batch["lin"]).gather(
+                    2, pred.unsqueeze(-1)).float().mean()
+            self.log("val/pair_acc_tie", ok, prog_bar=True)
+            self.log("val_pair_acc_tie", ok)            # slash-free alias for checkpointing
         self.log("val/loss", loss, prog_bar=True)
         self.log("val/pair_acc", pair_acc, prog_bar=True)
         self.log("val_pair_acc", pair_acc)              # slash-free alias, see train_diploid.py
@@ -884,6 +945,12 @@ def parse_args():
                         "train fresh (new optimizer/scheduler/epoch state) -- unlike "
                         "--resume, which requires an exact architecture match and "
                         "restores full trainer state. Mutually exclusive with --resume.")
+    p.add_argument("--tie-aware-loss", action="store_true",
+                   help="credit any founder pair IBD-equivalent (same ancestral lineage at the "
+                        "row) to the labelled pair; needs per-row lineage labels (--lineage-labels)")
+    p.add_argument("--lineage-labels", default=None,
+                   help="[N,T,K] int8 per-row lineage sidecar (default with --tie-aware-loss: "
+                        "<data minus .npy>.lin.npy, written by gen_training_data.py)")
     p.add_argument("--allow-hparam-mismatch", action="store_true",
                    help="Proceed even if --warm-start-ckpt was trained with different "
                         "model hparams (time_local_emis, homo_penalty, ...) than this "
@@ -902,17 +969,27 @@ def main():
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    lin_path = None
+    if args.tie_aware_loss:
+        lin_path = args.lineage_labels or str(Path(args.data).with_suffix("")) + ".lin.npy"
+        if not Path(lin_path).exists():
+            raise SystemExit(f"--tie-aware-loss: lineage labels not found at {lin_path}")
+        if not (args.founder_affinity or args.adaptive_homo):
+            raise SystemExit("--tie-aware-loss needs the individual-aligned splits "
+                             "(--founder-affinity or --adaptive-homo)")
     if args.founder_affinity:
         train_ds, val_ds, _ = make_indel_diploid_affinity_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
             args.windows_per_individual, limit_n=args.limit_n,
-            split_seed=args.split_seed, legacy_tail_split=args.legacy_tail_split)
+            split_seed=args.split_seed, legacy_tail_split=args.legacy_tail_split,
+            lin_path=lin_path)
     elif args.adaptive_homo:
         train_ds, val_ds, _ = make_indel_diploid_individual_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
             args.windows_per_individual, het_inbred=args.het_inbred,
             het_outbred=args.het_outbred, limit_n=args.limit_n,
-            split_seed=args.split_seed, legacy_tail_split=args.legacy_tail_split)
+            split_seed=args.split_seed, legacy_tail_split=args.legacy_tail_split,
+            lin_path=lin_path)
     else:
         train_ds, val_ds, _ = make_indel_diploid_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
@@ -930,7 +1007,7 @@ def main():
         spike_skip=args.spike_skip, spike_mult=args.spike_mult,
         loss_spike_mult=args.loss_spike_mult,
         learned_het=args.learned_het, founder_affinity=args.founder_affinity,
-        fast_cells=args.fast_cells)
+        fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate
@@ -960,11 +1037,14 @@ def main():
     # Checkpoint/stop on val/pair_acc (max), matching train_diploid.py: the CRF
     # partition NLL can spike on long-block data even as Viterbi accuracy stays
     # good, so selecting on loss can discard the best model.
+    sel_metric = "val_pair_acc_tie" if args.tie_aware_loss else "val_pair_acc"
     callbacks = [
-        ModelCheckpoint(dirpath=str(ckpt_dir), monitor="val_pair_acc",
+        # tie-aware runs select on tie-aware accuracy: exact-pair accuracy is
+        # arbitrary among lineage-equivalent founders there
+        ModelCheckpoint(dirpath=str(ckpt_dir), monitor=sel_metric,
                         mode="max", save_top_k=2, save_last=True,
-                        filename="d-{epoch:02d}-{val_pair_acc:.4f}"),
-        EarlyStopping(monitor="val_pair_acc", mode="max", patience=args.patience),
+                        filename="d-{epoch:02d}-{" + sel_metric + ":.4f}"),
+        EarlyStopping(monitor=sel_metric, mode="max", patience=args.patience),
     ]
     if args.ema:
         callbacks.append(EMACallback(args.ema_decay))
