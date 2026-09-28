@@ -427,7 +427,7 @@ def _load_obs_table(path):
     return t
 
 
-def _refmap_observation(rng, del_kt, ref_founder, obs):
+def _refmap_observation(rng, del_kt, ref_founder, obs, lineage=None):
     """Real-refmap-like per-(founder, site) observation of the deletion state, from the
     tables measure_real_stats.py builds on the calibration corpus (`obs_table`).
 
@@ -447,10 +447,21 @@ def _refmap_observation(rng, del_kt, ref_founder, obs):
     L = _run_length(del_kt) * float(obs["bp_per_site"])
     b = np.clip(np.searchsorted(edges, L, "right") - 1, 0, p_del.size - 1)
     p = np.where(del_kt, p_del[b], float(obs["p_minus1_given_present"]))
-    obs_del = rng.random(del_kt.shape) < p
+    if lineage is None:
+        u1 = rng.random(del_kt.shape)
+        u2 = rng.random(del_kt.shape)
+    else:
+        # --obs-by-lineage: one draw per (window, ancestral lineage, site), shared by every
+        # founder descending from it, so IBD founders get identical -1/0 states and distance
+        # codes instead of independent per-founder noise that separates them artificially
+        n_lin = int(lineage.max()) + 1
+        shape = (del_kt.shape[0], n_lin, del_kt.shape[2])
+        u1 = np.take_along_axis(rng.random(shape), lineage, axis=1)
+        u2 = np.take_along_axis(rng.random(shape), lineage, axis=1)
+    obs_del = u1 < p
     off = int(obs.get("dist_code_offset", 1))
     code = np.zeros(del_kt.shape, dtype=np.int8)
-    u = rng.random(del_kt.shape)
+    u = u2
     for key, m in (("present|0", ~del_kt & ~obs_del), ("present|-1", ~del_kt & obs_del),
                    ("del|0", del_kt & ~obs_del), ("del|-1", del_kt & obs_del)):
         cdf = np.cumsum(np.asarray(obs["dist_code_pmf"][key], dtype=np.float64))
@@ -1082,7 +1093,7 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   max_stack, anchor_thresh, ref_founder, dist_scale,
                   coverage_model="linear", read_len=150, collapse_rows=False,
                   rep_grp=None, rep_shift=0.0, rep_cross_del=0.0, rep_cross_present=0.0,
-                  obs_table=None):
+                  obs_table=None, obs_lineage=None):
     """Assemble one chunk's indel-mode output:
     `(tern, dist, count [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T]
     int32, short [n] bool, n_either int, n_hemi int, n_null int)`. `count`
@@ -1234,7 +1245,8 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
 
     obs_del = obs_code = None
     if obs_table is not None:   # drawn after the reads, so --obs-table changes only the observation
-        obs_del, obs_code = _refmap_observation(rng, dist_kt > anchor_thresh, ref_founder, obs_table)
+        obs_del, obs_code = _refmap_observation(rng, dist_kt > anchor_thresh, ref_founder, obs_table,
+                                                lineage=obs_lineage)
 
     tern_out = np.full((n, T, K), TERN_PAD, dtype=np.int8)
     dist_out = np.full((n, T, K), DIST_PAD, dtype=np.int8)
@@ -1379,7 +1391,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              repl_cross_del=0.0, repl_cross_present=0.0, repl_groups="random",
              subst_model="dense",
              subst_rate=0.018, coverage_model="linear", read_len=150,
-             emit_read_counts=False, collapse_rows=False, obs_table=None):
+             emit_read_counts=False, collapse_rows=False, obs_table=None, obs_by_lineage=False):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
     (default) behavior, including rng draw order, is byte-for-byte
@@ -1614,7 +1626,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 collapse_rows,
                 rep_grp=rep_grp if indel_model == "replacement" else None,
                 rep_shift=repl_shift_sites, rep_cross_del=repl_cross_del,
-                rep_cross_present=repl_cross_present, obs_table=obs_table)
+                rep_cross_present=repl_cross_present, obs_table=obs_table,
+                obs_lineage=lineage if obs_by_lineage else None)
 
             out[sl, :, :K] = tern
             out[sl, :, K] = lab1
@@ -1863,6 +1876,9 @@ def parse_args():
     p.add_argument("--repl-cross-present", type=float, default=0.0,
                    help="--indel-model replacement: chance a replacement read also matches "
                         "a founder that keeps the B73 sequence (TE copies elsewhere)")
+    p.add_argument("--obs-by-lineage", action="store_true",
+                   help="with --obs-table: draw the -1/0 state and distance code once per ancestral "
+                        "lineage and site (IBD founders identical) instead of per founder")
     p.add_argument("--repl-groups", choices=["random", "lineage"], default="random",
                    help="--indel-model replacement: which founders share a replacement -- a "
                         "uniform random subset (default) or whole ancestral lineages (relatives "
@@ -2276,7 +2292,7 @@ def main():
         repl_max_share=args.repl_max_share, repl_groups_mean=args.repl_groups_mean,
         repl_shift_sites=args.repl_shift_sites, repl_cross_del=args.repl_cross_del,
         repl_cross_present=args.repl_cross_present, repl_groups=args.repl_groups,
-        obs_table=_load_obs_table(args.obs_table),
+        obs_table=_load_obs_table(args.obs_table), obs_by_lineage=args.obs_by_lineage,
         subst_model=args.subst_model, subst_rate=args.subst_rate,
         coverage_model=args.indel_coverage_model, read_len=args.indel_read_len_bp,
         emit_read_counts=args.emit_read_counts,

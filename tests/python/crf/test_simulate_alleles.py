@@ -1588,3 +1588,28 @@ def test_replacement_random_groups_default_unchanged():
     b = simulate(np.random.default_rng(3), repl_groups="random", **kw)[0]
     c = simulate(np.random.default_rng(3), repl_groups="lineage", **kw)[0]
     assert np.array_equal(a, b) and not np.array_equal(a, c)
+
+
+def test_obs_by_lineage_makes_ibd_founders_identical():
+    kw = dict(windows=2, sites=6000, founders=12, min_cross=2, max_cross=4, inbreeding=1.0,
+              allele_sharing=0.2, bad_frac=0.05, sharing_model="coalescent", ancestors=4,
+              sharing_theta=4.0, simulate_indels=True, indel_model="replacement", repl_groups="lineage",
+              indel_coverage=2.0, indel_region_mult=2, obs_table=_obs_table())
+    a = simulate(np.random.default_rng(3), **kw)[0]
+    b = simulate(np.random.default_rng(3), obs_by_lineage=False, **kw)[0]
+    assert np.array_equal(a, b)                                  # default unchanged
+    out = simulate(np.random.default_rng(3), obs_by_lineage=True, **kw)
+    o, ibd, refpos = out[0], out[1], out[6]
+    K = 12
+    t, d = o[..., :K], o[..., K + 2:2 * K + 2]
+    lin = np.take_along_axis(ibd, np.clip(refpos, 0, None)[..., None], axis=1)   # [n,L,K]
+    live = refpos >= 0
+    diff = 0
+    for i in range(o.shape[0]):
+        for r in np.nonzero(live[i])[0][:2000]:
+            for l in np.unique(lin[i, r]):
+                m = lin[i, r] == l
+                nm = m & (t[i, r] != 1)
+                if nm.sum() > 1:
+                    diff += len(set(zip(t[i, r][nm].tolist(), d[i, r][nm].tolist()))) > 1
+    assert diff == 0

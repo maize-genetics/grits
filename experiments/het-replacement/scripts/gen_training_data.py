@@ -44,6 +44,8 @@ def main():
     ap.add_argument("--override", nargs="*", default=[], help="repl_x=value overrides")
     ap.add_argument("--indel-model", default="replacement",
                     help="control runs: e.g. overlay (repl_* params are then unused)")
+    ap.add_argument("--obs-by-lineage", action="store_true",
+                    help="draw the -1/0 state and distance code once per ancestral lineage (IBD founders identical)")
     ap.add_argument("--no-obs-table", action="store_true",
                     help="ignore the params' obs_table (exact -1/distance observation, as before)")
     args = ap.parse_args()
@@ -60,13 +62,14 @@ def main():
     print("repl params:", repl, "| obs_table:", "yes" if obs else "no (exact)", flush=True)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{args.prefix}.recipe.json").write_text(json.dumps({"recipe": RECIPE, "indel_model": args.indel_model, "repl": repl, "obs_table": obs,
+    (out / f"{args.prefix}.recipe.json").write_text(json.dumps({"recipe": RECIPE, "indel_model": args.indel_model, "obs_by_lineage": args.obs_by_lineage, "repl": repl, "obs_table": obs,
                                                                 "windows": args.windows, "seeds": args.seeds}, indent=1))
     parts = []
     for inb, seed in zip(("1.0", "0.0"), args.seeds):
         o, ibd, _i, _p, _h, _c, refpos, short, _tc = simulate(
             np.random.default_rng(seed), windows=args.windows, inbreeding=float(inb),
-            indel_model=args.indel_model, obs_table=obs, **RECIPE, **repl)
+            indel_model=args.indel_model, obs_table=obs, obs_by_lineage=args.obs_by_lineage,
+            **RECIPE, **repl)
         print(f"inb{inb}: {o.shape}  short windows {100 * short.mean():.2f}%", flush=True)
         np.save(out / f"{args.prefix}_inb{inb}.npy", o)
         np.save(out / f"{args.prefix}_inb{inb}.ibd.npy", ibd)
