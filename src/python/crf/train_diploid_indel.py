@@ -307,13 +307,21 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  cosine_decay=False, spike_skip=False, spike_mult=8.0,
                  loss_spike_mult=5.0,
                  learned_het=False, founder_affinity=False, fast_cells=False,
-                 tie_aware_loss=False, pair_emission="sum"):
+                 tie_aware_loss=False, pair_emission="sum", emission="learned"):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
         if pair_emission not in ("sum", "mixture"):
             raise ValueError(f"pair_emission must be 'sum' or 'mixture', got {pair_emission!r}")
         self.pair_emission = pair_emission
+        if emission not in ("learned", "likelihood"):
+            raise ValueError(f"emission must be 'learned' or 'likelihood', got {emission!r}")
+        self.emission = emission
+        # --emission likelihood: the CRF emission is a read likelihood computed from the input,
+        # not an encoder founder score. One learned log-likelihood per ternary state, shared by
+        # every founder (deleted / present-no-match / match); init ~ log(1e-3), log(1e-2), 0.
+        # The encoder then only supplies the per-row gate g (site weight) and switch cost c.
+        self.tern_loglik = nn.Parameter(torch.tensor([-6.9, -4.6, 0.0]))
         self.num_parents = num_parents
         self.lr = lr
         self.weight_decay = weight_decay
@@ -378,6 +386,9 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         else:
             emis_f, g, c = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
                                         count=count)  # [B,T,K]
+        if self.emission == "likelihood":
+            tern_idx = (X_pad[..., 0].round().clamp(-1, 1) + 1).long()          # -1/0/1 -> 0/1/2
+            emis_f = g.unsqueeze(-1) * self.tern_loglik[tern_idx]            # [B,T,K]
         if self.pair_emission == "mixture":
             # each row comes from one haplotype or the other: a het pair is credited when
             # EITHER founder explains the row, so two founders explaining different reads
@@ -955,6 +966,10 @@ def parse_args():
                         "train fresh (new optimizer/scheduler/epoch state) -- unlike "
                         "--resume, which requires an exact architecture match and "
                         "restores full trainer state. Mutually exclusive with --resume.")
+    p.add_argument("--emission", choices=["learned", "likelihood"], default="learned",
+                   help="CRF emission source: learned (encoder founder scores, default) or likelihood "
+                        "(per-row read log-likelihood from the ternary state, 3 shared learned values; "
+                        "the encoder only supplies the gate and switch cost)")
     p.add_argument("--pair-emission", choices=["sum", "mixture"], default="sum",
                    help="pair-state emission from per-founder scores: sum (e_i + e_j, default) or "
                         "mixture (logaddexp(e_i, e_j) - log 2: each row explained by either haplotype)")
@@ -1021,7 +1036,7 @@ def main():
         loss_spike_mult=args.loss_spike_mult,
         learned_het=args.learned_het, founder_affinity=args.founder_affinity,
         fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss,
-        pair_emission=args.pair_emission)
+        pair_emission=args.pair_emission, emission=args.emission)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate

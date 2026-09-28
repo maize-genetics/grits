@@ -56,3 +56,23 @@ def test_mixture_pair_emission():
     ei = (es[..., (m.pi == i) & (m.pj == i)].squeeze(-1)) / 2
     ej = (es[..., (m.pi == j) & (m.pj == j)].squeeze(-1)) / 2
     assert torch.allclose(ep[..., p], torch.logaddexp(ei, ej) - math.log(2.0), atol=1e-5)
+
+
+def test_likelihood_emission_uses_only_input_gate():
+    torch.manual_seed(0)
+    m = GRITSCRFDiploidIndel(num_parents=5, d_model=16, n_heads=2, n_layers=1,
+                             emission="likelihood", pair_emission="mixture").eval()
+    X = torch.stack([torch.randint(-1, 2, (2, 6, 5)), torch.randint(0, 100, (2, 6, 5))], -1).float()
+    with torch.no_grad():
+        ep, g, _ = m(X)
+    homo = m.pi == m.pj
+    for f in range(5):
+        p = int(torch.nonzero(homo & (m.pi == f))[0])
+        want = g * m.tern_loglik[(X[..., f, 0] + 1).long()]
+        assert torch.allclose(ep[..., p], want, atol=1e-5)
+    # two founders with identical ternary columns get identical emissions (no founder identity)
+    X2 = X.clone(); X2[..., 1, :] = X2[..., 0, :]
+    with torch.no_grad():
+        ep2, _, _ = m(X2)
+    p0 = int(torch.nonzero(homo & (m.pi == 0))[0]); p1 = int(torch.nonzero(homo & (m.pi == 1))[0])
+    assert torch.allclose(ep2[..., p0], ep2[..., p1], atol=1e-6)
