@@ -10,7 +10,11 @@ J=/home/zrm22/.claude/jobs/two_stage
 TERN=$D/checkpoints/diploid-indel-v3-k25-overlay-affinity/d-epoch=04-val_pair_acc=0.6820.ckpt
 RECIPE="--data $D/data/training/maize_v3_hetrepl_v3_lineage_fullscale_sliced.npy --workdir $D --num-parents 25 --time-local-emis --warmup-steps 500 --homo-penalty 3.0 --spike-skip --founder-affinity --windows-per-individual 117 --batch-size 64 --precision bf16-mixed --tie-aware-loss"
 run() { PYTHONPATH=src CUDA_VISIBLE_DEVICES=$G $PY src/python/crf/train_diploid_indel.py $RECIPE "$@"; }
-if [ $MODE = twostage ]; then
+if [ $MODE = auxwsw ]; then
+  run --run-name ts-v3-auxw1-sw --max-epochs 5 --aux-loss-weight 1.0 --aux-w-switch 10 --aux-switch-pos-weight 30679 --warm-start-ckpt $TERN > $J/auxw1sw.log 2>&1
+  echo "auxw1sw exit=$?" >> $J/done.txt
+  N=ts-v3-auxw1-sw; TAG=ts_v3_auxw1_sw
+elif [ $MODE = twostage ]; then
   run --run-name ts-v3-stage1 --stage1-aux-only --max-epochs 1 --warm-start-ckpt $TERN > $J/stage1.log 2>&1
   echo "stage1 exit=$?" >> $J/done.txt
   run --run-name ts-v3-stage2 --max-epochs 4 --warm-start-ckpt $D/checkpoints/ts-v3-stage1/last.ckpt > $J/stage2.log 2>&1

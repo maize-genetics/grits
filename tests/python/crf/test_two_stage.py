@@ -1,6 +1,7 @@
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 from python.crf.crf_kernels import _dcrf_nll
 from python.crf.train_crf import IndelFounderPathEncoder
@@ -90,6 +91,17 @@ class TestAuxTargets(unittest.TestCase):
         tot, (lf, lg, ls) = m.aux_loss(raw, g, c, m.aux_targets(b["input_embeds"], b["h1"], b["h2"], b["lin"]))
         self.assertTrue(all(torch.isfinite(x) for x in (lf, lg, ls)))
         self.assertAlmostEqual(float(tot), float(lf), places=6)
+
+    def test_switch_pos_weight(self):
+        b = _batch()
+        m0 = _model(); m1 = _model(aux_switch_pos_weight=1.0); m5 = _model(aux_switch_pos_weight=5.0)
+        tg = m0.aux_targets(b["input_embeds"], b["h1"], b["h2"], b["lin"])
+        e, g, c, raw = m0(b["input_embeds"], None, b["ext_emb"], None, return_raw=True)
+        l0 = m0.aux_loss(raw, g, c, tg)[1][2]
+        self.assertEqual(float(l0), float(m1.aux_loss(raw, g, c, tg)[1][2]))   # pw=1 == unweighted
+        sw = tg[2].float(); x = -c[:, 1:]
+        ref = -(5.0 * sw * F.logsigmoid(x) + (1 - sw) * F.logsigmoid(-x)).mean()
+        self.assertAlmostEqual(float(m5.aux_loss(raw, g, c, tg)[1][2]), float(ref), places=5)
 
 
 class TestStages(unittest.TestCase):

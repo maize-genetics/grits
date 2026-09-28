@@ -309,7 +309,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  learned_het=False, founder_affinity=False, fast_cells=False,
                  tie_aware_loss=False, aux_loss_weight=0.0, stage1_aux_only=False,
                  aux_w_founder=1.0, aux_w_gate=1.0, aux_w_switch=1.0,
-                 freeze_encoder_trunk=False):
+                 freeze_encoder_trunk=False, aux_switch_pos_weight=0.0):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
@@ -320,6 +320,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         self.stage1_aux_only = stage1_aux_only
         self.aux_w = (aux_w_founder, aux_w_gate, aux_w_switch)
         self.freeze_encoder_trunk = freeze_encoder_trunk
+        self.aux_switch_pos_weight = aux_switch_pos_weight   # 0 = unweighted switch BCE
         self.num_parents = num_parents
         self.lr = lr
         self.weight_decay = weight_decay
@@ -472,7 +473,11 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         lf = F.binary_cross_entropy_with_logits(raw_f.float(), founder.float())
         gf = g.float().clamp(1e-6, 1 - 1e-6)
         lg = -(gate.float() * gf.log() + (1 - gate.float()) * (1 - gf).log()).mean()
-        ls = F.binary_cross_entropy_with_logits(-c[:, 1:].float(), switch.float())
+        if self.aux_switch_pos_weight > 0:
+            pw = torch.tensor(self.aux_switch_pos_weight, device=c.device)
+            ls = F.binary_cross_entropy_with_logits(-c[:, 1:].float(), switch.float(), pos_weight=pw)
+        else:
+            ls = F.binary_cross_entropy_with_logits(-c[:, 1:].float(), switch.float())
         return wf * lf + wg * lg + ws * ls, (lf, lg, ls)
 
     def _step(self, batch):
@@ -1063,6 +1068,9 @@ def parse_args():
     p.add_argument("--aux-w-founder", type=float, default=1.0)
     p.add_argument("--aux-w-gate", type=float, default=1.0)
     p.add_argument("--aux-w-switch", type=float, default=1.0)
+    p.add_argument("--aux-switch-pos-weight", type=float, default=0.0,
+                   help="pos_weight for the switch BCE (true switches are ~1e-4 of row pairs, so "
+                        "unweighted it is satisfied by 'never switch'); 0 = unweighted")
     p.add_argument("--freeze-encoder-trunk", action="store_true",
                    help="stage-2 'CRF-only' variant: freeze cell embed/founder pooling/"
                         "transformer; train only the gate/switch/affinity heads + stay_bonus")
@@ -1125,7 +1133,8 @@ def main():
         fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss,
         aux_loss_weight=args.aux_loss_weight, stage1_aux_only=args.stage1_aux_only,
         aux_w_founder=args.aux_w_founder, aux_w_gate=args.aux_w_gate,
-        aux_w_switch=args.aux_w_switch, freeze_encoder_trunk=args.freeze_encoder_trunk)
+        aux_w_switch=args.aux_w_switch, freeze_encoder_trunk=args.freeze_encoder_trunk,
+        aux_switch_pos_weight=args.aux_switch_pos_weight)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate
