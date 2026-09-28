@@ -636,7 +636,8 @@ def _overlay_indels(rng, n, K, R, rate, mean_len, ins_frac, founder_freq, max_le
     return del_mask, ins_bp
 
 
-def _replacement_indels(rng, n, K, R, rate, mean_len, max_share, groups_mean, max_len):
+def _replacement_indels(rng, n, K, R, rate, mean_len, max_share, groups_mean, max_len,
+                        lineage=None):
     """`--indel-model replacement` (experiments/het-replacement/PLAN.md §2.3):
     B73 sequence REPLACED in a subset of founders, as in real maize where
     AnchorWave-derived gVCFs mark ~37-41% of B73 bp deleted and an equal amount
@@ -651,6 +652,15 @@ def _replacement_indels(rng, n, K, R, rate, mean_len, max_share, groups_mean, ma
     1 + Poisson(groups_mean - 1) replacement groups: founders in the same group
     carry the same replacement sequence, so a replacement read matches them.
 
+    With `lineage` ([n,K,R] ancestral lineage per founder and site, --repl-groups
+    lineage), a tract removes the B73 sequence from whole lineages instead of random
+    founders: lineages present at the tract start are added in random order until at
+    least s founders are covered, and at every site of the tract the deleted founders
+    are exactly those descending from a chosen lineage there. A replacement is thus
+    inherited with the haplotype carrying it, so related founders share deletions
+    and replacement reads the way they share SNP alleles; each chosen lineage gets
+    one of the tract's replacement groups.
+
     Returns `(del_mask[n,K,R] bool, rep_grp[n,K,R] int8)`, rep_grp = -1 where the
     founder keeps the B73 sequence. Group ids are only compared between founders
     at the same site, so they wrap in int8.
@@ -659,6 +669,7 @@ def _replacement_indels(rng, n, K, R, rate, mean_len, max_share, groups_mean, ma
     rep_grp = np.full((n, K, R), -1, dtype=np.int8)
     max_share = int(np.clip(max_share, 1, K))
     n_tr = rng.poisson(rate * R, n)
+    n_lin = int(lineage.max()) + 1 if lineage is not None else 0
     gid = 0
     for w in range(n):
         for _ in range(n_tr[w]):
@@ -666,6 +677,21 @@ def _replacement_indels(rng, n, K, R, rate, mean_len, max_share, groups_mean, ma
             st = int(rng.integers(0, R))
             en = min(R, st + L)
             s = int(rng.integers(1, max_share + 1))
+            if lineage is not None:
+                lin = lineage[w, :, st:en]                                   # [K,L]
+                present, cnt = np.unique(lineage[w, :, st], return_counts=True)
+                order = rng.permutation(present.size)
+                take = order[:int(np.searchsorted(np.cumsum(cnt[order]), s)) + 1]
+                chosen = present[take]
+                g = int(min(chosen.size, 1 + rng.poisson(max(groups_mean - 1.0, 0.0))))
+                lut = np.full(n_lin, -1, dtype=np.int64)
+                lut[chosen] = gid + rng.integers(0, g, chosen.size)
+                glab = lut[lin]
+                hit = glab >= 0
+                del_mask[w, :, st:en] |= hit
+                rep_grp[w, :, st:en] = np.where(hit, (glab % 120).astype(np.int8), rep_grp[w, :, st:en])
+                gid += g
+                continue
             who = rng.choice(K, s, replace=False)
             g = int(min(s, 1 + rng.poisson(max(groups_mean - 1.0, 0.0))))
             lab = rng.integers(0, g, s)
@@ -1350,7 +1376,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              indel_overlay_rate=2.3e-3, indel_overlay_mean_len=300.0,
              indel_overlay_founder_freq=1.0, repl_rate=2e-4, repl_mean_len=500.0,
              repl_max_share=22, repl_groups_mean=1.5, repl_shift_sites=0.0,
-             repl_cross_del=0.0, repl_cross_present=0.0, subst_model="dense",
+             repl_cross_del=0.0, repl_cross_present=0.0, repl_groups="random",
+             subst_model="dense",
              subst_rate=0.018, coverage_model="linear", read_len=150,
              emit_read_counts=False, collapse_rows=False, obs_table=None):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
@@ -1512,7 +1539,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             elif indel_model == "replacement":
                 del_lin, rep_grp = _replacement_indels(
                     rng, n, K, R, repl_rate, repl_mean_len, repl_max_share,
-                    repl_groups_mean, indel_max_len)
+                    repl_groups_mean, indel_max_len,
+                    lineage=lineage if repl_groups == "lineage" else None)
                 ins_lin = np.zeros((n, K, R), dtype=np.int32)
                 lineage_indel = np.broadcast_to(
                     np.arange(K, dtype=np.int32)[None, :, None], (n, K, R))
@@ -1835,6 +1863,10 @@ def parse_args():
     p.add_argument("--repl-cross-present", type=float, default=0.0,
                    help="--indel-model replacement: chance a replacement read also matches "
                         "a founder that keeps the B73 sequence (TE copies elsewhere)")
+    p.add_argument("--repl-groups", choices=["random", "lineage"], default="random",
+                   help="--indel-model replacement: which founders share a replacement -- a "
+                        "uniform random subset (default) or whole ancestral lineages (relatives "
+                        "share replacements, as with inherited TE insertions)")
     p.add_argument("--obs-table", default=None,
                    help="indel mode: JSON observation table from measure_real_stats.py -- draw each "
                         "non-matching founder's -1/0 state and distance code the way real refmap "
@@ -2243,7 +2275,7 @@ def main():
         repl_rate=args.repl_rate, repl_mean_len=args.repl_mean_len,
         repl_max_share=args.repl_max_share, repl_groups_mean=args.repl_groups_mean,
         repl_shift_sites=args.repl_shift_sites, repl_cross_del=args.repl_cross_del,
-        repl_cross_present=args.repl_cross_present,
+        repl_cross_present=args.repl_cross_present, repl_groups=args.repl_groups,
         obs_table=_load_obs_table(args.obs_table),
         subst_model=args.subst_model, subst_rate=args.subst_rate,
         coverage_model=args.indel_coverage_model, read_len=args.indel_read_len_bp,

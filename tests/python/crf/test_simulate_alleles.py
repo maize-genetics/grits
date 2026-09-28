@@ -1560,3 +1560,31 @@ def test_obs_table_changes_only_observation_not_reads():
     assert np.array_equal(ta == TERN_MATCH, tb == TERN_MATCH)
     assert np.array_equal(a[..., K:K + 2], b[..., K:K + 2])
     assert ((tb[live] == TERN_DEL) != (ta[live] == TERN_DEL)).any()
+
+
+def test_replacement_lineage_groups_follow_lineages():
+    rng = np.random.default_rng(0)
+    n, K, R = 3, 10, 400
+    lineage = np.zeros((n, K, R), dtype=np.int32)
+    lineage[:, 5:, :] = 1                         # two clades
+    lineage[:, 8:, 200:] = 2                      # founders 8,9 switch lineage at site 200
+    dm, grp = _replacement_indels(rng, n, K, R, 0.01, 30.0, 3, 1.0, 400, lineage=lineage)
+    assert dm.any()
+    for w in range(n):
+        for t in range(R):
+            for lin in np.unique(lineage[w, :, t]):
+                members = lineage[w, :, t] == lin
+                # founders sharing a lineage at a site share its deletion state and group
+                assert len(set(dm[w, members, t].tolist())) == 1
+                assert len(set(grp[w, members, t].tolist())) == 1
+
+
+def test_replacement_random_groups_default_unchanged():
+    kw = dict(windows=2, sites=6000, founders=12, min_cross=2, max_cross=4, inbreeding=1.0,
+              allele_sharing=0.2, bad_frac=0.05, sharing_model="coalescent", ancestors=4,
+              sharing_theta=4.0, simulate_indels=True, indel_model="replacement", indel_coverage=2.0,
+              indel_region_mult=2)
+    a = simulate(np.random.default_rng(3), **kw)[0]
+    b = simulate(np.random.default_rng(3), repl_groups="random", **kw)[0]
+    c = simulate(np.random.default_rng(3), repl_groups="lineage", **kw)[0]
+    assert np.array_equal(a, b) and not np.array_equal(a, c)

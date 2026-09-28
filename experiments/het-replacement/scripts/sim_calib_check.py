@@ -21,7 +21,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from python.crf.simulate_alleles import simulate  # noqa: E402
-from gen_training_data import RECIPE, REPL_KEYS  # noqa: E402
+from gen_training_data import RECIPE, REPL_KEYS, REPL_STR_KEYS  # noqa: E402
 
 K = 25
 
@@ -39,10 +39,10 @@ def main():
     args = ap.parse_args()
     real = json.loads(Path(args.params).read_text())
     sp = real["suggested_sim_params"]
-    repl = {k: sp[k] for k in REPL_KEYS if k in sp}
+    repl = {k: sp[k] for k in REPL_KEYS + REPL_STR_KEYS if k in sp}
     for kv in args.override:
         k, v = kv.split("=")
-        repl[k] = float(v)
+        repl[k] = v if k in REPL_STR_KEYS else float(v)
     repl["repl_max_share"] = int(repl["repl_max_share"])
     obs = sp["obs_table"]
     rep = {"repl": repl}

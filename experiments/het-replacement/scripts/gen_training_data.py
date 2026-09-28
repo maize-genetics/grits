@@ -30,6 +30,7 @@ RECIPE = dict(sites=60000, founders=25, min_cross=2, max_cross=10, allele_sharin
               indel_coverage=2.0, emit_read_counts=True, collapse_rows=True, indel_region_mult=2)
 REPL_KEYS = ("repl_rate", "repl_mean_len", "repl_max_share", "repl_groups_mean", "repl_shift_sites",
              "repl_cross_del", "repl_cross_present")
+REPL_STR_KEYS = ("repl_groups",)
 
 
 def main():
@@ -49,10 +50,10 @@ def main():
 
     p = json.loads(Path(args.params).read_text())
     p = p.get("suggested_sim_params", p)
-    repl = {k: p[k] for k in REPL_KEYS if k in p and p[k] is not None}
+    repl = {k: p[k] for k in REPL_KEYS + REPL_STR_KEYS if k in p and p[k] is not None}
     for kv in args.override:
         k, v = kv.split("=")
-        repl[k] = float(v) if k != "repl_max_share" else int(v)
+        repl[k] = v if k in REPL_STR_KEYS else float(v) if k != "repl_max_share" else int(v)
     if "repl_max_share" in repl:
         repl["repl_max_share"] = int(repl["repl_max_share"])
     obs = None if args.no_obs_table else p.get("obs_table")
