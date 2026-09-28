@@ -36,3 +36,23 @@ def test_allowed_pairs_follow_lineage():
     al = m._allowed_pairs(torch.tensor([[5]]), torch.tensor([[2]]), lin)[0, 0]
     got = {(int(m.pi[p]), int(m.pj[p])) for p in torch.nonzero(al).ravel()}
     assert got == {(2, 5)}
+
+
+def test_mixture_pair_emission():
+    import math
+    torch.manual_seed(0)
+    m = GRITSCRFDiploidIndel(num_parents=5, d_model=16, n_heads=2, n_layers=1, pair_emission="mixture").eval()
+    ms = GRITSCRFDiploidIndel(num_parents=5, d_model=16, n_heads=2, n_layers=1).eval()
+    ms.load_state_dict(m.state_dict())
+    X = torch.stack([torch.randint(-1, 2, (2, 6, 5)), torch.randint(0, 100, (2, 6, 5))], -1).float()
+    with torch.no_grad():
+        ep, _, _ = m(X)
+        es, _, _ = ms(X)
+    homo = (m.pi == m.pj)
+    # homozygous states: mixture = e_i, sum = 2 e_i
+    assert torch.allclose(ep[..., homo] * 2, es[..., homo], atol=1e-5)
+    i, j = int(m.pi[~homo][0]), int(m.pj[~homo][0])
+    p = int(torch.nonzero(~homo)[0])
+    ei = (es[..., (m.pi == i) & (m.pj == i)].squeeze(-1)) / 2
+    ej = (es[..., (m.pi == j) & (m.pj == j)].squeeze(-1)) / 2
+    assert torch.allclose(ep[..., p], torch.logaddexp(ei, ej) - math.log(2.0), atol=1e-5)

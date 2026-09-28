@@ -63,6 +63,9 @@ def main():
                          "or the router's choice with --route)")
     ap.add_argument("--decode", choices=["viterbi", "marginal"], default="viterbi")
     ap.add_argument("--depth", default="0.1")
+    ap.add_argument("--manifest", default=MANIFEST,
+                    help="read-set manifest (default: the evaluation corpus; pass the calibration "
+                         "corpus manifest to score calibration rows)")
     ap.add_argument("--input-glob", default="scratch/*_snprc",
                     help="row dirs holding the aligned model input, relative to WORK "
                          "(e.g. scratch/lift_s200_local20k for the -s 200 + adaptive alignment)")
@@ -76,7 +79,7 @@ def main():
         args.ckpt, map_location=device, strict=False).eval().to(device)
     panel = fss.Panel()
     DEPTH = args.depth
-    rows = [r for r in csv.DictReader(open(MANIFEST), delimiter="\t") if r["coverage"] == DEPTH]
+    rows = [r for r in csv.DictReader(open(args.manifest), delimiter="\t") if r["coverage"] == DEPTH]
 
     summary = {}
     for scope in args.scope:

@@ -307,10 +307,13 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  cosine_decay=False, spike_skip=False, spike_mult=8.0,
                  loss_spike_mult=5.0,
                  learned_het=False, founder_affinity=False, fast_cells=False,
-                 tie_aware_loss=False):
+                 tie_aware_loss=False, pair_emission="sum"):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
+        if pair_emission not in ("sum", "mixture"):
+            raise ValueError(f"pair_emission must be 'sum' or 'mixture', got {pair_emission!r}")
+        self.pair_emission = pair_emission
         self.num_parents = num_parents
         self.lr = lr
         self.weight_decay = weight_decay
@@ -375,7 +378,14 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         else:
             emis_f, g, c = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
                                         count=count)  # [B,T,K]
-        emis_p = emis_f[..., self.pi] + emis_f[..., self.pj]     # [B,T,P]
+        if self.pair_emission == "mixture":
+            # each row comes from one haplotype or the other: a het pair is credited when
+            # EITHER founder explains the row, so two founders explaining different reads
+            # beat two relatives explaining the same ones; homozygous (i,i) scores emis_f[i]
+            emis_p = (torch.logaddexp(emis_f[..., self.pi], emis_f[..., self.pj])
+                      - math.log(2.0))                               # [B,T,P]
+        else:
+            emis_p = emis_f[..., self.pi] + emis_f[..., self.pj]     # [B,T,P]
         if self.learned_het:
             het_pen = F.softplus(het).unsqueeze(-1)              # [B,T,1] >= 0
             emis_p = emis_p - het_pen * self.homo_mask
@@ -945,6 +955,9 @@ def parse_args():
                         "train fresh (new optimizer/scheduler/epoch state) -- unlike "
                         "--resume, which requires an exact architecture match and "
                         "restores full trainer state. Mutually exclusive with --resume.")
+    p.add_argument("--pair-emission", choices=["sum", "mixture"], default="sum",
+                   help="pair-state emission from per-founder scores: sum (e_i + e_j, default) or "
+                        "mixture (logaddexp(e_i, e_j) - log 2: each row explained by either haplotype)")
     p.add_argument("--tie-aware-loss", action="store_true",
                    help="credit any founder pair IBD-equivalent (same ancestral lineage at the "
                         "row) to the labelled pair; needs per-row lineage labels (--lineage-labels)")
@@ -1007,7 +1020,8 @@ def main():
         spike_skip=args.spike_skip, spike_mult=args.spike_mult,
         loss_spike_mult=args.loss_spike_mult,
         learned_het=args.learned_het, founder_affinity=args.founder_affinity,
-        fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss)
+        fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss,
+        pair_emission=args.pair_emission)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate
