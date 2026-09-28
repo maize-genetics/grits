@@ -1,0 +1,106 @@
+{
+ "inbred": {
+  "tie_acc_viterbi": 0.9993689903846154,
+  "tie_acc_local_argmax": 0.7907618856837607,
+  "err_frac": 0.0006310096153846154,
+  "err_share_one_chrom_right": 0.0,
+  "err_share_both_wrong": 0.04497354497354497,
+  "err_share_pred_homo": 0.0,
+  "err_input_identical_pm16": 0.0,
+  "err_input_identical_window": 0.0,
+  "vit_wrong_loc_right_frac_rows": 1.8362713675213674e-05,
+  "vit_right_loc_wrong_frac_rows": 0.20862546741452992,
+  "pred_switches_per_window": 0.05213675213675214,
+  "true_label_switches_per_window": 0.02564102564102564,
+  "true_homo_frac": 1.0,
+  "pred_homo_frac": 0.12672859909188033,
+  "emis_gap_best_minus_best_allowed_q50_q90": [
+   0.0,
+   0.5
+  ],
+  "g_q10_50_90": [
+   0.09814453125,
+   0.9609375,
+   1.0
+  ],
+  "c_q10_50_90": [
+   10.562525749206543,
+   18.125,
+   93.5
+  ],
+  "allowed_pairs_q10_50_90": [
+   1.0,
+   15.0,
+   66.0
+  ],
+  "n_win_err": 0,
+  "n_win_ok": 2340,
+  "win_err_rows_truth_only_vs_pred_only_median": [
+   0.0,
+   0.0
+  ],
+  "win_err_frac_pred_explains_ge_truth": 1.0,
+  "win_ok_rows_truth_only_vs_pred_only_median": [
+   0.0,
+   0.0
+  ],
+  "sub_lineage_share_q10_50_90": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "stay_bonus": 2.1682310104370117
+ },
+ "hybrid": {
+  "tie_acc_viterbi": 0.5581655649038462,
+  "tie_acc_local_argmax": 0.2721604567307692,
+  "err_frac": 0.44183443509615383,
+  "err_share_one_chrom_right": 0.9998904322824278,
+  "err_share_both_wrong": 0.0,
+  "err_share_pred_homo": 0.0,
+  "err_input_identical_pm16": 0.0,
+  "err_input_identical_window": 0.0,
+  "vit_wrong_loc_right_frac_rows": 0.02573116987179487,
+  "vit_right_loc_wrong_frac_rows": 0.3117362780448718,
+  "pred_switches_per_window": 0.01581196581196581,
+  "true_label_switches_per_window": 0.025213675213675214,
+  "true_homo_frac": 0.05057592147435897,
+  "pred_homo_frac": 0.008389256143162393,
+  "emis_gap_best_minus_best_allowed_q50_q90": [
+   0.0213623046875,
+   3.3515625
+  ],
+  "g_q10_50_90": [
+   0.003082275390625,
+   0.00628662109375,
+   0.984375
+  ],
+  "c_q10_50_90": [
+   10.375031471252441,
+   11.43751049041748,
+   50.5
+  ],
+  "allowed_pairs_q10_50_90": [
+   4.0,
+   21.0,
+   66.0
+  ],
+  "n_win_err": 1036,
+  "n_win_ok": 1304,
+  "win_err_rows_truth_only_vs_pred_only_median": [
+   216.0,
+   0.0
+  ],
+  "win_err_frac_pred_explains_ge_truth": 0.0,
+  "win_ok_rows_truth_only_vs_pred_only_median": [
+   0.0,
+   0.0
+  ],
+  "sub_lineage_share_q10_50_90": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "stay_bonus": 2.1682310104370117
+ }
+}
