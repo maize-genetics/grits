@@ -307,10 +307,19 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  cosine_decay=False, spike_skip=False, spike_mult=8.0,
                  loss_spike_mult=5.0,
                  learned_het=False, founder_affinity=False, fast_cells=False,
-                 tie_aware_loss=False):
+                 tie_aware_loss=False, aux_loss_weight=0.0, stage1_aux_only=False,
+                 aux_w_founder=1.0, aux_w_gate=1.0, aux_w_switch=1.0,
+                 freeze_encoder_trunk=False):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
+        # Two-stage training (experiments/two-stage/): auxiliary encoder targets.
+        # aux_loss_weight>0 adds them to the CRF loss; stage1_aux_only trains on them
+        # ALONE (no CRF NLL, no gate_reg). Both off by default -> loss unchanged.
+        self.aux_loss_weight = aux_loss_weight
+        self.stage1_aux_only = stage1_aux_only
+        self.aux_w = (aux_w_founder, aux_w_gate, aux_w_switch)
+        self.freeze_encoder_trunk = freeze_encoder_trunk
         self.num_parents = num_parents
         self.lr = lr
         self.weight_decay = weight_decay
@@ -345,11 +354,22 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         self.register_buffer("nsw_pair", nsw)
         self.register_buffer("homo_mask", (pi == pj).float())
         self.P = pi.numel()
+        if freeze_encoder_trunk:
+            # Stage-2 "CRF-only" variant. The CRF itself has ONE free parameter
+            # (stay_bonus); emissions, gate and switch cost are all encoder outputs.
+            # So this freezes the trunk (cell embed, founder pooling, transformer,
+            # count_proj) and trains the heads (gate_head, recomb_head, ext_bias,
+            # het_head) + stay_bonus through the CRF loss.
+            for mod in (self.encoder.cell, self.encoder.fpool, self.encoder.pos_encoder,
+                        self.encoder.count_proj):
+                for q in mod.parameters():
+                    q.requires_grad_(False)
+            self.encoder.fquery.requires_grad_(False)
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"GRITSCRFDiploidIndel: K={K} states, P={self.P} pair-states, "
               f"{n_params:,} params")
 
-    def forward(self, X, homo_scale=None, ext_emb=None, count=None):
+    def forward(self, X, homo_scale=None, ext_emb=None, count=None, return_raw=False):
         B, T, K_feat, _ = X.shape
         K = self.num_parents + 1
         # Null-founder pad: (TERN_DIV, DIST_PAD), not zeros — DIST_PAD=-1 is
@@ -369,12 +389,11 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         if count is not None:                                    # 0 = no read support, neutral
             count = torch.cat(
                 [count, torch.zeros(B, T, 1, device=X.device, dtype=count.dtype)], dim=2)
-        if self.learned_het:
-            emis_f, g, c, het = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
-                                             emit_het=True, count=count)
-        else:
-            emis_f, g, c = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
-                                        count=count)  # [B,T,K]
+        enc = self.encoder(X_pad, founder_mask, ext_emb=ext_emb, emit_het=self.learned_het,
+                           count=count, return_raw=return_raw)
+        emis_f, g, c = enc[:3]                                   # [B,T,K]
+        het = enc[3] if self.learned_het else None
+        raw_f = enc[-1] if return_raw else None
         emis_p = emis_f[..., self.pi] + emis_f[..., self.pj]     # [B,T,P]
         if self.learned_het:
             het_pen = F.softplus(het).unsqueeze(-1)              # [B,T,1] >= 0
@@ -384,6 +403,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             if homo_scale is not None:
                 pen = pen * homo_scale.view(B, 1, 1)
             emis_p = emis_p - pen * self.homo_mask
+        if return_raw:
+            return emis_p, g, c, raw_f
         return emis_p, g, c
 
     def _pair_labels(self, h1, h2):
@@ -401,24 +422,93 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         e1, e2 = eq(h1), eq(h2)
         return (e1[..., self.pi] & e2[..., self.pj]) | (e1[..., self.pj] & e2[..., self.pi])
 
+    def _founder_sets(self, h1, h2, lin):
+        """[B,T,K+1] bool per chromosome: founders equivalent to the true one at
+        each row (same ancestral lineage if `lin` given, else the label itself);
+        the null label (K) is equivalent only to itself."""
+        Kf = self.num_parents
+        def eq(h):
+            real = (h < Kf).unsqueeze(-1)
+            if lin is not None:
+                lh = lin.gather(2, h.clamp(max=Kf - 1).unsqueeze(-1))
+                e = (lin == lh) & real
+            else:
+                e = F.one_hot(h.clamp(max=Kf - 1), Kf).bool() & real
+            return torch.cat([e, ~real], dim=2)
+        return eq(h1), eq(h2)
+
+    def aux_targets(self, X, h1, h2, lin=None):
+        """Stage-1 encoder targets, all derivable from existing labels/lineage/input
+        (no simulator sidecar):
+          founder [B,T,K+1]: founder f is (lineage-equivalent to) one of the two true
+                             founders at row t.
+          gate    [B,T]:     row is informative = the read is explained by the true
+                             pair (some true-set founder has tern==1) AND it is
+                             discriminative (<= half the real founders match).
+          switch  [B,T-1]:   a true switch into row t+1 = no pair state is allowed at
+                             both t and t+1 (lineage-aware; label change without lin).
+        """
+        e1, e2 = self._founder_sets(h1, h2, lin)
+        founder = e1 | e2
+        tern = X[..., 0]
+        match = torch.cat([tern == TERN_MATCH, torch.zeros_like(tern[..., :1], dtype=torch.bool)], 2)
+        explained = (match & founder).any(-1)
+        discrim = (tern == TERN_MATCH).float().sum(-1) <= self.num_parents / 2
+        gate = explained & discrim
+        if lin is not None:
+            allowed = (e1[..., self.pi] & e2[..., self.pj]) | (e1[..., self.pj] & e2[..., self.pi])
+            switch = ~(allowed[:, 1:] & allowed[:, :-1]).any(-1)
+        else:
+            tags = self._pair_labels(h1, h2)
+            switch = tags[:, 1:] != tags[:, :-1]
+        return founder, gate, switch
+
+    def aux_loss(self, raw_f, g, c, targets):
+        """Weighted sum of (founder BCE on UNGATED per-founder emissions, gate BCE on
+        g, switch BCE with switch logit -c: p_switch = sigmoid(-c), the CRF's own
+        per-chromosome switch penalty read as a log-odds). fp32, autocast-safe."""
+        founder, gate, switch = targets
+        wf, wg, ws = self.aux_w
+        lf = F.binary_cross_entropy_with_logits(raw_f.float(), founder.float())
+        gf = g.float().clamp(1e-6, 1 - 1e-6)
+        lg = -(gate.float() * gf.log() + (1 - gate.float()) * (1 - gf).log()).mean()
+        ls = F.binary_cross_entropy_with_logits(-c[:, 1:].float(), switch.float())
+        return wf * lf + wg * lg + ws * ls, (lf, lg, ls)
+
     def _step(self, batch):
         X, h1, h2 = batch["input_embeds"], batch["h1"], batch["h2"]
-        emis_p, g, c = self(X, batch.get("homo_scale"), batch.get("ext_emb"),
-                            batch.get("count"))
+        want_aux = self.stage1_aux_only or self.aux_loss_weight > 0
+        out = self(X, batch.get("homo_scale"), batch.get("ext_emb"), batch.get("count"),
+                   return_raw=want_aux)
+        emis_p, g, c = out[:3]
         tags = self._pair_labels(h1, h2)
+        self._aux_parts = None
+        if want_aux:
+            aux, self._aux_parts = self.aux_loss(
+                out[3], g, c, self.aux_targets(X, h1, h2, batch.get("lin")))
+        if self.stage1_aux_only:
+            return aux, aux, g, c, emis_p, tags
         if self.tie_aware_loss and "lin" in batch:
             crf = _dcrf_nll_tied(emis_p, c, self.nsw_pair, self.stay_bonus,
                                  self._allowed_pairs(h1, h2, batch["lin"]))
         else:
             crf = _dcrf_nll(emis_p, c, self.nsw_pair, self.stay_bonus, tags)
         loss = crf + self.gate_reg * (1.0 - g).mean()
+        if want_aux:
+            loss = loss + self.aux_loss_weight * aux
         return loss, crf, g, c, emis_p, tags
+
+    def _log_aux(self, prefix):
+        if self._aux_parts is not None:
+            for name, v in zip(("founder", "gate", "switch"), self._aux_parts):
+                self.log(f"{prefix}/aux_{name}", v)
 
     def training_step(self, batch, _):
         loss, crf, g, c, _, _ = self._step(batch)
         self.log("train/loss", loss, prog_bar=True)
         self.log("train/crf_loss", crf)
         self.log("train/gate", g.mean())
+        self._log_aux("train")
         if self.spike_skip:
             self._loss_seen += 1
             cv = float(crf.detach())
@@ -474,11 +564,22 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                     2, pred.unsqueeze(-1)).float().mean()
             self.log("val/pair_acc_tie", ok, prog_bar=True)
             self.log("val_pair_acc_tie", ok)            # slash-free alias for checkpointing
+            # per-individual-type tie accuracy (individuals are all-homozygous inbreds
+            # or hybrids): a window counts as inbred if every row's h1==h2
+            with torch.no_grad():
+                okw = self._allowed_pairs(batch["h1"], batch["h2"], batch["lin"]).gather(
+                    2, pred.unsqueeze(-1)).squeeze(-1).float()
+                inb = (batch["h1"] == batch["h2"]).all(1)
+                if inb.any():
+                    self.log("val/tie_acc_inbred", okw[inb].mean(), batch_size=int(inb.sum()))
+                if (~inb).any():
+                    self.log("val/tie_acc_hybrid", okw[~inb].mean(), batch_size=int((~inb).sum()))
         self.log("val/loss", loss, prog_bar=True)
         self.log("val/pair_acc", pair_acc, prog_bar=True)
         self.log("val_pair_acc", pair_acc)              # slash-free alias, see train_diploid.py
         self.log("val/hap_acc", hap_acc, prog_bar=True)
         self.log("val/gate", g.mean())
+        self._log_aux("val")
         return loss
 
     def on_before_optimizer_step(self, optimizer):
@@ -951,6 +1052,20 @@ def parse_args():
     p.add_argument("--lineage-labels", default=None,
                    help="[N,T,K] int8 per-row lineage sidecar (default with --tie-aware-loss: "
                         "<data minus .npy>.lin.npy, written by gen_training_data.py)")
+    p.add_argument("--stage1-aux-only", action="store_true",
+                   help="two-stage training, stage 1: train the encoder on the auxiliary "
+                        "targets only (founder-set BCE on ungated emissions, row-informativeness "
+                        "BCE on the gate g, true-switch BCE on the switch cost c); no CRF NLL, "
+                        "no gate_reg. Stage 2 = a normal run with --warm-start-ckpt <stage-1 ckpt>.")
+    p.add_argument("--aux-loss-weight", type=float, default=0.0,
+                   help="add the auxiliary targets to the normal CRF loss with this weight "
+                        "(single-stage equivalent of two-stage training; also usable in stage 2)")
+    p.add_argument("--aux-w-founder", type=float, default=1.0)
+    p.add_argument("--aux-w-gate", type=float, default=1.0)
+    p.add_argument("--aux-w-switch", type=float, default=1.0)
+    p.add_argument("--freeze-encoder-trunk", action="store_true",
+                   help="stage-2 'CRF-only' variant: freeze cell embed/founder pooling/"
+                        "transformer; train only the gate/switch/affinity heads + stay_bonus")
     p.add_argument("--allow-hparam-mismatch", action="store_true",
                    help="Proceed even if --warm-start-ckpt was trained with different "
                         "model hparams (time_local_emis, homo_penalty, ...) than this "
@@ -1007,7 +1122,10 @@ def main():
         spike_skip=args.spike_skip, spike_mult=args.spike_mult,
         loss_spike_mult=args.loss_spike_mult,
         learned_het=args.learned_het, founder_affinity=args.founder_affinity,
-        fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss)
+        fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss,
+        aux_loss_weight=args.aux_loss_weight, stage1_aux_only=args.stage1_aux_only,
+        aux_w_founder=args.aux_w_founder, aux_w_gate=args.aux_w_gate,
+        aux_w_switch=args.aux_w_switch, freeze_encoder_trunk=args.freeze_encoder_trunk)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate

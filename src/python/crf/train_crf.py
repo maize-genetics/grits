@@ -406,7 +406,11 @@ class IndelFounderPathEncoder(nn.Module):
             cells = cells + self.count_proj(count_n.unsqueeze(-1))
         return cells
 
-    def forward(self, X, founder_mask, dbp=None, ext_emb=None, emit_het=False, count=None):
+    def forward(self, X, founder_mask, dbp=None, ext_emb=None, emit_het=False, count=None,
+                return_raw=False):
+        """return_raw (two-stage training aux losses): also return the UNGATED
+        per-founder emission scores [B,T,K] as the last tuple element. Off by
+        default; the other outputs are unchanged either way."""
         B, T, K, _ = X.shape
         cells = self._embed_cells(X, count=count)
 
@@ -432,6 +436,7 @@ class IndelFounderPathEncoder(nn.Module):
             emis = emis + self.ext_bias(ext_emb).squeeze(-1).unsqueeze(1)   # [B,1,K]
         emis = emis.masked_fill(~founder_mask.bool().unsqueeze(1), NEG_INF)
 
+        raw = emis
         g = torch.sigmoid(self.gate_head(H)).squeeze(-1)
         valid = founder_mask.bool().unsqueeze(1)
         emis = torch.where(valid, g.unsqueeze(-1) * emis.clamp(min=NEG_INF / 2),
@@ -454,11 +459,14 @@ class IndelFounderPathEncoder(nn.Module):
             c = c.unsqueeze(1).expand(B, T)
         else:
             c = F.softplus(self.recomb_head(feats)).squeeze(-1)              # [B,T]
+        out = (emis, g, c)
         if emit_het:
             het = (self.het_head(H).squeeze(-1) if self.het_head is not None
                    else torch.zeros(B, T, device=X.device))                 # [B,T] logit
-            return emis, g, c, het
-        return emis, g, c
+            out = out + (het,)
+        if return_raw:
+            out = out + (raw,)
+        return out
 
     def _entropy(self, emis, founder_mask):
         p = torch.softmax(emis.masked_fill(~founder_mask.bool().unsqueeze(1), NEG_INF), dim=-1)
