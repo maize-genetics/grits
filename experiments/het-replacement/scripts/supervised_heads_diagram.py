@@ -51,19 +51,24 @@ for i, (h, q) in enumerate(heads):
 ax.text(13.45, 7.62, "simulator truth", ha="center", fontsize=12, weight="bold", color="#B06000")
 ax.plot([0.3, 15.7], [5.2, 5.2], color="#DADCE0", lw=1.2)
 
-# ---- 2 set the CRF parameters
-ax.text(0.3, 4.85, "2  Set the CRF's few numbers — simulated data, encoder frozen", fontsize=14.5, weight="bold", color="#188038")
-box(0.3, 2.95, 4.9, 1.65, C["lik"], "Computed from the truth", ["read likelihood ℓ per state", "switch/stay from the switch head"], fs=13, lfs=11)
-box(5.6, 2.95, 4.9, 1.65, C["lik"], "or fitted (≈4–25 numbers)", ["ℓ, stay bonus, penalty and", "prior weights, CRF loss"], fs=13, lfs=11)
-box(10.9, 2.95, 4.8, 1.65, C["truth"], "Check", ["computed ≈ fitted?", "if not, a head is miscalibrated"], fs=13, lfs=11)
-arrow(5.2, 3.75, 5.6, 3.75); arrow(10.5, 3.75, 10.9, 3.75)
+# ---- 2 fit the CRF's few numbers on the encoder's outputs
+ax.text(0.3, 4.85, "2  Fit the emission and CRF numbers — simulated data, encoder frozen", fontsize=14.5, weight="bold", color="#188038")
+box(0.3, 3.0, 2.3, 1.6, C["sim"], "Simulated reads", [], fs=12.5)
+box(3.05, 3.0, 2.6, 1.6, C["enc"], "Frozen encoder", ["gate, switch,", "het, affinity"], fs=12.5, lfs=11)
+box(6.1, 3.0, 3.6, 1.6, C["crf"], "CRF", ["read likelihood ℓ  ← fitted", "stay, penalty, prior weights ← fitted"], fs=12.5, lfs=10.5)
+box(10.15, 3.0, 2.3, 1.6, C["crf"], "Decoded path", [], fs=12.5)
+box(12.9, 3.0, 2.8, 1.6, C["truth"], "True path", ["loss → update", "the fitted numbers"], fs=12.5, lfs=11)
+arrow(2.65, 3.8, 3.05, 3.8); arrow(5.7, 3.8, 6.1, 3.8); arrow(9.75, 3.8, 10.15, 3.8)
+ax.add_patch(FancyArrowPatch((12.88, 3.8), (12.5, 3.8), arrowstyle="-|>", mutation_scale=14, lw=1.4, color="#B06000", linestyle="--"))
+ax.add_patch(FancyArrowPatch((14.3, 3.0), (7.9, 2.98), connectionstyle="arc3,rad=-0.12", arrowstyle="-|>", mutation_scale=14,
+                             lw=1.3, color="#B06000", linestyle="--"))
 ax.plot([0.3, 15.7], [2.7, 2.7], color="#DADCE0", lw=1.2)
 
 # ---- 3 decode real reads
 ax.text(0.3, 2.35, "3  Decode real reads — nothing tuned here", fontsize=14.5, weight="bold", color="#E8710A")
 box(0.3, 0.45, 2.8, 1.65, C["sim"], "Real reads", ["refmap → rows"], fs=13)
 for (y, col, title, sub) in ((1.35, C["enc"], "Encoder", "gate, switch, het, affinity"),
-                             (0.45, C["lik"], "Read likelihood ℓ", "from step 2")):
+                             (0.45, C["lik"], "Read likelihood ℓ", "fitted in step 2")):
     ax.add_patch(FancyBboxPatch((4.0, y), 5.0, 0.72, boxstyle="round,pad=0.03,rounding_size=0.12",
                                 fc=col, ec=C["edge"], lw=1.4))
     ax.text(4.25, y + 0.36, title, ha="left", va="center", fontsize=13, weight="bold")
