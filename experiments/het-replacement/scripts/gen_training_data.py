@@ -44,6 +44,12 @@ def main():
     ap.add_argument("--override", nargs="*", default=[], help="repl_x=value overrides")
     ap.add_argument("--indel-model", default="replacement",
                     help="control runs: e.g. overlay (repl_* params are then unused)")
+    ap.add_argument("--depth-factor", type=float, default=1.0,
+                    help="simulate read depth f x the calibration depth (0.1x): each site stands for 1/f as "
+                         "much genome, so per-bp quantities are rescaled -- founder crossovers and ancestral "
+                         "lineage switches / f, replacement tract length and read shift x f, tract rate / f, "
+                         "obs-table bp_per_site / f. Sites and windows per individual are unchanged, so sets "
+                         "at different depths concatenate (same --windows-per-individual).")
     ap.add_argument("--obs-by-lineage", action="store_true",
                     help="draw the -1/0 state and distance code once per ancestral lineage (IBD founders identical)")
     ap.add_argument("--no-obs-table", action="store_true",
@@ -59,17 +65,30 @@ def main():
     if "repl_max_share" in repl:
         repl["repl_max_share"] = int(repl["repl_max_share"])
     obs = None if args.no_obs_table else p.get("obs_table")
+    recipe = dict(RECIPE)
+    f = args.depth_factor
+    if f != 1.0:
+        recipe["min_cross"] = max(0, int(round(RECIPE["min_cross"] / f)))
+        recipe["max_cross"] = max(1, int(round(RECIPE["max_cross"] / f)))
+        recipe["ancestor_crossovers"] = 8.0 / f            # simulate() default is 8 per individual
+        for k, sc in (("repl_mean_len", f), ("repl_shift_sites", f), ("repl_rate", 1.0 / f)):
+            if k in repl:
+                repl[k] = repl[k] * sc
+        if obs is not None:
+            obs = dict(obs, bp_per_site=obs["bp_per_site"] / f)
+    print("depth factor", f, "| crossovers", recipe["min_cross"], "-", recipe["max_cross"],
+          "| ancestor crossovers", recipe.get("ancestor_crossovers", 8), flush=True)
     print("repl params:", repl, "| obs_table:", "yes" if obs else "no (exact)", flush=True)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{args.prefix}.recipe.json").write_text(json.dumps({"recipe": RECIPE, "indel_model": args.indel_model, "obs_by_lineage": args.obs_by_lineage, "repl": repl, "obs_table": obs,
+    (out / f"{args.prefix}.recipe.json").write_text(json.dumps({"recipe": recipe, "depth_factor": f, "indel_model": args.indel_model, "obs_by_lineage": args.obs_by_lineage, "repl": repl, "obs_table": obs,
                                                                 "windows": args.windows, "seeds": args.seeds}, indent=1))
     parts = []
     for inb, seed in zip(("1.0", "0.0"), args.seeds):
         o, ibd, _i, _p, _h, _c, refpos, short, _tc = simulate(
             np.random.default_rng(seed), windows=args.windows, inbreeding=float(inb),
             indel_model=args.indel_model, obs_table=obs, obs_by_lineage=args.obs_by_lineage,
-            **RECIPE, **repl)
+            **recipe, **repl)
         print(f"inb{inb}: {o.shape}  short windows {100 * short.mean():.2f}%", flush=True)
         np.save(out / f"{args.prefix}_inb{inb}.npy", o)
         np.save(out / f"{args.prefix}_inb{inb}.ibd.npy", ibd)
