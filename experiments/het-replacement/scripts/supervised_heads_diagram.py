@@ -38,7 +38,7 @@ ax.text(0.3, 7.8, "1  Train the encoder — simulated data", fontsize=14.5, weig
 box(0.3, 5.45, 2.8, 2.1, C["sim"], "Simulated reads", ["4 depths (0.1–2x)"], fs=13)
 box(4.0, 5.45, 3.0, 2.1, C["enc"], "Encoder", ["transformer over", "the window"], fs=13)
 arrow(3.15, 6.5, 4.0, 6.5)
-heads = [("gate", "row trustworthy?"), ("switch", "crossover here?"), ("het", "parents distinct?"), ("affinity", "founders in sample")]
+heads = [("gate", "row trustworthy?"), ("crossovers", "how many in this window?"), ("het", "parents distinct?"), ("affinity", "founders in sample")]
 for i, (h, q) in enumerate(heads):
     y = 7.1 - 0.52 * i
     for x, w, col, txt, bold in ((7.8, 2.3, C["enc"], h, True), (11.2, 4.5, C["truth"], q, False)):
@@ -54,7 +54,7 @@ ax.plot([0.3, 15.7], [5.2, 5.2], color="#DADCE0", lw=1.2)
 # ---- 2 fit the CRF's few numbers on the encoder's outputs
 ax.text(0.3, 4.85, "2  Fit the emission and CRF numbers — simulated data, encoder frozen", fontsize=14.5, weight="bold", color="#188038")
 box(0.3, 3.0, 2.3, 1.6, C["sim"], "Simulated reads", [], fs=12.5)
-box(3.05, 3.0, 2.6, 1.6, C["enc"], "Frozen encoder", ["gate, switch,", "het, affinity"], fs=12.5, lfs=11)
+box(3.05, 3.0, 2.6, 1.6, C["enc"], "Frozen encoder", ["gate, crossovers,", "het, affinity"], fs=12.5, lfs=11)
 box(6.1, 3.0, 3.6, 1.6, C["crf"], "CRF", ["read likelihood ℓ  ← fitted", "stay, penalty, prior weights ← fitted"], fs=12.5, lfs=10.5)
 box(10.15, 3.0, 2.3, 1.6, C["crf"], "Decoded path", [], fs=12.5)
 box(12.9, 3.0, 2.8, 1.6, C["truth"], "True path", ["loss → update", "the fitted numbers"], fs=12.5, lfs=11)
@@ -67,7 +67,7 @@ ax.plot([0.3, 15.7], [2.7, 2.7], color="#DADCE0", lw=1.2)
 # ---- 3 decode real reads
 ax.text(0.3, 2.35, "3  Decode real reads — nothing tuned here", fontsize=14.5, weight="bold", color="#E8710A")
 box(0.3, 0.45, 2.8, 1.65, C["sim"], "Real reads", ["refmap → rows"], fs=13)
-for (y, col, title, sub) in ((1.35, C["enc"], "Encoder", "gate, switch, het, affinity"),
+for (y, col, title, sub) in ((1.35, C["enc"], "Encoder", "gate, crossovers, het, affinity"),
                              (0.45, C["lik"], "Read likelihood ℓ", "fitted in step 2")):
     ax.add_patch(FancyBboxPatch((4.0, y), 5.0, 0.72, boxstyle="round,pad=0.03,rounding_size=0.12",
                                 fc=col, ec=C["edge"], lw=1.4))
@@ -76,7 +76,7 @@ for (y, col, title, sub) in ((1.35, C["enc"], "Encoder", "gate, switch, het, aff
     arrow(3.15, 1.27, 4.0, y + 0.36)
     arrow(9.05, y + 0.36, 9.8, 1.27)
 box(9.8, 0.45, 5.9, 1.65, C["crf"], "CRF decode", ["emission = gate × ℓ + affinity, mixture of haplotypes",
-                                                   "switch cost, het penalty → founder-pair path"], fs=13, lfs=11)
+                                                   "switch rate from crossovers, het penalty → path"], fs=13, lfs=11)
 
 for i, (lab, c) in enumerate((("data", C["sim"]), ("encoder (learned)", C["enc"]), ("simulator truth", C["truth"]),
                               ("likelihood", C["lik"]), ("CRF", C["crf"]))):
