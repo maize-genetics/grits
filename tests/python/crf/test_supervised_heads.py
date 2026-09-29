@@ -145,20 +145,29 @@ class TestHeadsModel(unittest.TestCase):
         self.assertIsNotNone(m.encoder.gate_head.weight.grad)
         self.assertIsNotNone(m.encoder.recomb_head.weight.grad)
         self.assertIsNotNone(m.sup_xo_head.weight.grad)
-        for n in ("stay_bonus", "het_w", "aff_w", "c_scale", "c_offset", "xo_scale", "tern_dist_loglik"):
+        for n in ("stay_bonus", "het_w", "aff_w", "c_scale", "c_offset", "log_xo_scale", "tern_dist_loglik"):
             self.assertIsNone(dict(m.named_parameters())[n].grad, n)
 
     def test_stage2_trains_scalars_only(self):
         m = _model(supervised_heads="stage2").train()
         train = {n for n, p in m.named_parameters() if p.requires_grad}
-        self.assertEqual(train, {"tern_loglik", "tern_dist_loglik", "stay_bonus", "het_w", "aff_w",
-                                 "xo_scale"})
+        self.assertEqual(train, {"tern_loglik", "tern_dist_loglik", "het_w", "aff_w", "log_xo_scale"})
         b = _batch()
         b["aff_pred"] = torch.rand(2, 5)
         loss, *_ = m._step(b)
         loss.backward()
         self.assertIsNotNone(m.aff_w.grad)
-        self.assertIsNotNone(m.xo_scale.grad)
+        self.assertIsNotNone(m.log_xo_scale.grad)
+
+    def test_xo_scale_positive_and_old_checkpoints_convert(self):
+        m = _model(supervised_heads="stage2")
+        with torch.no_grad():
+            m.log_xo_scale.fill_(-50.0)
+        self.assertGreater(float(m.xo_scale), 0.0)
+        sd = {k: v for k, v in m.state_dict().items() if k != "log_xo_scale"}
+        sd["xo_scale"] = torch.tensor(2.5)
+        m.load_state_dict(sd)
+        self.assertAlmostEqual(float(m.xo_scale), 2.5, places=5)
 
 
 class TestAffinityTarget(unittest.TestCase):

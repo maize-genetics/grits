@@ -505,15 +505,18 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             self.aff_w = nn.Parameter(torch.tensor(1.0))
             self.c_scale = nn.Parameter(torch.tensor(1.0))      # unused since the xo head
             self.c_offset = nn.Parameter(torch.tensor(math.log(2.0)))
-            self.xo_scale = nn.Parameter(torch.tensor(1.0))
+            # window crossover calibration, fitted in log space: a raw scale can cross 0, where
+            # p = xo_scale*lambda/(T-1) hits its clamp and the gradient dies (sh3 fit B: -0.19)
+            self.log_xo_scale = nn.Parameter(torch.tensor(0.0))
             with torch.no_grad():
                 self.stay_bonus.fill_(0.0)
             nf1, nf2 = _new_founder_tables(pi, pj, nsw)
             self.register_buffer("newf1", nf1)
             self.register_buffer("newf2", nf2)
             if supervised_heads == "stage2":
-                keep = {"tern_loglik", "tern_dist_loglik", "stay_bonus", "het_w", "aff_w",
-                        "xo_scale"}
+                # stay_bonus stays at 0: a bonus on every stay is (up to multi-founder
+                # changes) the same as a higher switch cost, so fitting both is degenerate
+                keep = {"tern_loglik", "tern_dist_loglik", "het_w", "aff_w", "log_xo_scale"}
                 for n_, q in self.named_parameters():
                     q.requires_grad_(n_ in keep)
         self._heads = None
@@ -587,6 +590,17 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                 pen = pen * homo_scale.view(B, 1, 1)
             emis_p = emis_p - pen * self.homo_mask
         return emis_p, g, c
+
+    @property
+    def xo_scale(self):
+        return self.log_xo_scale.exp()
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # checkpoints from before the log-space parameterization store a raw xo_scale
+        k = prefix + "xo_scale"
+        if k in state_dict:
+            state_dict[prefix + "log_xo_scale"] = torch.log(state_dict.pop(k).float().clamp_min(1e-6))
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def _heads_crf(self, X_pad, g, c_head, het_logit, aff_logit, aff_pred):
         """Supervised-heads CRF inputs. Returns (emis_p [B,T,P], g, c [B,T]) and stores the
