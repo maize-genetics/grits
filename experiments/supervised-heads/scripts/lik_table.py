@@ -47,6 +47,9 @@ for dpt in range(a.n_depths):
     tables[f"depth{dpt}"] = (np.log(ps) - np.log(pn)).round(3).tolist()
 ps = (tot_src + 1) / (tot_src + 1).sum(); pn = (tot_non + 1) / (tot_non + 1).sum()
 lr_dist = np.log(ps) - np.log(pn)
+# (state, band) cells never observed for either class carry no simulator evidence: 0 (neutral),
+# not the smoothing artifact log((1/Ns)/(1/Nn))
+lr_dist[(tot_src == 0) & (tot_non == 0)] = 0.0
 s3 = tot_src.sum(1) + 1; n3 = tot_non.sum(1) + 1
 lr3 = np.log(s3 / s3.sum()) - np.log(n3 / n3.sum())
 res = {"tern_dist_loglik": lr_dist.tolist(), "tern_loglik": lr3.tolist(),
