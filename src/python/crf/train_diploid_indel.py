@@ -328,14 +328,21 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         if pair_emission not in ("sum", "mixture"):
             raise ValueError(f"pair_emission must be 'sum' or 'mixture', got {pair_emission!r}")
         self.pair_emission = pair_emission
-        if emission not in ("learned", "likelihood"):
-            raise ValueError(f"emission must be 'learned' or 'likelihood', got {emission!r}")
+        if emission not in ("learned", "likelihood", "likelihood_dist"):
+            raise ValueError(f"emission must be 'learned', 'likelihood' or 'likelihood_dist', got {emission!r}")
         self.emission = emission
         # --emission likelihood: the CRF emission is a read likelihood computed from the input,
         # not an encoder founder score. One learned log-likelihood per ternary state, shared by
         # every founder (deleted / present-no-match / match); init ~ log(1e-3), log(1e-2), 0.
         # The encoder then only supplies the per-row gate g (site weight) and switch cost c.
         self.tern_loglik = nn.Parameter(torch.tensor([-6.9, -4.6, 0.0]))
+        # --emission likelihood_dist: one log-likelihood per (ternary state, anchor-distance band),
+        # still shared by every founder. Bands over the log distance code round(8*log2(1+bp)):
+        # 0 | 1-40 (<30bp) | 41-56 | 57-72 | 73-80 | 81-88 (1-2kb) | 89-104 (2-8kb) | >=105 | -1 none.
+        # Initialised to the per-state values so training starts where 'likelihood' does.
+        self.register_buffer("dist_band_edges", torch.tensor([0.5, 40.5, 56.5, 72.5, 80.5, 88.5, 104.5]))
+        self.tern_dist_loglik = nn.Parameter(
+            torch.tensor([-6.9, -4.6, 0.0]).unsqueeze(1).repeat(1, 9))
         self.num_parents = num_parents
         self.lr = lr
         self.weight_decay = weight_decay
@@ -403,6 +410,12 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         if self.emission == "likelihood":
             tern_idx = (X_pad[..., 0].round().clamp(-1, 1) + 1).long()          # -1/0/1 -> 0/1/2
             emis_f = g.unsqueeze(-1) * self.tern_loglik[tern_idx]            # [B,T,K]
+        elif self.emission == "likelihood_dist":
+            tern_idx = (X_pad[..., 0].round().clamp(-1, 1) + 1).long()
+            d = X_pad[..., 1]
+            band = torch.bucketize(d, self.dist_band_edges)                      # 0..7
+            band = torch.where(d < 0, torch.full_like(band, 8), band)            # no anchor -> 8
+            emis_f = g.unsqueeze(-1) * self.tern_dist_loglik[tern_idx, band]
         if self.pair_emission == "mixture":
             # each row comes from one haplotype or the other: a het pair is credited when
             # EITHER founder explains the row, so two founders explaining different reads
@@ -984,7 +997,7 @@ def parse_args():
                    help="with --founder-affinity: scale the homozygous penalty per simulated individual "
                         "by its true kind (0 inbred, 1 hybrid), as the router does at inference; "
                         "default applies the full penalty to every individual")
-    p.add_argument("--emission", choices=["learned", "likelihood"], default="learned",
+    p.add_argument("--emission", choices=["learned", "likelihood", "likelihood_dist"], default="learned",
                    help="CRF emission source: learned (encoder founder scores, default) or likelihood "
                         "(per-row read log-likelihood from the ternary state, 3 shared learned values; "
                         "the encoder only supplies the gate and switch cost)")

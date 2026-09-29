@@ -88,3 +88,21 @@ def test_train_homo_scale_marks_inbreds_zero():
     ds = IndelDiploidAffinityDataset(d, K, G, train_homo_scale=True)
     assert float(ds[0]["homo_scale"]) == 0.0 and float(ds[3]["homo_scale"]) == 1.0
     assert "homo_scale" not in IndelDiploidAffinityDataset(d, K, G)[0]
+
+
+def test_likelihood_dist_emission_bands():
+    torch.manual_seed(0)
+    m = GRITSCRFDiploidIndel(num_parents=4, d_model=16, n_heads=2, n_layers=1,
+                             emission="likelihood_dist", pair_emission="mixture").eval()
+    with torch.no_grad():
+        m.tern_dist_loglik.copy_(torch.arange(27, dtype=torch.float32).view(3, 9))
+    codes = torch.tensor([0., 20., 50., 60., 75., 85., 100., 120.])        # bands 0..7
+    X = torch.zeros(1, 8, 4, 2)
+    X[0, :, 0, 0] = 1; X[0, :, 0, 1] = codes                               # founder 0: match, all bands
+    X[0, :, 1, 0] = -1; X[0, :, 1, 1] = -1                                  # founder 1: deleted, no anchor
+    with torch.no_grad():
+        ep, g, _ = m(X)
+    homo = m.pi == m.pj
+    p0 = int(torch.nonzero(homo & (m.pi == 0))[0]); p1 = int(torch.nonzero(homo & (m.pi == 1))[0])
+    assert torch.allclose(ep[0, :, p0], g[0] * torch.arange(18, 26, dtype=torch.float32), atol=1e-5)
+    assert torch.allclose(ep[0, :, p1], g[0] * 8.0, atol=1e-5)
