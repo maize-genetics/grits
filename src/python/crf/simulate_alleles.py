@@ -79,6 +79,23 @@ LABEL_PAD = -1
 # existing recomb-rate track's clip-and-round precedent (:threshold near
 # line 492 below): code = clip(round(scale*log2(1+d)), 0, DIST_SAT-1).
 DIST_LOG_SCALE = 8.0
+# --emit-row-provenance sidecar (per output row, int8): bits 0-2 = row kind
+# (0/1 collinear read from hap1/hap2, 2/3 insertion-derived hap1/hap2,
+# 4/5 replacement read hap1/hap2), bit 3 = replacement read placed OFF its
+# source site (shifted), bit 4 = bad site (bad_frac: collinear read corrupted
+# to a random founder's haplotype). PROV_PAD = padded row (short window).
+PROV_KIND_MASK, PROV_OFF_SITE, PROV_BAD_SITE, PROV_PAD = 7, 8, 16, -1
+
+
+def prov_is_clean(prov):
+    """Gate target for a provenance array: the row is a read from one of the
+    individual's own haplotypes, placed at its true site, from an uncorrupted
+    site. Collinear (0/1) rows are clean unless on a bad site; insertion-derived
+    (2/3) rows are always clean (no SNP-level corruption is simulated for them);
+    replacement (4/5) rows are clean only when placed at their source site.
+    Padded rows are not clean."""
+    prov = np.asarray(prov)
+    return (prov >= 0) & ((prov & (PROV_OFF_SITE | PROV_BAD_SITE)) == 0)
 
 
 def _rate_map(rng, n, T, span, tile):
@@ -1093,10 +1110,12 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   max_stack, anchor_thresh, ref_founder, dist_scale,
                   coverage_model="linear", read_len=150, collapse_rows=False,
                   rep_grp=None, rep_shift=0.0, rep_cross_del=0.0, rep_cross_present=0.0,
-                  obs_table=None, obs_lineage=None):
+                  obs_table=None, obs_lineage=None, good=None, emit_provenance=False):
     """Assemble one chunk's indel-mode output:
     `(tern, dist, count [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T]
-    int32, short [n] bool, n_either int, n_hemi int, n_null int)`. `count`
+    int32, short [n] bool, n_either int, n_hemi int, n_null int)`, plus a
+    trailing `prov [n,T] int8` when `emit_provenance` (needs `good`, the
+    [n,R] good-site mask; no RNG draws -- see PROV_* above). `count`
     is always computed (cheap, deterministic) -- callers decide whether to
     write it into a widened output array (experiments/depth-confidence-fix/,
     --emit-read-counts).
@@ -1254,6 +1273,7 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
     lab1_out = np.full((n, T), LABEL_PAD, dtype=np.int8)
     lab2_out = np.full((n, T), LABEL_PAD, dtype=np.int8)
     refpos_out = np.full((n, T), -1, dtype=np.int32)
+    prov_out = np.full((n, T), PROV_PAD, dtype=np.int8) if emit_provenance else None
 
     if w.size:
         b1 = on1[w, t].astype(np.int64)
@@ -1317,6 +1337,16 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
 
         tern_out[w, r] = tern_rows
         dist_out[w, r] = dist_rows
+        if emit_provenance:
+            prov = kind.astype(np.int16)
+            if rs1 is not None:
+                for k_id, rs in ((4, rs1), (5, rs2)):
+                    sel = kind == k_id
+                    prov[sel] |= np.where(rs[w[sel], t[sel]] != t[sel], PROV_OFF_SITE, 0).astype(np.int16)
+            if good is None:
+                raise ValueError("emit_provenance needs the good-site mask")
+            prov |= np.where((kind <= 1) & ~good[w, t], PROV_BAD_SITE, 0).astype(np.int16)
+            prov_out[w, r] = prov.astype(np.int8)
         lab1_out[w, r] = h1[w, t].astype(np.int8)
         lab2_out[w, r] = h2[w, t].astype(np.int8)
         refpos_out[w, r] = t
@@ -1363,8 +1393,9 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
             count_rows = np.repeat(row_group_size[:, None], K, axis=1)  # [Rows,K]
         count_out[w, r] = _encode_dist(count_rows, dist_scale)
 
-    return (tern_out, dist_out, count_out, lab1_out, lab2_out, refpos_out, short,
-            n_either, n_hemi, n_null, n_deleted, n_founder_sites)
+    ret = (tern_out, dist_out, count_out, lab1_out, lab2_out, refpos_out, short,
+           n_either, n_hemi, n_null, n_deleted, n_founder_sites)
+    return ret + (prov_out,) if emit_provenance else ret
 
 
 def simulate(rng, windows, sites, founders, min_cross, max_cross,
@@ -1391,7 +1422,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              repl_cross_del=0.0, repl_cross_present=0.0, repl_groups="random",
              subst_model="dense",
              subst_rate=0.018, coverage_model="linear", read_len=150,
-             emit_read_counts=False, collapse_rows=False, obs_table=None, obs_by_lineage=False):
+             emit_read_counts=False, collapse_rows=False, obs_table=None, obs_by_lineage=False,
+             emit_row_provenance=False):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
     (default) behavior, including rng draw order, is byte-for-byte
@@ -1493,7 +1525,9 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
             rng, windows, windows_per_individual, K, min_founders, max_founders)
     ind_out = ind if (grouped or breeding) else None
 
-    refpos_out = short_out = None
+    refpos_out = short_out = prov_all = None
+    if emit_row_provenance and not simulate_indels:
+        raise ValueError("emit_row_provenance needs simulate_indels")
     true_either_sum = true_hemi_sum = true_null_sum = true_total_sum = 0
     true_deleted_sum = true_founder_sites_sum = 0
     if simulate_indels:
@@ -1509,6 +1543,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
         track = False
         refpos_out = np.empty((windows, T), dtype=np.int32)
         short_out = np.empty(windows, dtype=bool)
+        if emit_row_provenance:
+            prov_all = np.empty((windows, T), dtype=np.int8)
         # Tract arrays scale as n*M*R; keep the per-chunk memory bounded
         # (~4M site-slots/chunk) the same way regardless of how large R is.
         chunk = min(chunk, max(16, int(2 ** 22 // max(1, R))))
@@ -1618,7 +1654,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 subst_model=subst_model, subst_rate=subst_rate)
 
             (tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null,
-             n_deleted, n_founder_sites) = _indel_chunk(
+             n_deleted, n_founder_sites, *prov) = _indel_chunk(
                 rng, n, R, T, K, h1, h2, lineage_indel, del_lin, ins_lin,
                 match1, match2, gamete_balance, indel_coverage,
                 indel_ins_read_per_bp, indel_max_stack, indel_anchor_thresh,
@@ -1627,7 +1663,10 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 rep_grp=rep_grp if indel_model == "replacement" else None,
                 rep_shift=repl_shift_sites, rep_cross_del=repl_cross_del,
                 rep_cross_present=repl_cross_present, obs_table=obs_table,
-                obs_lineage=lineage if obs_by_lineage else None)
+                obs_lineage=lineage if obs_by_lineage else None,
+                good=good, emit_provenance=emit_row_provenance)
+            if emit_row_provenance:
+                prov_all[sl] = prov[0]
 
             out[sl, :, :K] = tern
             out[sl, :, K] = lab1
@@ -1746,6 +1785,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
     true_cov_out = (None if not simulate_indels else
                     (true_either_sum, true_hemi_sum, true_null_sum, true_total_sum,
                      true_deleted_sum, true_founder_sites_sum))
+    if emit_row_provenance:
+        return out, ibd, ind_out, panel, het_tw, cls_w, refpos_out, short_out, true_cov_out, prov_all
     return out, ibd, ind_out, panel, het_tw, cls_w, refpos_out, short_out, true_cov_out
 
 

@@ -406,7 +406,10 @@ class IndelFounderPathEncoder(nn.Module):
             cells = cells + self.count_proj(count_n.unsqueeze(-1))
         return cells
 
-    def forward(self, X, founder_mask, dbp=None, ext_emb=None, emit_het=False, count=None):
+    def forward(self, X, founder_mask, dbp=None, ext_emb=None, emit_het=False, count=None,
+                return_hidden=False):
+        """return_hidden (supervised heads): also return (H [B,T,d], cells [B,T,K,d]) as the
+        last two tuple elements. Off by default; the other outputs are unchanged."""
         B, T, K, _ = X.shape
         cells = self._embed_cells(X, count=count)
 
@@ -454,11 +457,14 @@ class IndelFounderPathEncoder(nn.Module):
             c = c.unsqueeze(1).expand(B, T)
         else:
             c = F.softplus(self.recomb_head(feats)).squeeze(-1)              # [B,T]
+        out = (emis, g, c)
         if emit_het:
             het = (self.het_head(H).squeeze(-1) if self.het_head is not None
                    else torch.zeros(B, T, device=X.device))                 # [B,T] logit
-            return emis, g, c, het
-        return emis, g, c
+            out = out + (het,)
+        if return_hidden:
+            out = out + (H, cells)
+        return out
 
     def _entropy(self, emis, founder_mask):
         p = torch.softmax(emis.masked_fill(~founder_mask.bool().unsqueeze(1), NEG_INF), dim=-1)

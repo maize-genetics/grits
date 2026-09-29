@@ -231,8 +231,11 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
     has no calibration constants to shift, just mean/centered-mean over the
     MATCH view) attached to every window of the individual."""
     def __init__(self, data, num_parents, windows_per_individual, lin=None,
-                 train_homo_scale=False):
+                 train_homo_scale=False, prov=None, aff_target=None, aff_pred=None):
         super().__init__(data, num_parents, lin)
+        self.prov = prov                  # [N,T] int8 row provenance (--supervised-heads)
+        self.aff_target = aff_target      # [N/G,K] true per-individual affinity
+        self.aff_pred = aff_pred          # [N/G,K] pooled affinity-head prediction (stage2)
         G = windows_per_individual
         if len(data) % G:
             raise ValueError(f"rows {len(data)} not divisible by windows/ind {G}")
@@ -257,12 +260,37 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
         out["ext_emb"] = torch.tensor(self.affinity[idx // self.G], dtype=torch.float32)
         if self.homo_scale is not None:
             out["homo_scale"] = torch.tensor(self.homo_scale[idx // self.G], dtype=torch.float32)
+        if self.prov is not None:
+            out["prov"] = torch.tensor(np.asarray(self.prov[idx], dtype=np.int64))
+        if self.aff_target is not None:
+            out["aff_target"] = torch.tensor(self.aff_target[idx // self.G], dtype=torch.float32)
+        if self.aff_pred is not None:
+            out["aff_pred"] = torch.tensor(self.aff_pred[idx // self.G], dtype=torch.float32)
         return out
+
+
+def individual_affinity_target(data, lin, num_parents, G):
+    """[N/G,K] float32: per individual, the fraction of its labelled rows where founder f is
+    lineage-equivalent (same ancestral lineage at the row) to one of the two true founders."""
+    K = num_parents
+    n_ind = len(data) // G
+    out = np.zeros((n_ind, K), dtype=np.float32)
+    for i in range(n_ind):
+        lab = np.asarray(data[i * G:(i + 1) * G, :, K:K + 2]).astype(np.int64)    # [G,T,2]
+        L = np.asarray(lin[i * G:(i + 1) * G]).astype(np.int64)                  # [G,T,K]
+        real = (lab[..., 0] >= 0) & (lab[..., 1] >= 0)
+        h1, h2 = np.clip(lab[..., 0], 0, K - 1), np.clip(lab[..., 1], 0, K - 1)
+        l1 = np.take_along_axis(L, h1[..., None], -1)
+        l2 = np.take_along_axis(L, h2[..., None], -1)
+        mem = ((L == l1) | (L == l2)) & real[..., None]
+        out[i] = mem.sum((0, 1)) / max(1, real.sum())
+    return out
 
 
 def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G, limit_n=0,
                                        split_seed=0, legacy_tail_split=False, lin_path=None,
-                                       train_homo_scale=False):
+                                       train_homo_scale=False, prov_path=None, aff_targets=False,
+                                       aff_pred_path=None):
     """Individual-aligned split, same boundaries as
     make_indel_diploid_individual_splits (mirrors train_diploid.py's
     make_diploid_affinity_splits intent)."""
@@ -274,9 +302,18 @@ def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G
     n_ind = N // G
     splits = individual_split_rows(n_ind, G, val_frac, test_frac, split_seed, legacy_tail_split)
     lin = _load_lineage(lin_path, data)
-    mk = lambda rows: IndelDiploidAffinityDataset(data[rows], num_parents, G,
-                                                  None if lin is None else lin[rows],
-                                                  train_homo_scale=train_homo_scale)
+    prov = None if prov_path is None else np.load(prov_path, mmap_mode="r")[:N]
+    aff_pred = None if aff_pred_path is None else np.load(aff_pred_path)[:n_ind]
+
+    def mk(rows):
+        ids = rows[::G] // G
+        lr = None if lin is None else lin[rows]
+        dr = data[rows]
+        return IndelDiploidAffinityDataset(
+            dr, num_parents, G, lr, train_homo_scale=train_homo_scale,
+            prov=None if prov is None else prov[rows],
+            aff_target=(individual_affinity_target(dr, lr, num_parents, G) if aff_targets else None),
+            aff_pred=None if aff_pred is None else aff_pred[ids])
     print(f"IndelDiploid(affinity) {Path(path).name}: N={N:,} individuals={n_ind} "
           f"train={len(splits[0]):,} val={len(splits[1]):,} test={len(splits[2]):,} "
           f"split={'legacy-tail' if legacy_tail_split else f'shuffled(seed={split_seed})'}")
@@ -307,6 +344,68 @@ def _dcrf_nll_tied(emis, c, nsw, stay_bonus, allowed):
     return (torch.logsumexp(a, dim=1) - torch.logsumexp(b, dim=1)).mean()
 
 
+def _new_founder_tables(pi, pj, nsw):
+    """[P,P] long x2: the founder(s) newly entered on the transition p -> q (multiset
+    q minus p; K = none). nsw=1 -> one new founder, nsw=2 -> two, nsw=0 -> none."""
+    from collections import Counter
+    P = pi.numel()
+    K = int(max(pi.max(), pj.max())) + 1
+    n1 = torch.full((P, P), K, dtype=torch.long)
+    n2 = torch.full((P, P), K, dtype=torch.long)
+    pairs = list(zip(pi.tolist(), pj.tolist()))
+    for a, pa in enumerate(pairs):
+        cp = Counter(pa)
+        for b, qb in enumerate(pairs):
+            new = list((Counter(qb) - cp).elements())
+            if nsw[a, b] == 0:
+                continue
+            new = new[:int(nsw[a, b])]
+            if len(new) > 0:
+                n1[a, b] = new[0]
+            if len(new) > 1:
+                n2[a, b] = new[1]
+    return n1, n2
+
+
+def _prior_trans(c_t, nsw, stay_bonus, trans_prior):
+    stay_mask = (nsw == 0).float()
+    return (-c_t[:, None, None] * nsw[None] + stay_bonus * stay_mask[None] + trans_prior)
+
+
+def crf_nll_prior(emis, c, nsw, stay_bonus, allowed, trans_prior, init_prior):
+    """Tie-aware pair CRF NLL (as _dcrf_nll_tied) with a per-sample transition prior
+    trans_prior [B,P,P] (added to every p->q step) and initial prior init_prior [B,P]."""
+    emis = emis.float(); c = c.float(); nsw = nsw.float()
+    sb = stay_bonus.float(); tp = trans_prior.float()
+    neg = torch.tensor(-1e9, dtype=emis.dtype, device=emis.device)
+    emis_a = torch.where(allowed, emis, neg)
+    a = emis[:, 0] + init_prior.float()
+    b = emis_a[:, 0] + init_prior.float()
+    for t in range(1, emis.shape[1]):
+        tr = _prior_trans(c[:, t], nsw, sb, tp)
+        a = emis[:, t] + torch.logsumexp(a.unsqueeze(2) + tr, dim=1)
+        b = emis_a[:, t] + torch.logsumexp(b.unsqueeze(2) + tr, dim=1)
+    return (torch.logsumexp(a, dim=1) - torch.logsumexp(b, dim=1)).mean()
+
+
+@torch.no_grad()
+def crf_viterbi_prior(emis, c, nsw, stay_bonus, trans_prior, init_prior):
+    emis = emis.float(); c = c.float(); nsw = nsw.float()
+    sb = stay_bonus.float(); tp = trans_prior.float()
+    B, T, P = emis.shape
+    delta = emis[:, 0] + init_prior.float()
+    bp = torch.zeros(T - 1, B, P, dtype=torch.long, device=emis.device)
+    for t in range(1, T):
+        best, idx = (delta.unsqueeze(2) + _prior_trans(c[:, t], nsw, sb, tp)).max(dim=1)
+        delta = emis[:, t] + best
+        bp[t - 1] = idx
+    path = torch.zeros(B, T, dtype=torch.long, device=emis.device)
+    path[:, T - 1] = delta.argmax(dim=1)
+    for t in range(T - 2, -1, -1):
+        path[:, t] = bp[t].gather(1, path[:, t + 1].unsqueeze(1)).squeeze(1)
+    return path
+
+
 class GRITSCRFDiploidIndel(pl.LightningModule):
     """Mirrors GRITSCRFDiploid's structure exactly — same loss, same CRF
     kernels (imported from crf_kernels.py), same training-loop glue.
@@ -321,7 +420,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  cosine_decay=False, spike_skip=False, spike_mult=8.0,
                  loss_spike_mult=5.0,
                  learned_het=False, founder_affinity=False, fast_cells=False,
-                 tie_aware_loss=False, pair_emission="sum", emission="learned"):
+                 tie_aware_loss=False, pair_emission="sum", emission="learned",
+                 supervised_heads="off"):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
@@ -377,11 +477,45 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         self.register_buffer("nsw_pair", nsw)
         self.register_buffer("homo_mask", (pi == pj).float())
         self.P = pi.numel()
+        # --supervised-heads (experiments/supervised-heads/): the encoder is trained DIRECTLY
+        # on simulator-truth targets (stage1) -- gate g = P(row clean), switch p = sigmoid(-c),
+        # het h = P(true founders are distinct lineages), per-founder affinity a = fraction of
+        # the individual's rows where the founder is a true (lineage-equivalent) founder -- and
+        # then (stage2) only the CRF scalars below are fitted with the encoder frozen.
+        # Created last so that flags-off models keep their exact init RNG stream.
+        if supervised_heads not in ("off", "stage1", "stage2"):
+            raise ValueError(f"supervised_heads must be off/stage1/stage2, got {supervised_heads!r}")
+        self.supervised_heads = supervised_heads
+        if supervised_heads != "off":
+            if emission not in ("likelihood", "likelihood_dist"):
+                raise ValueError("--supervised-heads needs --emission likelihood or likelihood_dist")
+            self.sup_het_head = nn.Linear(d_model, 1)
+            self.sup_aff_head = nn.Linear(d_model, 1)
+            # CRF scalars in the heads model, at their simulator-derived values ("A"):
+            # emission = log(g*mean(exp(l_i), exp(l_j)) + 1-g) with l a log-LR table;
+            # het prior w_het*log(h | 1-h); transitions stay 0 / switch -c per founder change
+            # with c = c_scale*c_head + c_offset (c_head = -logit p), plus w_aff*log(a_x/sum a)
+            # for each newly entered founder x and at the first row.
+            self.het_w = nn.Parameter(torch.tensor(1.0))
+            self.aff_w = nn.Parameter(torch.tensor(1.0))
+            self.c_scale = nn.Parameter(torch.tensor(1.0))
+            self.c_offset = nn.Parameter(torch.tensor(math.log(2.0)))
+            with torch.no_grad():
+                self.stay_bonus.fill_(0.0)
+            nf1, nf2 = _new_founder_tables(pi, pj, nsw)
+            self.register_buffer("newf1", nf1)
+            self.register_buffer("newf2", nf2)
+            if supervised_heads == "stage2":
+                keep = {"tern_loglik", "tern_dist_loglik", "stay_bonus", "het_w", "aff_w",
+                        "c_scale", "c_offset"}
+                for n_, q in self.named_parameters():
+                    q.requires_grad_(n_ in keep)
+        self._heads = None
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"GRITSCRFDiploidIndel: K={K} states, P={self.P} pair-states, "
               f"{n_params:,} params")
 
-    def forward(self, X, homo_scale=None, ext_emb=None, count=None):
+    def forward(self, X, homo_scale=None, ext_emb=None, count=None, aff_pred=None):
         B, T, K_feat, _ = X.shape
         K = self.num_parents + 1
         # Null-founder pad: (TERN_DIV, DIST_PAD), not zeros — DIST_PAD=-1 is
@@ -401,9 +535,20 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         if count is not None:                                    # 0 = no read support, neutral
             count = torch.cat(
                 [count, torch.zeros(B, T, 1, device=X.device, dtype=count.dtype)], dim=2)
+        sup = self.supervised_heads != "off"
         if self.learned_het:
             emis_f, g, c, het = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
                                              emit_het=True, count=count)
+        elif sup:
+            emis_f, g, c, H, cells = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
+                                                  count=count, return_hidden=True)
+            Kf = self.num_parents
+            gate_logit = self.encoder.gate_head(H).squeeze(-1)                  # [B,T]
+            het_logit = self.sup_het_head(H).squeeze(-1)                       # [B,T]
+            pooled = (cells[:, :, :Kf, :] * H.unsqueeze(2)).mean(1)            # [B,Kf,d]
+            aff_logit = self.sup_aff_head(pooled).squeeze(-1)                  # [B,Kf]
+            self._heads = dict(gate_logit=gate_logit, het_logit=het_logit,
+                               aff_logit=aff_logit, c=c)
         else:
             emis_f, g, c = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
                                         count=count)  # [B,T,K]
@@ -416,6 +561,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             band = torch.bucketize(d, self.dist_band_edges)                      # 0..7
             band = torch.where(d < 0, torch.full_like(band, 8), band)            # no anchor -> 8
             emis_f = g.unsqueeze(-1) * self.tern_dist_loglik[tern_idx, band]
+        if sup:
+            return self._heads_crf(X_pad, g, c, het_logit, aff_logit, aff_pred)
         if self.pair_emission == "mixture":
             # each row comes from one haplotype or the other: a het pair is credited when
             # EITHER founder explains the row, so two founders explaining different reads
@@ -434,6 +581,46 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             emis_p = emis_p - pen * self.homo_mask
         return emis_p, g, c
 
+    def _heads_crf(self, X_pad, g, c_head, het_logit, aff_logit, aff_pred):
+        """Supervised-heads CRF inputs. Returns (emis_p [B,T,P], g, c [B,T]) and stores the
+        transition prior self._trans_prior [B,P,P] and initial prior self._init_prior [B,P]
+        (consumed by crf_nll_prior / crf_viterbi_prior). homo_scale is not used."""
+        B, T = g.shape
+        Kf = self.num_parents
+        tern_idx = (X_pad[..., 0].round().clamp(-1, 1) + 1).long()
+        if self.emission == "likelihood_dist":
+            d = X_pad[..., 1]
+            band = torch.bucketize(d, self.dist_band_edges)
+            band = torch.where(d < 0, torch.full_like(band, 8), band)
+            ll = self.tern_dist_loglik[tern_idx, band].float()                  # [B,T,K] log-LR
+        else:
+            ll = self.tern_loglik[tern_idx].float()
+        # null founder: log-LR 0 (uninformative) -- it is never a row's source in the simulator
+        ll = torch.cat([ll[..., :Kf], torch.zeros_like(ll[..., :1])], -1)
+        mix = torch.logaddexp(ll[..., self.pi], ll[..., self.pj]) - math.log(2.0)   # [B,T,P]
+        gf = g.float().clamp(1e-6, 1 - 1e-6).unsqueeze(-1)
+        emis_p = torch.logaddexp(torch.log(gf) + mix, torch.log1p(-gf))
+        h = torch.sigmoid(het_logit.float()).clamp(1e-4, 1 - 1e-4).unsqueeze(-1)
+        emis_p = emis_p + self.het_w * (self.homo_mask * torch.log1p(-h)
+                                        + (1 - self.homo_mask) * torch.log(h))
+        a = aff_pred if aff_pred is not None else torch.sigmoid(aff_logit.float())
+        a = torch.cat([a.float().clamp(1e-3, 1.0), torch.full_like(a[:, :1], 1e-3)], 1)
+        la = torch.log(a / a[:, :Kf].sum(1, keepdim=True))                     # [B,K]
+        la0 = torch.cat([la, torch.zeros_like(la[:, :1])], 1)                   # index K = none
+        self._trans_prior = self.aff_w * (la0[:, self.newf1] + la0[:, self.newf2])   # [B,P,P]
+        self._init_prior = self.aff_w * (la[:, self.pi] + la[:, self.pj])       # [B,P]
+        c = self.c_scale * c_head.float() + self.c_offset
+        return emis_p, g, c
+
+    def crf_decode(self, emis_p, c, stay_bonus=None, marginal=False):
+        """Viterbi for this model: the prior-aware kernel in heads mode, else _dcrf_viterbi."""
+        sb = self.stay_bonus if stay_bonus is None else stay_bonus
+        if self.supervised_heads != "off":
+            return crf_viterbi_prior(emis_p, c, self.nsw_pair, sb, self._trans_prior,
+                                     self._init_prior)
+        dec = _dcrf_marginal if marginal else _dcrf_viterbi
+        return dec(emis_p, c, self.nsw_pair, sb)
+
     def _pair_labels(self, h1, h2):
         return self.pair_table[h1, h2]                           # [B,T]
 
@@ -449,11 +636,62 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         e1, e2 = eq(h1), eq(h2)
         return (e1[..., self.pi] & e2[..., self.pj]) | (e1[..., self.pj] & e2[..., self.pi])
 
+    def head_targets(self, h1, h2, lin, prov=None):
+        """Simulator-truth targets for --supervised-heads (masks: True = row counts).
+          gate   [B,T]   row clean per simulate_alleles.prov_is_clean (needs prov)
+          switch [B,T-1] lineage-aware switch between rows t and t+1 (no pair state
+                         allowed at both rows)
+          het    [B,T]   the two true founders are distinct ancestral lineages at t
+        Rows with a null (padded) label are masked out of het and switch."""
+        Kf = self.num_parents
+        def eq(h):
+            lh = lin.gather(2, h.clamp(max=Kf - 1).unsqueeze(-1))
+            real = (h < Kf).unsqueeze(-1)
+            return torch.cat([(lin == lh) & real, ~real], dim=2)
+        e1, e2 = eq(h1), eq(h2)
+        allowed = (e1[..., self.pi] & e2[..., self.pj]) | (e1[..., self.pj] & e2[..., self.pi])
+        switch = ~(allowed[:, 1:] & allowed[:, :-1]).any(-1)
+        real = (h1 < Kf) & (h2 < Kf)
+        l1 = lin.gather(2, h1.clamp(max=Kf - 1).unsqueeze(-1)).squeeze(-1)
+        l2 = lin.gather(2, h2.clamp(max=Kf - 1).unsqueeze(-1)).squeeze(-1)
+        het = l1 != l2
+        out = dict(switch=switch, switch_mask=real[:, 1:] & real[:, :-1], het=het, het_mask=real)
+        if prov is not None:
+            from python.crf.simulate_alleles import PROV_OFF_SITE, PROV_BAD_SITE
+            out["gate"] = (prov >= 0) & ((prov & (PROV_OFF_SITE | PROV_BAD_SITE)) == 0)
+            out["gate_mask"] = prov >= 0
+        return out
+
+    def head_loss(self, heads, tg, aff_target=None):
+        """Mean masked BCE per head (fp32); returns total and the parts."""
+        def bce(logit, y, m):
+            l = F.binary_cross_entropy_with_logits(logit.float(), y.float(), reduction="none")
+            m = m.float()
+            return (l * m).sum() / m.sum().clamp_min(1.0)
+        parts = {"switch": bce(-heads["c"][:, 1:], tg["switch"], tg["switch_mask"]),
+                 "het": bce(heads["het_logit"], tg["het"], tg["het_mask"])}
+        if "gate" in tg:
+            parts["gate"] = bce(heads["gate_logit"], tg["gate"], tg["gate_mask"])
+        if aff_target is not None:
+            parts["aff"] = F.binary_cross_entropy_with_logits(heads["aff_logit"].float(),
+                                                              aff_target.float())
+        return sum(parts.values()), parts
+
     def _step(self, batch):
         X, h1, h2 = batch["input_embeds"], batch["h1"], batch["h2"]
         emis_p, g, c = self(X, batch.get("homo_scale"), batch.get("ext_emb"),
-                            batch.get("count"))
+                            batch.get("count"), batch.get("aff_pred"))
         tags = self._pair_labels(h1, h2)
+        self._head_parts = None
+        if self.supervised_heads == "stage1":
+            tg = self.head_targets(h1, h2, batch["lin"], batch.get("prov"))
+            loss, self._head_parts = self.head_loss(self._heads, tg, batch.get("aff_target"))
+            return loss, loss, g, c, emis_p, tags
+        if self.supervised_heads != "off":
+            crf = crf_nll_prior(emis_p, c, self.nsw_pair, self.stay_bonus,
+                                self._allowed_pairs(h1, h2, batch["lin"]),
+                                self._trans_prior, self._init_prior)
+            return crf, crf, g, c, emis_p, tags
         if self.tie_aware_loss and "lin" in batch:
             crf = _dcrf_nll_tied(emis_p, c, self.nsw_pair, self.stay_bonus,
                                  self._allowed_pairs(h1, h2, batch["lin"]))
@@ -462,11 +700,17 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         loss = crf + self.gate_reg * (1.0 - g).mean()
         return loss, crf, g, c, emis_p, tags
 
+    def _log_heads(self, prefix):
+        if getattr(self, "_head_parts", None):
+            for k, v in self._head_parts.items():
+                self.log(f"{prefix}/head_{k}", v)
+
     def training_step(self, batch, _):
         loss, crf, g, c, _, _ = self._step(batch)
         self.log("train/loss", loss, prog_bar=True)
         self.log("train/crf_loss", crf)
         self.log("train/gate", g.mean())
+        self._log_heads("train")
         if self.spike_skip:
             self._loss_seen += 1
             cv = float(crf.detach())
@@ -482,7 +726,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
 
     @torch.no_grad()
     def _accuracy(self, emis_p, c, h1, h2):
-        pred = _dcrf_viterbi(emis_p, c, self.nsw_pair, self.stay_bonus)
+        pred = self.crf_decode(emis_p, c)
         pair_true = self.pair_table[h1, h2]
         pair_acc = (pred == pair_true).float().mean()
         pred_lo, pred_hi = self.pi[pred], self.pj[pred]
@@ -517,16 +761,26 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         pair_acc, hap_acc = self._accuracy(emis_p, c, batch["h1"], batch["h2"])
         if "lin" in batch:
             with torch.no_grad():
-                pred = _dcrf_viterbi(emis_p, c, self.nsw_pair, self.stay_bonus)
+                pred = self.crf_decode(emis_p, c)
                 ok = self._allowed_pairs(batch["h1"], batch["h2"], batch["lin"]).gather(
                     2, pred.unsqueeze(-1)).float().mean()
             self.log("val/pair_acc_tie", ok, prog_bar=True)
             self.log("val_pair_acc_tie", ok)            # slash-free alias for checkpointing
+            with torch.no_grad():
+                okw = self._allowed_pairs(batch["h1"], batch["h2"], batch["lin"]).gather(
+                    2, pred.unsqueeze(-1)).squeeze(-1).float()
+                inb = (batch["h1"] == batch["h2"]).all(1)
+                if inb.any():
+                    self.log("val/tie_acc_inbred", okw[inb].mean(), batch_size=int(inb.sum()))
+                if (~inb).any():
+                    self.log("val/tie_acc_hybrid", okw[~inb].mean(), batch_size=int((~inb).sum()))
         self.log("val/loss", loss, prog_bar=True)
+        self.log("val_loss", loss)
         self.log("val/pair_acc", pair_acc, prog_bar=True)
         self.log("val_pair_acc", pair_acc)              # slash-free alias, see train_diploid.py
         self.log("val/hap_acc", hap_acc, prog_bar=True)
         self.log("val/gate", g.mean())
+        self._log_heads("val")
         return loss
 
     def on_before_optimizer_step(self, optimizer):
@@ -692,6 +946,14 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
           f"switch_scale={switch_scale}", flush=True)
     ext_emb = torch.tensor(affinity, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
 
+    aff_pred = None
+    if getattr(model, "supervised_heads", "off") != "off":
+        # the heads decide the homozygous penalty (per row), the switch cost and the affinity
+        # prior: the homo_scale and switch_scale chosen above are NOT used for this model
+        aff_pred = pooled_affinity(model, feats, count, ext_emb, device, batch_size)
+        print(f"  supervised heads: router homo_scale/switch_scale unused, pooled affinity "
+              f"top founders {np.argsort(-aff_pred.cpu().numpy())[:4].tolist()}", flush=True)
+
     preds_lo, preds_hi = [], []
     with torch.no_grad():
         for s in range(0, N, batch_size):
@@ -699,13 +961,33 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
             eb = ext_emb[s:s + batch_size].to(device)
             hs = torch.full((xb.shape[0],), homo_scale, device=device)
             cb = count[s:s + batch_size].to(device) if count is not None else None
-            emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs, count=cb)
-            dec = _dcrf_marginal if decode == "marginal" else _dcrf_viterbi
-            pred = dec(emis_p, c * switch_scale, model.nsw_pair,
-                       model.stay_bonus * switch_scale)
+            ab = None if aff_pred is None else aff_pred.unsqueeze(0).expand(xb.shape[0], -1)
+            emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs, count=cb, aff_pred=ab)
+            if aff_pred is not None:        # heads model: its own calibrated switch cost
+                pred = model.crf_decode(emis_p, c)
+            else:
+                dec = _dcrf_marginal if decode == "marginal" else _dcrf_viterbi
+                pred = dec(emis_p, c * switch_scale, model.nsw_pair,
+                           model.stay_bonus * switch_scale)
             preds_lo.append(model.pi[pred].cpu().numpy())
             preds_hi.append(model.pj[pred].cpu().numpy())
     return np.concatenate(preds_lo), np.concatenate(preds_hi)
+
+
+@torch.no_grad()
+def pooled_affinity(model, feats, count, ext_emb, device, batch_size=256):
+    """Supervised-heads affinity for one sample: mean over ALL its windows of the per-window
+    affinity-head probabilities -> [K] (the per-sample pooled prior)."""
+    acc, n = None, 0
+    for s in range(0, len(feats), batch_size):
+        xb = feats[s:s + batch_size].to(device)
+        eb = ext_emb[s:s + batch_size].to(device)
+        cb = count[s:s + batch_size].to(device) if count is not None else None
+        model(xb, ext_emb=eb, count=cb)
+        a = torch.sigmoid(model._heads["aff_logit"].float()).sum(0)
+        acc = a if acc is None else acc + a
+        n += xb.shape[0]
+    return acc / n
 
 
 def _window_error_slots(true_lo_w0, true_hi_w0, maj_lo, maj_hi):
@@ -1004,6 +1286,17 @@ def parse_args():
     p.add_argument("--pair-emission", choices=["sum", "mixture"], default="sum",
                    help="pair-state emission from per-founder scores: sum (e_i + e_j, default) or "
                         "mixture (logaddexp(e_i, e_j) - log 2: each row explained by either haplotype)")
+    p.add_argument("--supervised-heads", choices=["off", "stage1", "stage2"], default="off",
+                   help="stage1: train the encoder only on simulator-truth head targets (gate=row "
+                        "clean from <data>.prov.npy, switch, het, per-individual affinity); stage2: "
+                        "freeze everything but the CRF scalars and fit them with the CRF loss "
+                        "(warm start from the stage-1 ckpt, --aff-pred for the pooled affinity)")
+    p.add_argument("--prov-labels", default=None,
+                   help="[N,T] int8 row-provenance sidecar (default <data minus .npy>.prov.npy)")
+    p.add_argument("--aff-pred", default=None,
+                   help="stage2: [N/G,K] pooled affinity-head predictions (pool_affinity.py)")
+    p.add_argument("--limit-train-batches", type=float, default=1.0,
+                   help="fraction of training batches per epoch (Lightning), e.g. for stage2")
     p.add_argument("--tie-aware-loss", action="store_true",
                    help="credit any founder pair IBD-equivalent (same ancestral lineage at the "
                         "row) to the labelled pair; needs per-row lineage labels (--lineage-labels)")
@@ -1036,12 +1329,23 @@ def main():
         if not (args.founder_affinity or args.adaptive_homo):
             raise SystemExit("--tie-aware-loss needs the individual-aligned splits "
                              "(--founder-affinity or --adaptive-homo)")
+    prov_path = None
+    if args.supervised_heads != "off":
+        if not (args.founder_affinity and args.tie_aware_loss):
+            raise SystemExit("--supervised-heads needs --founder-affinity and --tie-aware-loss "
+                             "(individual splits + lineage labels)")
+        if args.supervised_heads == "stage1":
+            prov_path = args.prov_labels or str(Path(args.data).with_suffix("")) + ".prov.npy"
+            if not Path(prov_path).exists():
+                raise SystemExit(f"--supervised-heads stage1: provenance not found at {prov_path}")
     if args.founder_affinity:
         train_ds, val_ds, _ = make_indel_diploid_affinity_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
             args.windows_per_individual, limit_n=args.limit_n,
             split_seed=args.split_seed, legacy_tail_split=args.legacy_tail_split,
-            lin_path=lin_path, train_homo_scale=args.train_homo_scale)
+            lin_path=lin_path, train_homo_scale=args.train_homo_scale,
+            prov_path=prov_path, aff_targets=args.supervised_heads == "stage1",
+            aff_pred_path=args.aff_pred)
     elif args.adaptive_homo:
         train_ds, val_ds, _ = make_indel_diploid_individual_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
@@ -1067,7 +1371,8 @@ def main():
         loss_spike_mult=args.loss_spike_mult,
         learned_het=args.learned_het, founder_affinity=args.founder_affinity,
         fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss,
-        pair_emission=args.pair_emission, emission=args.emission)
+        pair_emission=args.pair_emission, emission=args.emission,
+        supervised_heads=args.supervised_heads)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate
@@ -1098,13 +1403,16 @@ def main():
     # partition NLL can spike on long-block data even as Viterbi accuracy stays
     # good, so selecting on loss can discard the best model.
     sel_metric = "val_pair_acc_tie" if args.tie_aware_loss else "val_pair_acc"
+    sel_mode = "max"
+    if args.supervised_heads == "stage1":          # heads only: select on the head loss
+        sel_metric, sel_mode = "val_loss", "min"
     callbacks = [
         # tie-aware runs select on tie-aware accuracy: exact-pair accuracy is
         # arbitrary among lineage-equivalent founders there
         ModelCheckpoint(dirpath=str(ckpt_dir), monitor=sel_metric,
-                        mode="max", save_top_k=2, save_last=True,
+                        mode=sel_mode, save_top_k=2, save_last=True,
                         filename="d-{epoch:02d}-{" + sel_metric + ":.4f}"),
-        EarlyStopping(monitor=sel_metric, mode="max", patience=args.patience),
+        EarlyStopping(monitor=sel_metric, mode=sel_mode, patience=args.patience),
     ]
     if args.ema:
         callbacks.append(EMACallback(args.ema_decay))
@@ -1114,7 +1422,8 @@ def main():
         accelerator="auto", devices=args.devices, precision=args.precision,
         val_check_interval=(args.val_check_interval or None),
         gradient_clip_val=args.grad_clip,
-        accumulate_grad_batches=args.accumulate_grad_batches)
+        accumulate_grad_batches=args.accumulate_grad_batches,
+        limit_train_batches=args.limit_train_batches)
     trainer.fit(model, train_loader, val_loader, ckpt_path=args.resume)
     print(f"Best checkpoint: {callbacks[0].best_model_path}")
 

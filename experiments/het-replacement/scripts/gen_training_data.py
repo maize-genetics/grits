@@ -52,6 +52,10 @@ def main():
                          "at different depths concatenate (same --windows-per-individual).")
     ap.add_argument("--obs-by-lineage", action="store_true",
                     help="draw the -1/0 state and distance code once per ancestral lineage (IBD founders identical)")
+    ap.add_argument("--emit-row-provenance", action="store_true",
+                    help="also write <prefix>_fullscale_sliced.prov.npy [N,512] int8, row-aligned with the "
+                         "sliced data: row kind + off-site / bad-site flags (simulate_alleles PROV_*); "
+                         "no RNG draws, the data files are unchanged")
     ap.add_argument("--no-obs-table", action="store_true",
                     help="ignore the params' obs_table (exact -1/distance observation, as before)")
     args = ap.parse_args()
@@ -83,12 +87,14 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     (out / f"{args.prefix}.recipe.json").write_text(json.dumps({"recipe": recipe, "depth_factor": f, "indel_model": args.indel_model, "obs_by_lineage": args.obs_by_lineage, "repl": repl, "obs_table": obs,
                                                                 "windows": args.windows, "seeds": args.seeds}, indent=1))
-    parts = []
+    parts, prov_parts = [], []
     for inb, seed in zip(("1.0", "0.0"), args.seeds):
-        o, ibd, _i, _p, _h, _c, refpos, short, _tc = simulate(
+        o, ibd, _i, _p, _h, _c, refpos, short, _tc, *prov = simulate(
             np.random.default_rng(seed), windows=args.windows, inbreeding=float(inb),
             indel_model=args.indel_model, obs_table=obs, obs_by_lineage=args.obs_by_lineage,
-            **recipe, **repl)
+            emit_row_provenance=args.emit_row_provenance, **recipe, **repl)
+        if args.emit_row_provenance:
+            prov_parts.append(prov[0])
         print(f"inb{inb}: {o.shape}  short windows {100 * short.mean():.2f}%", flush=True)
         np.save(out / f"{args.prefix}_inb{inb}.npy", o)
         np.save(out / f"{args.prefix}_inb{inb}.ibd.npy", ibd)
@@ -99,6 +105,10 @@ def main():
     G = comb.shape[1] // T
     np.save(out / f"{args.prefix}_fullscale_sliced.npy", comb[:, :G * T].reshape(-1, T, comb.shape[2]))
     print(f"wrote {args.prefix}_fullscale_sliced.npy  (--windows-per-individual {G})", flush=True)
+    if args.emit_row_provenance:
+        pv = np.concatenate(prov_parts, axis=0)
+        np.save(out / f"{args.prefix}_fullscale_sliced.prov.npy", pv[:, :G * T].reshape(-1, T))
+        print(f"wrote {args.prefix}_fullscale_sliced.prov.npy", flush=True)
     import subprocess
     subprocess.run([sys.executable, str(Path(__file__).with_name("lineage_rows.py")), "--dir", str(out),
                     "--prefix", args.prefix], check=True)      # per-row lineage labels for --tie-aware-loss

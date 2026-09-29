@@ -1613,3 +1613,51 @@ def test_obs_by_lineage_makes_ibd_founders_identical():
                 if nm.sum() > 1:
                     diff += len(set(zip(t[i, r][nm].tolist(), d[i, r][nm].tolist()))) > 1
     assert diff == 0
+
+
+# --emit-row-provenance sidecar (supervised-heads branch) ---------------------
+
+def _prov_kw(**kw):
+    base = dict(windows=3, sites=6000, founders=12, min_cross=2, max_cross=4, inbreeding=0.0,
+                allele_sharing=0.2, bad_frac=0.1, sharing_model="coalescent", ancestors=4,
+                sharing_theta=4.0, simulate_indels=True, indel_model="replacement",
+                repl_groups="lineage", repl_rate=5e-3, repl_mean_len=60.0, repl_max_share=8,
+                repl_shift_sites=2.0, indel_coverage=2.0, indel_region_mult=2,
+                emit_read_counts=True, collapse_rows=True, obs_table=_obs_table())
+    base.update(kw)
+    return base
+
+
+def test_row_provenance_off_is_byte_identical():
+    a = simulate(np.random.default_rng(5), **_prov_kw())
+    b = simulate(np.random.default_rng(5), emit_row_provenance=True, **_prov_kw())
+    assert len(a) == 9 and len(b) == 10
+    for x, y in zip(a, b[:9]):
+        if isinstance(x, np.ndarray):
+            assert np.array_equal(x, y)
+    assert b[9].shape == b[0].shape[:2] and b[9].dtype == np.int8
+
+
+def test_row_provenance_semantics():
+    from python.crf.simulate_alleles import (PROV_KIND_MASK, PROV_OFF_SITE, PROV_BAD_SITE,
+                                             prov_is_clean)
+    K = 12
+    out = simulate(np.random.default_rng(5), emit_row_provenance=True, **_prov_kw())
+    o, prov = out[0], out[9].astype(int)
+    kind = prov & PROV_KIND_MASK
+    assert (prov >= 0).all() and set(np.unique(kind)) <= set(range(6))
+    assert {0, 1, 4, 5} <= set(np.unique(kind))
+    bad, off = (prov & PROV_BAD_SITE) > 0, (prov & PROV_OFF_SITE) > 0
+    assert not (bad & (kind > 1)).any() and not (off & (kind < 4)).any()
+    assert off.any() and bad.any()
+    coll = kind <= 1
+    assert 0.05 < bad[coll].mean() < 0.15            # ~ bad_frac=0.1
+    tern = o[..., :K]
+    h = np.where(kind == 0, o[..., K], o[..., K + 1]).astype(int)
+    own = np.take_along_axis(tern, h[..., None], -1)[..., 0]
+    # a clean collinear read always matches the founder of the haplotype it came from
+    assert (own[coll & ~bad] == 1).all()
+    assert (own[coll & bad] != 1).mean() > 0.2       # corrupted reads often do not
+    clean = prov_is_clean(prov)
+    assert np.array_equal(clean, ~bad & ~off)
+    assert not prov_is_clean(np.array([-1])).any()
