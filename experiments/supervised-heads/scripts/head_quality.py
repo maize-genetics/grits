@@ -45,7 +45,7 @@ for di, dname in enumerate(DEP):
         if len(ids) == 0:
             continue
         gs, gy, sw_pred, sw_true, het_p, het_y, aff_p, aff_t = [], [], [], [], [], [], [], []
-        tie_ok, dec_sw = [], []
+        tie_ok, dec_sw, xo_p, xo_t = [], [], [], []
         for i in ids:
             rows = np.arange(i * G, (i + 1) * G)
             dr = np.asarray(data[rows]); lr = np.asarray(lin[rows])
@@ -63,6 +63,7 @@ for di, dname in enumerate(DEP):
             gs.append(torch.sigmoid(H["gate_logit"])[gm].cpu().numpy()); gy.append(tg["gate"][gm].cpu().numpy())
             p = torch.sigmoid(-H["c"][:, 1:]) * tg["switch_mask"]
             sw_pred.append(p.sum(1).cpu().numpy()); sw_true.append((tg["switch"] & tg["switch_mask"]).sum(1).cpu().numpy())
+            xo_p.append((m.xo_scale.float() * H["xo_lam"]).detach().cpu().numpy())
             hm = tg["het_mask"]
             het_p.append(torch.sigmoid(H["het_logit"])[hm].cpu().numpy()); het_y.append(tg["het"][hm].cpu().numpy())
             if a.decode:
@@ -77,12 +78,20 @@ for di, dname in enumerate(DEP):
         hp, hy = np.concatenate(het_p), np.concatenate(het_y).astype(bool)
         sp, st = np.concatenate(sw_pred), np.concatenate(sw_true)
         AP, AT = np.array(aff_p), np.array(aff_t)
+        XP = np.concatenate(xo_p)
+        edges = [0, .02, .05, .1, .2, .5, 1, 2, 5, 1e9]
+        xb = np.digitize(XP, edges) - 1
+        curve = [[float(XP[xb == i].mean()), float(st[xb == i].mean()), int((xb == i).sum())]
+                 for i in range(len(edges) - 1) if (xb == i).any()]
         pr = gs >= 0.5
         r = {"n_ind": len(ids), "gate_clean_frac": float(gy.mean()), "gate_auc": auc(gs, gy),
              "gate_avg_precision_clean": ap_score(gs, gy), "gate_avg_precision_noisy": ap_score(-gs, ~gy),
              "gate_precision@0.5": float(gy[pr].mean()) if pr.any() else None,
              "gate_recall@0.5": float(pr[gy].mean()), "gate_median": float(np.median(gs)),
-             "switch_pred_per_window": float(sp.mean()), "switch_true_per_window": float(st.mean()),
+             "xo_lambda_mean": float(XP.mean()), "xo_true_mean": float(st.mean()),
+             "xo_poisson_nll": float((XP - st * np.log(np.maximum(XP, 1e-8))).mean()),
+             "xo_calibration_curve[pred,true,n]": curve,
+             "rowhead_switch_pred_per_window": float(sp.mean()), "switch_true_per_window": float(st.mean()),
              "het_acc": float(((hp >= 0.5) == hy).mean()), "het_true_frac": float(hy.mean()),
              "het_pred_mean": float(hp.mean()),
              "aff_pearson": float(np.corrcoef(AP.ravel(), AT.ravel())[0, 1]),

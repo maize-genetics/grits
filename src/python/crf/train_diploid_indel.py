@@ -421,7 +421,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  loss_spike_mult=5.0,
                  learned_het=False, founder_affinity=False, fast_cells=False,
                  tie_aware_loss=False, pair_emission="sum", emission="learned",
-                 supervised_heads="off"):
+                 supervised_heads="off", xo_placement=False):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
@@ -491,6 +491,11 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                 raise ValueError("--supervised-heads needs --emission likelihood or likelihood_dist")
             self.sup_het_head = nn.Linear(d_model, 1)
             self.sup_aff_head = nn.Linear(d_model, 1)
+            # window-level crossover count: lambda_w = softplus(xo_head(mean_t H)); the CRF's
+            # per-row switch probability spreads lambda_w over the window's T-1 transitions
+            # (uniformly, or with --xo-placement in proportion to the per-row switch head)
+            self.sup_xo_head = nn.Linear(d_model, 1)
+            self.xo_placement = xo_placement
             # CRF scalars in the heads model, at their simulator-derived values ("A"):
             # emission = log(g*mean(exp(l_i), exp(l_j)) + 1-g) with l a log-LR table;
             # het prior w_het*log(h | 1-h); transitions stay 0 / switch -c per founder change
@@ -498,8 +503,9 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             # for each newly entered founder x and at the first row.
             self.het_w = nn.Parameter(torch.tensor(1.0))
             self.aff_w = nn.Parameter(torch.tensor(1.0))
-            self.c_scale = nn.Parameter(torch.tensor(1.0))
+            self.c_scale = nn.Parameter(torch.tensor(1.0))      # unused since the xo head
             self.c_offset = nn.Parameter(torch.tensor(math.log(2.0)))
+            self.xo_scale = nn.Parameter(torch.tensor(1.0))
             with torch.no_grad():
                 self.stay_bonus.fill_(0.0)
             nf1, nf2 = _new_founder_tables(pi, pj, nsw)
@@ -507,7 +513,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             self.register_buffer("newf2", nf2)
             if supervised_heads == "stage2":
                 keep = {"tern_loglik", "tern_dist_loglik", "stay_bonus", "het_w", "aff_w",
-                        "c_scale", "c_offset"}
+                        "xo_scale"}
                 for n_, q in self.named_parameters():
                     q.requires_grad_(n_ in keep)
         self._heads = None
@@ -547,8 +553,9 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             het_logit = self.sup_het_head(H).squeeze(-1)                       # [B,T]
             pooled = (cells[:, :, :Kf, :] * H.unsqueeze(2)).mean(1)            # [B,Kf,d]
             aff_logit = self.sup_aff_head(pooled).squeeze(-1)                  # [B,Kf]
+            xo_lam = F.softplus(self.sup_xo_head(H.float().mean(1)).squeeze(-1))   # [B]
             self._heads = dict(gate_logit=gate_logit, het_logit=het_logit,
-                               aff_logit=aff_logit, c=c)
+                               aff_logit=aff_logit, c=c, xo_lam=xo_lam)
         else:
             emis_f, g, c = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
                                         count=count)  # [B,T,K]
@@ -609,7 +616,18 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         la0 = torch.cat([la, torch.zeros_like(la[:, :1])], 1)                   # index K = none
         self._trans_prior = self.aff_w * (la0[:, self.newf1] + la0[:, self.newf2])   # [B,P,P]
         self._init_prior = self.aff_w * (la[:, self.pi] + la[:, self.pj])       # [B,P]
-        c = self.c_scale * c_head.float() + self.c_offset
+        # switch probability per transition t-1 -> t (t >= 1) from the window crossover count
+        lam = self.xo_scale * self._heads["xo_lam"].float()                  # [B]
+        if self.xo_placement:
+            w = torch.sigmoid(-c_head.float()[:, 1:])
+            w = w / w.sum(1, keepdim=True).clamp_min(1e-12)
+        else:
+            w = torch.full_like(c_head.float()[:, 1:], 1.0 / (T - 1))
+        p = (lam.unsqueeze(1) * w).clamp(1e-12, 1 - 1e-4)
+        p = torch.cat([p[:, :1], p], 1)                                      # c[:,0] unused
+        # stay log(1-p) / change log(p/2) + log(a_x/sum a); minus log(1-p) on every
+        # transition at t (path-invariant): stay 0, change -(-logit p + log 2)
+        c = -torch.log(p) + torch.log1p(-p) + self.c_offset
         return emis_p, g, c
 
     def crf_decode(self, emis_p, c, stay_bonus=None, marginal=False):
@@ -668,7 +686,10 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             l = F.binary_cross_entropy_with_logits(logit.float(), y.float(), reduction="none")
             m = m.float()
             return (l * m).sum() / m.sum().clamp_min(1.0)
+        n_sw = (tg["switch"] & tg["switch_mask"]).float().sum(1)
+        lam = heads["xo_lam"].float().clamp_min(1e-8)
         parts = {"switch": bce(-heads["c"][:, 1:], tg["switch"], tg["switch_mask"]),
+                 "xo": (lam - n_sw * torch.log(lam)).mean(),                 # Poisson NLL
                  "het": bce(heads["het_logit"], tg["het"], tg["het_mask"])}
         if "gate" in tg:
             parts["gate"] = bce(heads["gate_logit"], tg["gate"], tg["gate_mask"])
@@ -1291,6 +1312,9 @@ def parse_args():
                         "clean from <data>.prov.npy, switch, het, per-individual affinity); stage2: "
                         "freeze everything but the CRF scalars and fit them with the CRF loss "
                         "(warm start from the stage-1 ckpt, --aff-pred for the pooled affinity)")
+    p.add_argument("--xo-placement", action="store_true",
+                   help="supervised heads: spread the window crossover count over rows in proportion "
+                        "to the per-row switch head (default: uniformly over the window)")
     p.add_argument("--prov-labels", default=None,
                    help="[N,T] int8 row-provenance sidecar (default <data minus .npy>.prov.npy)")
     p.add_argument("--aff-pred", default=None,
@@ -1372,7 +1396,7 @@ def main():
         learned_het=args.learned_het, founder_affinity=args.founder_affinity,
         fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss,
         pair_emission=args.pair_emission, emission=args.emission,
-        supervised_heads=args.supervised_heads)
+        supervised_heads=args.supervised_heads, xo_placement=args.xo_placement)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate

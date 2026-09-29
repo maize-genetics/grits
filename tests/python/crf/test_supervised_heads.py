@@ -90,9 +90,23 @@ class TestHeadsModel(unittest.TestCase):
         self.assertAlmostEqual(float(tp[0, idx[(0, 1)], idx[(2, 3)]]), 2 * math.log(1 / K), places=5)
         self.assertEqual(float(tp[0, idx[(0, 1)], idx[(0, 1)]]), 0.0)
         self.assertEqual(float(m.stay_bonus), 0.0)
-        # c = -logit(p) + log 2
+        # c = -logit(p_t) + log 2 with p_t = lambda_w / (T-1)
         emis, g, c = m(b["input_embeds"], None, b["ext_emb"], None, aff_pred=uniform)
-        self.assertTrue(torch.allclose(c, m._heads["c"].float() + math.log(2.0), atol=1e-6))
+        lam = m._heads["xo_lam"].float()
+        p = lam / 8
+        self.assertTrue(torch.allclose(c[:, 1:], (-torch.log(p) + torch.log1p(-p) + math.log(2.0))[:, None].expand(-1, 8),
+                                       atol=1e-5))
+
+    def test_switch_probs_sum_to_lambda(self):
+        for place in (False, True):
+            m = _model(supervised_heads="stage1", xo_placement=place)
+            b = _batch()
+            emis, g, c = m(b["input_embeds"], None, b["ext_emb"], None)
+            p = torch.sigmoid(-(c[:, 1:] - math.log(2.0)))
+            self.assertTrue(torch.allclose(p.sum(1), m._heads["xo_lam"].float(), rtol=1e-4))
+            if place:   # placement follows the per-row switch head
+                w = torch.sigmoid(-m._heads["c"].float()[:, 1:])
+                self.assertTrue(torch.allclose(p / p.sum(1, keepdim=True), w / w.sum(1, keepdim=True), atol=1e-5))
 
     def test_gate_mixture_emission(self):
         m = _model(supervised_heads="stage1")
@@ -130,20 +144,21 @@ class TestHeadsModel(unittest.TestCase):
         self.assertIsNotNone(m.sup_aff_head.weight.grad)
         self.assertIsNotNone(m.encoder.gate_head.weight.grad)
         self.assertIsNotNone(m.encoder.recomb_head.weight.grad)
-        for n in ("stay_bonus", "het_w", "aff_w", "c_scale", "c_offset", "tern_dist_loglik"):
+        self.assertIsNotNone(m.sup_xo_head.weight.grad)
+        for n in ("stay_bonus", "het_w", "aff_w", "c_scale", "c_offset", "xo_scale", "tern_dist_loglik"):
             self.assertIsNone(dict(m.named_parameters())[n].grad, n)
 
     def test_stage2_trains_scalars_only(self):
         m = _model(supervised_heads="stage2").train()
         train = {n for n, p in m.named_parameters() if p.requires_grad}
         self.assertEqual(train, {"tern_loglik", "tern_dist_loglik", "stay_bonus", "het_w", "aff_w",
-                                 "c_scale", "c_offset"})
+                                 "xo_scale"})
         b = _batch()
         b["aff_pred"] = torch.rand(2, 5)
         loss, *_ = m._step(b)
         loss.backward()
         self.assertIsNotNone(m.aff_w.grad)
-        self.assertIsNotNone(m.c_offset.grad)
+        self.assertIsNotNone(m.xo_scale.grad)
 
 
 class TestAffinityTarget(unittest.TestCase):
