@@ -1661,3 +1661,44 @@ def test_row_provenance_semantics():
     clean = prov_is_clean(prov)
     assert np.array_equal(clean, ~bad & ~off)
     assert not prov_is_clean(np.array([-1])).any()
+
+
+class TestStructuredDistance:
+    """--dist-structure: shared-mode anchor-distance codes obey refmap's 2kb rule and IBD sharing."""
+
+    def _tabs(self):
+        import json
+        from pathlib import Path
+        from python.crf.simulate_alleles import _prep_dist_structure
+        root = Path(__file__).resolve().parents[3] / "experiments/het-replacement/results"
+        ds = json.loads((root / "calib_dist_structure_s200.json").read_text())
+        obs = json.loads((root / "repl_params_v3.json").read_text())["suggested_sim_params"]["obs_table"]
+        return _prep_dist_structure(ds, obs)
+
+    def test_rules_and_sharing(self):
+        from python.crf.simulate_alleles import _structured_distance
+        rng = np.random.default_rng(0)
+        N, K = 4000, 25
+        tern = rng.choice([-1, 0, 1], size=(N, K), p=[.25, .4, .35]).astype(np.int8)
+        lin = rng.integers(0, 12, size=(N, K))
+        lin[:, 1] = lin[:, 0]
+        tern[:, 1] = tern[:, 0]
+        tern[:, 3] = 1                                          # the reference always matches itself
+        truth = tern == -1
+        code = _structured_distance(rng, tern, truth, lin, np.zeros(N, bool), 3, self._tabs(), 0.0, 88)
+        assert ((code[tern == -1] > 88).all())
+        assert ((code[tern == 0] <= 88).all())
+        assert ((code[:, 3] == 0).all())
+        assert ((code[:, 0] == code[:, 1]).all())       # same lineage + state -> same code
+        distinct = np.mean([len(np.unique(r)) for r in code]) / K
+        assert distinct < 0.6                          # shared, not K independent draws
+
+    def test_same_site_copy(self):
+        from python.crf.simulate_alleles import _structured_distance
+        rng = np.random.default_rng(1)
+        tern = np.ones((6, 25), np.int8)
+        lin = np.tile(np.arange(25), (6, 1))
+        ssp = np.array([False, True, True, False, True, True])
+        code = _structured_distance(rng, tern, tern < 0, lin, ssp, -1, self._tabs(), 1.0, 88)
+        assert ((code[0] == code[1]).all() and (code[1] == code[2]).all())
+        assert ((code[3] == code[5]).all())

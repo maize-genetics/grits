@@ -79,6 +79,7 @@ LABEL_PAD = -1
 # existing recomb-rate track's clip-and-round precedent (:threshold near
 # line 492 below): code = clip(round(scale*log2(1+d)), 0, DIST_SAT-1).
 DIST_LOG_SCALE = 8.0
+DIST_NO_ANCHOR_BP = 2000   # refmap: a non-matching founder reads -1 when its nearest anchor is > 2kb
 # --emit-row-provenance sidecar (per output row, int8): bits 0-2 = row kind
 # (0/1 collinear read from hap1/hap2, 2/3 insertion-derived hap1/hap2,
 # 4/5 replacement read hap1/hap2), bit 3 = replacement read placed OFF its
@@ -488,6 +489,104 @@ def _refmap_observation(rng, del_kt, ref_founder, obs, lineage=None):
         obs_del[:, ref_founder, :] = False
         code[:, ref_founder, :] = 0
     return obs_del, code
+
+
+DIST_STATE_IDX = {1: 0, 0: 1, -1: 2}
+
+
+def _prep_dist_structure(ds, obs):
+    """measure_dist_structure.py JSON (+ the --obs-table per-state code pmfs) -> sampling tables:
+    mode cdf, per-(truth, state) cumulative side split, pooled per-(state, side) off-mode |delta|
+    cdfs, level ratios, and per-state absolute code cdfs for the non-match states (truth-mixed by
+    the calibration counts) used where refmap's 2kb rule pins the code's range."""
+    cdf = lambda p: np.cumsum(np.asarray(p, np.float64)) / max(float(np.sum(p)), 1e-300)
+    split = np.zeros((2, 2, 3, 3))       # [mode band <=/> 2kb code, truth present/del, state, at/below/above]
+    for bi, b in enumerate(("lo", "hi")):
+        for ti, tr in enumerate(("present", "del")):
+            for s, si in DIST_STATE_IDX.items():
+                split[bi, ti, si] = ds["split_by_mode_band"][f"{b}|{tr}|{s}"]
+    delta = np.zeros((3, 2, len(ds["mode_code_pmf"])))            # [state, below/above, |delta|]
+    lev = np.zeros((3, 2))
+    absc = {}
+    off = int(obs.get("dist_code_offset", 1))
+    for s, si in DIST_STATE_IDX.items():
+        for sd_i, sd in enumerate(("below", "above")):
+            for tr in ("present", "del"):
+                n_side = ds["split_counts"][f"{tr}|{s}"][1 + sd_i]
+                delta[si, sd_i] += n_side * np.asarray(ds["delta_pmf"][f"{tr}|{s}|{sd}"])
+            delta[si, sd_i] = cdf(delta[si, sd_i])
+            lev[si, sd_i] = ds["levels_per_offmode_founder"][f"{s}|{sd}"]
+        if s != 1:
+            mix = sum(sum(ds["split_counts"][f"{tr}|{s}"]) * np.asarray(obs["dist_code_pmf"][f"{tr}|{s}"])
+                      for tr in ("present", "del"))
+            absc[si] = (cdf(mix), off)
+    return dict(mode_cdf=np.stack([cdf(h) for h in ds["mode_code_pmf_by_del_frac"]]),
+                mode_edges=np.asarray(ds["mode_del_frac_edges"]), split=np.cumsum(split, -1), delta_cdf=delta,
+                lev=lev, abs_cdf=absc, bin_bp=float(ds["bin_bp"]))
+
+
+def _structured_distance(rng, tern, truth_del, lin, same_site_prev, ref_founder, tabs, p_copy,
+                         thresh_code):
+    """Per-row refmap-like anchor-distance codes [N,K] int8 (--dist-structure).
+
+    refmap's distance is per (bin, founder) and founders collinear around the same anchor gap
+    share it, so a row is: one modal code shared by most founders (drawn given the row's -1
+    fraction: deleted-heavy rows sit in large anchor gaps); each founder at the mode,
+    below or above it with P(side | mode <=/> the 2kb code, truth, observed state); off-mode founders pick one of a few
+    shared per-(row, state, side) levels (mode -/+ a delta), the pool size set so distinct
+    levels / off-mode founders matches the calibration. Founders of one ancestral lineage make
+    the same draws (identical sequence -> identical anchors). The observed state stays
+    consistent with refmap's rule (non-match -1 iff anchor > 2kb, code thresh_code): a violating
+    draw is moved to the nearest allowed code. A row at the same site as the previous row copies
+    it with p_copy (P(same bin | same site)). tern: [N,K] observed ternary; truth_del: [N,K] bool;
+    lin: [N,K] ancestral lineage; same_site_prev: [N] bool."""
+    N, K = tern.shape
+    if N == 0:
+        return np.zeros((0, K), np.int8)
+    si = np.select([tern == 1, tern == 0], [0, 1], 2)                        # [N,K]
+    ti = truth_del.astype(np.int64)
+    n_lin = int(lin.max()) + 1
+    shared = lambda: np.take_along_axis(rng.random((N, n_lin)), lin, axis=1)  # one draw per lineage
+    nb = tabs["mode_cdf"].shape[0]
+    db = np.clip(np.searchsorted(tabs["mode_edges"], (tern == -1).mean(1), "right") - 1, 0, nb - 1)
+    mode = (rng.random(N)[:, None] > tabs["mode_cdf"][db]).sum(1).clip(0, tabs["mode_cdf"].shape[1] - 1)
+    band = (mode > thresh_code).astype(np.int64)[:, None]
+    side = (shared()[..., None] > tabs["split"][band, ti, si]).sum(-1).clip(0, 2)   # 0 at, 1 below, 2 above
+    code = np.repeat(mode[:, None], K, axis=1).astype(np.int64)
+    upool = shared()
+    absdraw = lambda si_, shape: (np.searchsorted(tabs["abs_cdf"][si_][0], rng.random(shape), "right")
+                                  - tabs["abs_cdf"][si_][1])
+    # the mode is not an allowed code for a -1 (0) founder when it is <= (>) thresh: off-mode
+    side = np.where((si == 2) & (side == 0) & (mode[:, None] <= thresh_code), 2, side)
+    side = np.where((si == 1) & (side == 0) & (mode[:, None] > thresh_code), 1, side)
+    for s in range(3):
+        for sd in (1, 2):
+            m = (si == s) & (side == sd)
+            n_off = m.sum(1)
+            rows = np.nonzero(n_off)[0]
+            if not rows.size:
+                continue
+            L = np.maximum(1, np.ceil(tabs["lev"][s, sd - 1] * n_off[rows])).astype(np.int64)
+            Lmax = int(L.max())
+            if s == 2:                    # -1: its own large-gap distribution (all > 2kb)
+                levels = absdraw(2, (rows.size, Lmax))
+            else:
+                d = np.maximum(np.searchsorted(tabs["delta_cdf"][s, sd - 1], rng.random((rows.size, Lmax)),
+                                               "right"), 1)
+                levels = mode[rows, None] + (1 if sd == 2 else -1) * d
+                if s == 1:                # 0 (diverged, anchor within 2kb): redraw levels past it
+                    bad = (levels > thresh_code) | (levels < 0)
+                    levels = np.where(bad, absdraw(1, levels.shape), levels)
+            lvl = np.minimum((upool[rows] * L[:, None]).astype(np.int64), L[:, None] - 1)   # [rows,K]
+            code[rows] = np.where(m[rows], np.take_along_axis(levels, lvl, axis=1), code[rows])
+    copy = same_site_prev & (rng.random(N) < p_copy)
+    src = np.maximum.accumulate(np.where(copy, 0, np.arange(N)))    # chains copy their first row
+    code = code[src].clip(0, DIST_SAT - 1)
+    code = np.where(tern == -1, np.maximum(code, thresh_code + 1), code)
+    code = np.where(tern == 0, np.minimum(code, thresh_code), code)
+    if ref_founder >= 0:
+        code[:, ref_founder] = 0
+    return code.astype(np.int8)
 
 
 def _indel_tracts(rng, n, M, R, density, ins_frac, large_frac, small_alpha,
@@ -1110,7 +1209,8 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   max_stack, anchor_thresh, ref_founder, dist_scale,
                   coverage_model="linear", read_len=150, collapse_rows=False,
                   rep_grp=None, rep_shift=0.0, rep_cross_del=0.0, rep_cross_present=0.0,
-                  obs_table=None, obs_lineage=None, good=None, emit_provenance=False):
+                  obs_table=None, obs_lineage=None, good=None, emit_provenance=False,
+                  dist_structure=None):
     """Assemble one chunk's indel-mode output:
     `(tern, dist, count [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T]
     int32, short [n] bool, n_either int, n_hemi int, n_null int)`, plus a
@@ -1335,6 +1435,20 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                                  TERN_MATCH).astype(np.int8)
             dist_rows = obs_code[w, :, t]
 
+        if dist_structure is not None:
+            # --dist-structure: refmap-like shared anchor-distance structure (rows ordered by
+            # window then output row, so the previous row is w,r-1)
+            order = np.lexsort((r, w))
+            wo, to = w[order], t[order]
+            ssp = np.zeros(w.size, bool)
+            ssp[1:] = (wo[1:] == wo[:-1]) & (to[1:] == to[:-1])
+            p_copy = min(1.0, dist_structure["bin_bp"] / float(obs_table["bp_per_site"]))
+            thresh_code = int(np.rint(dist_scale * np.log2(1.0 + DIST_NO_ANCHOR_BP)))
+            dsr = _structured_distance(rng, tern_rows[order], (dist_row > anchor_thresh)[order],
+                                       lineage[w, :, t][order], ssp, ref_founder, dist_structure,
+                                       p_copy, thresh_code)
+            dist_rows = np.empty_like(dsr)
+            dist_rows[order] = dsr
         tern_out[w, r] = tern_rows
         dist_out[w, r] = dist_rows
         if emit_provenance:
@@ -1423,6 +1537,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              subst_model="dense",
              subst_rate=0.018, coverage_model="linear", read_len=150,
              emit_read_counts=False, collapse_rows=False, obs_table=None, obs_by_lineage=False,
+             dist_structure=None,
              emit_row_provenance=False):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
@@ -1476,6 +1591,9 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
     K = founders
     T = sites
     coalescent = sharing_model == "coalescent"
+    if dist_structure is not None and obs_table is None:
+        raise ValueError("dist_structure needs obs_table (its bp_per_site sets the same-bin copy rate)")
+    dist_tabs = None if dist_structure is None else _prep_dist_structure(dist_structure, obs_table)
     if simulate_indels and not coalescent:
         raise ValueError(
             "simulate_indels=True requires sharing_model='coalescent' "
@@ -1664,6 +1782,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 rep_shift=repl_shift_sites, rep_cross_del=repl_cross_del,
                 rep_cross_present=repl_cross_present, obs_table=obs_table,
                 obs_lineage=lineage if obs_by_lineage else None,
+                dist_structure=dist_tabs,
                 good=good, emit_provenance=emit_row_provenance)
             if emit_row_provenance:
                 prov_all[sl] = prov[0]

@@ -56,6 +56,9 @@ def main():
                     help="also write <prefix>_fullscale_sliced.prov.npy [N,512] int8, row-aligned with the "
                          "sliced data: row kind + off-site / bad-site flags (simulate_alleles PROV_*); "
                          "no RNG draws, the data files are unchanged")
+    ap.add_argument("--dist-structure", default=None,
+                    help="measure_dist_structure.py JSON: refmap-like shared anchor-distance codes "
+                         "(shared row mode + pooled off-mode levels) instead of per-founder draws")
     ap.add_argument("--no-obs-table", action="store_true",
                     help="ignore the params' obs_table (exact -1/distance observation, as before)")
     args = ap.parse_args()
@@ -69,6 +72,7 @@ def main():
     if "repl_max_share" in repl:
         repl["repl_max_share"] = int(repl["repl_max_share"])
     obs = None if args.no_obs_table else p.get("obs_table")
+    dstruct = json.loads(Path(args.dist_structure).read_text()) if args.dist_structure else None
     recipe = dict(RECIPE)
     f = args.depth_factor
     if f != 1.0:
@@ -85,13 +89,13 @@ def main():
     print("repl params:", repl, "| obs_table:", "yes" if obs else "no (exact)", flush=True)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{args.prefix}.recipe.json").write_text(json.dumps({"recipe": recipe, "depth_factor": f, "indel_model": args.indel_model, "obs_by_lineage": args.obs_by_lineage, "repl": repl, "obs_table": obs,
+    (out / f"{args.prefix}.recipe.json").write_text(json.dumps({"recipe": recipe, "depth_factor": f, "indel_model": args.indel_model, "obs_by_lineage": args.obs_by_lineage, "dist_structure": args.dist_structure, "repl": repl, "obs_table": obs,
                                                                 "windows": args.windows, "seeds": args.seeds}, indent=1))
     parts, prov_parts = [], []
     for inb, seed in zip(("1.0", "0.0"), args.seeds):
         o, ibd, _i, _p, _h, _c, refpos, short, _tc, *prov = simulate(
             np.random.default_rng(seed), windows=args.windows, inbreeding=float(inb),
-            indel_model=args.indel_model, obs_table=obs, obs_by_lineage=args.obs_by_lineage,
+            indel_model=args.indel_model, obs_table=obs, obs_by_lineage=args.obs_by_lineage, dist_structure=dstruct,
             emit_row_provenance=args.emit_row_provenance, **recipe, **repl)
         if args.emit_row_provenance:
             prov_parts.append(prov[0])
