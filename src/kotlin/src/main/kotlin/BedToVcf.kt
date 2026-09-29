@@ -243,21 +243,30 @@ class BedToVcf : CliktCommand(help = "Convert a set of imputed BED files to a si
     }
 
     /**
-     * Function to build a map of gamete names to Alleles from a VariantContext
-     * This assumes that the sample names in the VariantContext correspond to gamete names
-     * and that each sample has a single allele representing the gamete's allele at this position
+     * Build a map from PHG donor/gamete IDs to their allele at this VCF site.
+     *
+     * PHG path BED donor IDs use:
+     *     <VCF-sample-name>:<allele-index>
+     *
+     * This supports:
+     * - haploid VCF samples with a gamete index, e.g. Founder1.hap1:0
+     * - haploid VCF samples without gamete index, e.g., Founder1
+     * - phased diploid VCF samples, e.g. Founder1:0 and Founder1:1 (phasing not enforced)
      */
     fun buildGameteToAlleleMap(vc: VariantContext): Map<String, Allele> {
-        //Loop through each sample in the variant context
-        return vc.genotypes.map { genotype ->
-            val sampleName = genotype.sampleName
-            val alleles = genotype.alleles
-            if(alleles.isNotEmpty()) {
-                Pair(sampleName, alleles[0])
+        val gameteToAlleleMap = mutableMapOf<String, Allele>()
+
+        vc.genotypes.forEach { genotype ->
+            genotype.alleles.forEachIndexed { alleleIndex, allele ->
+                gameteToAlleleMap["${genotype.sampleName}:$alleleIndex"] = allele
             }
-            else {
-                Pair("", Allele.NO_CALL)
+
+            // Support unindexed names for haploid/sample-per-gamete panels.
+            if (genotype.alleles.size == 1) {
+                gameteToAlleleMap[genotype.sampleName] = genotype.alleles[0]
             }
-        }.filter { it.first != "" }.toMap()
+        }
+
+        return gameteToAlleleMap
     }
 }
