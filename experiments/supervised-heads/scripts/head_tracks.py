@@ -1,6 +1,6 @@
 """Atlas-style genome tracks for supervised-heads checkpoints on real 0.1x rows (Ia453, A188xEP1,
 B73xOh43): gate g, switch probability p = sigmoid(-c_head), het h, decoded switches and
-SNP+RefCall error, binned to 1 Mb along the concatenated autosomes. One PNG per sample.
+SNP+RefCall error, binned to 1 Mb along the concatenated autosomes -> tracks_<sample>.npz (plot with plot_tracks.py).
 Usage: head_tracks.py <device> <outdir> name=ckpt [name=ckpt ...]"""
 import contextlib, io, sys
 from pathlib import Path
@@ -12,9 +12,6 @@ import torch  # noqa: E402
 sys.path.insert(0, "/home/zrm22/.claude/jobs/ec1f8138/tmp/viz")
 import model_internals as mi  # noqa: E402
 import window_truth as wt  # noqa: E402
-import matplotlib  # noqa: E402
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
 
 K, T, BIN = 25, 512, 1_000_000
 dev, outd = sys.argv[1], Path(sys.argv[2])
@@ -34,7 +31,7 @@ for sname, (dname, p1, p2) in mi.SAMPLES.items():
         off[c] = o; o += int(pos[contig == c].max()) + 1
     gpos = np.array([off[c] for c in contig]) + pos
     gb = gpos // BIN; nb = int(gb.max()) + 1
-    fig, ax = plt.subplots(5, 1, figsize=(16, 9), sharex=True)
+    store = {"chrom_offsets_mb": np.array([off[c] / BIN for c in chroms]), "chroms": np.array(chroms)}
     for mname, ck in models.items():
         m = GRITSCRFDiploidIndel.load_from_checkpoint(ck, map_location="cpu", strict=False).to(dev).eval()
         tern = data[:, :, :K].astype(np.float32); dist = data[:, :, K + 2:2 * K + 2].astype(np.float32)
@@ -63,23 +60,17 @@ for sname, (dname, p1, p2) in mi.SAMPLES.items():
         srows, smatch = wt.site_match(panel, t1, t2, f1, f2)
         n = np.bincount(gb, minlength=nb).astype(float); n[n == 0] = np.nan
         x = np.arange(nb)
-        ax[0].plot(x, np.bincount(gb, G, nb) / n, lw=.7, label=mname)
-        ax[1].semilogy(x, np.bincount(gb, P, nb) / n, lw=.7)
-        ax[2].plot(x, np.bincount(gb, Hh, nb) / n, lw=.7)
-        ax[3].plot(x, np.bincount(gb, sw.ravel().astype(float), nb), lw=.7)
+        store[f"{mname}/gate"] = np.bincount(gb, G, nb) / n
+        store[f"{mname}/p_switch_row"] = np.bincount(gb, P, nb) / n
+        store[f"{mname}/het"] = np.bincount(gb, Hh, nb) / n
+        store[f"{mname}/switches"] = np.bincount(gb, sw.ravel().astype(float), nb)
         sc = np.array([off.get(fss.AUTOSOMES[ci], 0) for ci in panel.chrom[srows]]) + panel.pos[srows]
         sb = sc // BIN; keep = sb < nb
         ne = np.bincount(sb[keep], (~smatch[keep]).astype(float), nb); ns = np.bincount(sb[keep], minlength=nb).astype(float)
         ns[ns == 0] = np.nan
-        ax[4].plot(x, 100 * ne / ns, lw=.7)
+        store[f"{mname}/snprc_err_pct"] = 100 * ne / ns
         print(sname, mname, "snprc", round(100 * float(1 - smatch.mean()), 3), "g_med", round(float(np.median(G)), 3),
               "p_med", float(np.median(P)), "h_mean", round(float(Hh.mean()), 3), "switches", int(sw.sum()), flush=True)
         del m; torch.cuda.empty_cache()
-    for a_, lab in zip(ax, ["gate g", "p(switch)/row", "het h", "decoded switches", "SNP+RC err %"]):
-        a_.set_ylabel(lab, fontsize=8)
-    for c in chroms:
-        for a_ in ax:
-            a_.axvline(off[c] / BIN, color="0.85", lw=.5)
-    ax[0].legend(fontsize=8); ax[0].set_title(f"{sname} ({dname}) - supervised heads, 1 Mb bins")
-    fig.tight_layout(); fig.savefig(outd / f"tracks_{sname}.png", dpi=110); plt.close(fig)
+    np.savez_compressed(outd / f"tracks_{sname}.npz", title=f"{sname} ({dname})", **store)
 print("done")
