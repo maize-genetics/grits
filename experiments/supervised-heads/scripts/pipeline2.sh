@@ -11,7 +11,7 @@ J=/home/zrm22/.claude/jobs/sup_heads
 S=$WT/experiments/supervised-heads/scripts
 R=$WT/experiments/supervised-heads/results; mkdir -p $R
 DATA=$D/data/training/maize_v3prov_multidepth_fullscale_sliced.npy
-AFF=$D/data/training/maize_v3prov_multidepth.affpred_sh2.npy
+AFF=$D/data/training/maize_v3prov_multidepth.affpred_sh3.npy
 TERN=$D/checkpoints/diploid-indel-v3-k25-overlay-affinity/d-epoch=04-val_pair_acc=0.6820.ckpt
 CK=$D/checkpoints
 log() { echo "$(date +%H:%M) $*" >> $J/done.txt; }
@@ -19,13 +19,13 @@ cd $WT
 $PY $S/lik_table.py --data $DATA --out $R/lik_table_A.json > $J/lik_table.log 2>&1 &
 LT=$!
 RECIPE="--data $DATA --workdir $D --num-parents 25 --time-local-emis --warmup-steps 500 --homo-penalty 3.0 --spike-skip --founder-affinity --windows-per-individual 117 --batch-size 64 --precision bf16-mixed --tie-aware-loss --emission likelihood_dist --pair-emission mixture"
-CUDA_VISIBLE_DEVICES=0 $PY src/python/crf/train_diploid_indel.py $RECIPE --run-name sh2-stage1 --supervised-heads stage1 --max-epochs 3 --warm-start-ckpt $TERN > $J/stage1.log 2>&1 || { log "stage1 FAILED"; exit 1; }
-S1=$(ls $CK/sh2-stage1/d-epoch=*.ckpt | sort -t= -k3 -g | head -1)
+CUDA_VISIBLE_DEVICES=0 $PY src/python/crf/train_diploid_indel.py $RECIPE --run-name sh3-stage1 --supervised-heads stage1 --max-epochs 15 --patience 3 --warm-start-ckpt $TERN > $J/stage1.log 2>&1 || { log "stage1 FAILED"; exit 1; }
+S1=$(ls $CK/sh3-stage1/d-epoch=*.ckpt | sort -t= -k3 -g | head -1)
 log "stage1 done best(min val_loss) $S1"
 CUDA_VISIBLE_DEVICES=0 $PY $S/pool_affinity.py $S1 $DATA $AFF > $J/pool.log 2>&1 || { log "pool FAILED"; exit 1; }
 wait $LT || { log "lik table FAILED"; exit 1; }
-$PY $S/make_ckpt_A.py $S1 $R/lik_table_A.json $CK/sh2-stage1/A.ckpt > $J/make_A.log 2>&1 || { log "make A FAILED"; exit 1; }
-$PY $S/make_ckpt_A.py $S1 $R/lik_table_A.json $CK/sh2-stage1/A_place.ckpt --placement >> $J/make_A.log 2>&1 || { log "make A_place FAILED"; exit 1; }
+$PY $S/make_ckpt_A.py $S1 $R/lik_table_A.json $CK/sh3-stage1/A.ckpt > $J/make_A.log 2>&1 || { log "make A FAILED"; exit 1; }
+$PY $S/make_ckpt_A.py $S1 $R/lik_table_A.json $CK/sh3-stage1/A_place.ckpt --placement >> $J/make_A.log 2>&1 || { log "make A_place FAILED"; exit 1; }
 log "A ckpts built"
 evals() {   # GPU CKPT TAG
   cd $WT/experiments/simval-corpus/scripts
@@ -36,17 +36,17 @@ evals() {   # GPU CKPT TAG
 hq() {      # GPU CKPT NAME
   CUDA_VISIBLE_DEVICES=$1 $PY $S/head_quality.py --ckpt $2 --data $DATA --decode --out $R/head_quality_$3.json > $J/hq_$3.log 2>&1; log "hq $3 exit=$?"
 }
-( hq 1 $CK/sh2-stage1/A.ckpt A; evals 1 $CK/sh2-stage1/A.ckpt sh2_A
-  hq 1 $CK/sh2-stage1/A_place.ckpt A_place; evals 1 $CK/sh2-stage1/A_place.ckpt sh2_Aplace
+( hq 1 $CK/sh3-stage1/A.ckpt A; evals 1 $CK/sh3-stage1/A.ckpt sh3_A
+  hq 1 $CK/sh3-stage1/A_place.ckpt A_place; evals 1 $CK/sh3-stage1/A_place.ckpt sh3_Aplace
   until grep -q "stage2 B_place done" $J/done.txt; do sleep 60; done
-  evals 1 $CK/sh2-stage2B_place/last.ckpt sh2_Bplace ) &
+  evals 1 $CK/sh3-stage2B_place/last.ckpt sh3_Bplace ) &
 fit() {     # FROM NAME [extra]
-  CUDA_VISIBLE_DEVICES=0 $PY src/python/crf/train_diploid_indel.py $RECIPE --run-name sh2-stage2$2 --supervised-heads stage2 --max-epochs 1 --limit-train-batches 0.25 --warmup-steps 100 --lr 1e-2 --warm-start-ckpt $1 --aff-pred $AFF "${@:3}" > $J/stage2$2.log 2>&1 && log "stage2 $2 done" || log "stage2 $2 FAILED"
+  CUDA_VISIBLE_DEVICES=0 $PY src/python/crf/train_diploid_indel.py $RECIPE --run-name sh3-stage2$2 --supervised-heads stage2 --max-epochs 1 --limit-train-batches 0.25 --warmup-steps 100 --lr 1e-2 --warm-start-ckpt $1 --aff-pred $AFF "${@:3}" > $J/stage2$2.log 2>&1 && log "stage2 $2 done" || log "stage2 $2 FAILED"
 }
-fit $CK/sh2-stage1/A.ckpt B
-fit $CK/sh2-stage1/A_place.ckpt B_place --xo-placement
-hq 0 $CK/sh2-stage2B/last.ckpt B
-hq 0 $CK/sh2-stage2B_place/last.ckpt B_place
-evals 0 $CK/sh2-stage2B/last.ckpt sh2_B
+fit $CK/sh3-stage1/A.ckpt B
+fit $CK/sh3-stage1/A_place.ckpt B_place --xo-placement
+hq 0 $CK/sh3-stage2B/last.ckpt B
+hq 0 $CK/sh3-stage2B_place/last.ckpt B_place
+evals 0 $CK/sh3-stage2B/last.ckpt sh3_B
 wait
 log "PIPELINE DONE"

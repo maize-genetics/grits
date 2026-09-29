@@ -779,6 +779,13 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
 
     def validation_step(self, batch, _):
         loss, crf, g, c, emis_p, _ = self._step(batch)
+        if self.supervised_heads == "stage1":
+            # heads only: the CRF scalars are not set yet, so no decode; select on the summed
+            # validation head losses (gate + switch + xo + het + affinity)
+            self.log("val/loss", loss, prog_bar=True)
+            self.log("val_head_total", loss)
+            self._log_heads("val")
+            return loss
         pair_acc, hap_acc = self._accuracy(emis_p, c, batch["h1"], batch["h2"])
         if "lin" in batch:
             with torch.no_grad():
@@ -1428,8 +1435,8 @@ def main():
     # good, so selecting on loss can discard the best model.
     sel_metric = "val_pair_acc_tie" if args.tie_aware_loss else "val_pair_acc"
     sel_mode = "max"
-    if args.supervised_heads == "stage1":          # heads only: select on the head loss
-        sel_metric, sel_mode = "val_loss", "min"
+    if args.supervised_heads == "stage1":          # heads only: select on the summed head losses
+        sel_metric, sel_mode = "val_head_total", "min"
     callbacks = [
         # tie-aware runs select on tie-aware accuracy: exact-pair accuracy is
         # arbitrary among lineage-equivalent founders there
