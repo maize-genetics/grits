@@ -367,36 +367,44 @@ def _new_founder_tables(pi, pj, nsw):
     return n1, n2
 
 
-def _prior_trans(c_t, nsw, stay_bonus, trans_prior):
+def _prior_trans(c_t, nsw, stay_bonus, trans_prior, seg_t=None):
+    """seg_t [B,P]: a per-destination log-prior paid only on entering a new pair state (a
+    founder change), i.e. once per segment (--het-prior segment)."""
     stay_mask = (nsw == 0).float()
-    return (-c_t[:, None, None] * nsw[None] + stay_bonus * stay_mask[None] + trans_prior)
+    tr = -c_t[:, None, None] * nsw[None] + stay_bonus * stay_mask[None] + trans_prior
+    if seg_t is not None:
+        tr = tr + (1.0 - stay_mask)[None] * seg_t[:, None, :]
+    return tr
 
 
-def crf_nll_prior(emis, c, nsw, stay_bonus, allowed, trans_prior, init_prior):
+def crf_nll_prior(emis, c, nsw, stay_bonus, allowed, trans_prior, init_prior, seg=None):
     """Tie-aware pair CRF NLL (as _dcrf_nll_tied) with a per-sample transition prior
-    trans_prior [B,P,P] (added to every p->q step) and initial prior init_prior [B,P]."""
+    trans_prior [B,P,P] (added to every p->q step) and initial prior init_prior [B,P];
+    seg [B,T,P] optional per-segment log-prior (paid at row 0 and on each state change)."""
     emis = emis.float(); c = c.float(); nsw = nsw.float()
     sb = stay_bonus.float(); tp = trans_prior.float()
     neg = torch.tensor(-1e9, dtype=emis.dtype, device=emis.device)
     emis_a = torch.where(allowed, emis, neg)
-    a = emis[:, 0] + init_prior.float()
-    b = emis_a[:, 0] + init_prior.float()
+    ip = init_prior.float() + (seg[:, 0].float() if seg is not None else 0.0)
+    a = emis[:, 0] + ip
+    b = emis_a[:, 0] + ip
     for t in range(1, emis.shape[1]):
-        tr = _prior_trans(c[:, t], nsw, sb, tp)
+        tr = _prior_trans(c[:, t], nsw, sb, tp, None if seg is None else seg[:, t].float())
         a = emis[:, t] + torch.logsumexp(a.unsqueeze(2) + tr, dim=1)
         b = emis_a[:, t] + torch.logsumexp(b.unsqueeze(2) + tr, dim=1)
     return (torch.logsumexp(a, dim=1) - torch.logsumexp(b, dim=1)).mean()
 
 
 @torch.no_grad()
-def crf_viterbi_prior(emis, c, nsw, stay_bonus, trans_prior, init_prior):
+def crf_viterbi_prior(emis, c, nsw, stay_bonus, trans_prior, init_prior, seg=None):
     emis = emis.float(); c = c.float(); nsw = nsw.float()
     sb = stay_bonus.float(); tp = trans_prior.float()
     B, T, P = emis.shape
-    delta = emis[:, 0] + init_prior.float()
+    delta = emis[:, 0] + init_prior.float() + (seg[:, 0].float() if seg is not None else 0.0)
     bp = torch.zeros(T - 1, B, P, dtype=torch.long, device=emis.device)
     for t in range(1, T):
-        best, idx = (delta.unsqueeze(2) + _prior_trans(c[:, t], nsw, sb, tp)).max(dim=1)
+        best, idx = (delta.unsqueeze(2) + _prior_trans(
+            c[:, t], nsw, sb, tp, None if seg is None else seg[:, t].float())).max(dim=1)
         delta = emis[:, t] + best
         bp[t - 1] = idx
     path = torch.zeros(B, T, dtype=torch.long, device=emis.device)
@@ -421,7 +429,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  loss_spike_mult=5.0,
                  learned_het=False, founder_affinity=False, fast_cells=False,
                  tie_aware_loss=False, pair_emission="sum", emission="learned",
-                 supervised_heads="off", xo_placement=False):
+                 supervised_heads="off", xo_placement=False, het_prior="row"):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
@@ -496,6 +504,13 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             # (uniformly, or with --xo-placement in proportion to the per-row switch head)
             self.sup_xo_head = nn.Linear(d_model, 1)
             self.xo_placement = xo_placement
+            # het-head prior: "row" adds w_het*log(h | 1-h) to every row's emission (summed over
+            # the window it can swamp the reads when the head is off on real data); "segment"
+            # pays it once per segment (row 0 and each state change); "off" drops it
+            if het_prior not in ("row", "segment", "off"):
+                raise ValueError(f"het_prior must be row/segment/off, got {het_prior!r}")
+            self.het_prior = het_prior
+            self._seg_prior = None
             # CRF scalars in the heads model, at their simulator-derived values ("A"):
             # emission = log(g*mean(exp(l_i), exp(l_j)) + 1-g) with l a log-LR table;
             # het prior w_het*log(h | 1-h); transitions stay 0 / switch -c per founder change
@@ -622,8 +637,13 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         gf = g.float().clamp(1e-6, 1 - 1e-6).unsqueeze(-1)
         emis_p = torch.logaddexp(torch.log(gf) + mix, torch.log1p(-gf))
         h = torch.sigmoid(het_logit.float()).clamp(1e-4, 1 - 1e-4).unsqueeze(-1)
-        emis_p = emis_p + self.het_w * (self.homo_mask * torch.log1p(-h)
-                                        + (1 - self.homo_mask) * torch.log(h))
+        lq = self.het_w * (self.homo_mask * torch.log1p(-h) + (1 - self.homo_mask) * torch.log(h))
+        self._seg_prior = None
+        hp = getattr(self, "het_prior", "row")
+        if hp == "row":
+            emis_p = emis_p + lq
+        elif hp == "segment":
+            self._seg_prior = lq                                                 # [B,T,P]
         a = aff_pred if aff_pred is not None else torch.sigmoid(aff_logit.float())
         a = torch.cat([a.float().clamp(1e-3, 1.0), torch.full_like(a[:, :1], 1e-3)], 1)
         la = torch.log(a / a[:, :Kf].sum(1, keepdim=True))                     # [B,K]
@@ -649,7 +669,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         sb = self.stay_bonus if stay_bonus is None else stay_bonus
         if self.supervised_heads != "off":
             return crf_viterbi_prior(emis_p, c, self.nsw_pair, sb, self._trans_prior,
-                                     self._init_prior)
+                                     self._init_prior, self._seg_prior)
         dec = _dcrf_marginal if marginal else _dcrf_viterbi
         return dec(emis_p, c, self.nsw_pair, sb)
 
@@ -725,7 +745,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         if self.supervised_heads != "off":
             crf = crf_nll_prior(emis_p, c, self.nsw_pair, self.stay_bonus,
                                 self._allowed_pairs(h1, h2, batch["lin"]),
-                                self._trans_prior, self._init_prior)
+                                self._trans_prior, self._init_prior, self._seg_prior)
             return crf, crf, g, c, emis_p, tags
         if self.tie_aware_loss and "lin" in batch:
             crf = _dcrf_nll_tied(emis_p, c, self.nsw_pair, self.stay_bonus,
@@ -1333,6 +1353,9 @@ def parse_args():
                         "clean from <data>.prov.npy, switch, het, per-individual affinity); stage2: "
                         "freeze everything but the CRF scalars and fit them with the CRF loss "
                         "(warm start from the stage-1 ckpt, --aff-pred for the pooled affinity)")
+    p.add_argument("--het-prior", choices=["row", "segment", "off"], default="row",
+                   help="--supervised-heads: het-head prior on every row (row), once per segment "
+                        "(segment: row 0 and each pair-state change) or not at all (off)")
     p.add_argument("--xo-placement", action="store_true",
                    help="supervised heads: spread the window crossover count over rows in proportion "
                         "to the per-row switch head (default: uniformly over the window)")
@@ -1417,7 +1440,8 @@ def main():
         learned_het=args.learned_het, founder_affinity=args.founder_affinity,
         fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss,
         pair_emission=args.pair_emission, emission=args.emission,
-        supervised_heads=args.supervised_heads, xo_placement=args.xo_placement)
+        supervised_heads=args.supervised_heads, xo_placement=args.xo_placement,
+        het_prior=args.het_prior)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate

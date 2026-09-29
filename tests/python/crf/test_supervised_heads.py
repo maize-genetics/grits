@@ -185,3 +185,45 @@ class TestAffinityTarget(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHetPriorModes(unittest.TestCase):
+    def test_segment_prior_paid_once_per_segment(self):
+        from python.crf.train_diploid_indel import crf_viterbi_prior, _prior_trans
+        torch.manual_seed(0)
+        m = _model(supervised_heads="stage2", het_prior="segment").eval()
+        P = m.nsw_pair.shape[0]
+        B, T = 2, 7
+        emis = torch.randn(B, T, P)
+        c = torch.full((B, T), 3.0)
+        tp = torch.zeros(B, P, P)
+        ip = torch.zeros(B, P)
+        seg = torch.randn(B, T, P)
+        path = crf_viterbi_prior(emis, c, m.nsw_pair, m.stay_bonus, tp, ip, seg)
+        def score(pth):
+            sc = emis[:, 0].gather(1, pth[:, :1]).squeeze(1) + seg[:, 0].gather(1, pth[:, :1]).squeeze(1)
+            for t in range(1, T):
+                tr = _prior_trans(c[:, t], m.nsw_pair.float(), m.stay_bonus.float(), tp, seg[:, t])
+                sc = sc + tr[torch.arange(B), pth[:, t - 1], pth[:, t]] + emis[:, t].gather(1, pth[:, t:t + 1]).squeeze(1)
+            return sc
+        best = score(path)
+        for _ in range(200):                                  # Viterbi beats random paths
+            self.assertTrue((score(torch.randint(0, P, (B, T))) <= best + 1e-4).all())
+        # a constant path pays seg only at row 0
+        const = torch.zeros(B, T, dtype=torch.long)
+        exp = emis[:, :, 0].sum(1) + seg[:, 0, 0] + T * 0 + (T - 1) * float(m.stay_bonus)
+        self.assertTrue(torch.allclose(score(const), exp, atol=1e-4))
+
+    def test_modes_change_emission(self):
+        b = _batch()
+        out = {}
+        for mode in ("row", "segment", "off"):
+            m = _model(supervised_heads="stage2", het_prior=mode).eval()
+            torch.manual_seed(0)
+            with torch.no_grad():
+                emis, g, c = m(b["input_embeds"], None, b["ext_emb"], b.get("count"), aff_pred=torch.rand(2, 5))
+            out[mode] = (emis, m._seg_prior)
+        self.assertIsNone(out["row"][1])
+        self.assertIsNone(out["off"][1])
+        self.assertIsNotNone(out["segment"][1])
+        self.assertTrue(torch.allclose(out["segment"][0], out["off"][0]))
