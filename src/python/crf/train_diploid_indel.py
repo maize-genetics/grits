@@ -434,11 +434,18 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  loss_spike_mult=5.0,
                  learned_het=False, founder_affinity=False, fast_cells=False,
                  tie_aware_loss=False, pair_emission="sum", emission="learned",
-                 supervised_heads="off", xo_placement=False, het_prior="row", no_distance=False):
+                 supervised_heads="off", xo_placement=False, het_prior="row", no_distance=False,
+                 aff_source="head"):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
         self.no_distance = no_distance
+        # CRF founder prior: "head" = pooled supervised affinity head; "reads" = the sample's
+        # own genome-wide founder match rate (_founder_affinity, diploid-affinity's ext_emb),
+        # with no affinity head trained in stage 1
+        if aff_source not in ("head", "reads"):
+            raise ValueError(f"aff_source must be head/reads, got {aff_source!r}")
+        self.aff_source = aff_source
         if pair_emission not in ("sum", "mixture"):
             raise ValueError(f"pair_emission must be 'sum' or 'mixture', got {pair_emission!r}")
         self.pair_emission = pair_emission
@@ -595,7 +602,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             band = torch.where(d < 0, torch.full_like(band, 8), band)            # no anchor -> 8
             emis_f = g.unsqueeze(-1) * self.tern_dist_loglik[tern_idx, band]
         if sup:
-            return self._heads_crf(X_pad, g, c, het_logit, aff_logit, aff_pred)
+            return self._heads_crf(X_pad, g, c, het_logit, aff_logit, aff_pred, ext_emb)
         if self.pair_emission == "mixture":
             # each row comes from one haplotype or the other: a het pair is credited when
             # EITHER founder explains the row, so two founders explaining different reads
@@ -625,7 +632,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             state_dict[prefix + "log_xo_scale"] = torch.log(state_dict.pop(k).float().clamp_min(1e-6))
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
-    def _heads_crf(self, X_pad, g, c_head, het_logit, aff_logit, aff_pred):
+    def _heads_crf(self, X_pad, g, c_head, het_logit, aff_logit, aff_pred, ext_emb=None):
         """Supervised-heads CRF inputs. Returns (emis_p [B,T,P], g, c [B,T]) and stores the
         transition prior self._trans_prior [B,P,P] and initial prior self._init_prior [B,P]
         (consumed by crf_nll_prior / crf_viterbi_prior). homo_scale is not used."""
@@ -652,7 +659,12 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             emis_p = emis_p + lq
         elif hp == "segment":
             self._seg_prior = lq                                                 # [B,T,P]
-        a = aff_pred if aff_pred is not None else torch.sigmoid(aff_logit.float())
+        if getattr(self, "aff_source", "head") == "reads":
+            if ext_emb is None:
+                raise ValueError("aff_source='reads' needs ext_emb (the genome-wide match rate)")
+            a = ext_emb[:, :Kf, 0].float()                                     # raw match rate
+        else:
+            a = aff_pred if aff_pred is not None else torch.sigmoid(aff_logit.float())
         a = torch.cat([a.float().clamp(1e-3, 1.0), torch.full_like(a[:, :1], 1e-3)], 1)
         la = torch.log(a / a[:, :Kf].sum(1, keepdim=True))                     # [B,K]
         la0 = torch.cat([la, torch.zeros_like(la[:, :1])], 1)                   # index K = none
@@ -1361,6 +1373,9 @@ def parse_args():
                         "clean from <data>.prov.npy, switch, het, per-individual affinity); stage2: "
                         "freeze everything but the CRF scalars and fit them with the CRF loss "
                         "(warm start from the stage-1 ckpt, --aff-pred for the pooled affinity)")
+    p.add_argument("--aff-source", choices=["head", "reads"], default="head",
+                   help="--supervised-heads CRF founder prior: pooled affinity head, or the sample's "
+                        "genome-wide read match rate (no affinity head/loss in stage 1)")
     p.add_argument("--aff-target-scope", choices=["individual", "window"], default="individual",
                    help="stage1 affinity-head target: the individual's genome-wide founder fractions "
                         "(default) or each window's own (pooled over windows at decode = the former)")
@@ -1426,7 +1441,8 @@ def main():
             args.windows_per_individual, limit_n=args.limit_n,
             split_seed=args.split_seed, legacy_tail_split=args.legacy_tail_split,
             lin_path=lin_path, train_homo_scale=args.train_homo_scale,
-            prov_path=prov_path, aff_targets=args.supervised_heads == "stage1",
+            prov_path=prov_path,
+            aff_targets=args.supervised_heads == "stage1" and args.aff_source == "head",
             aff_pred_path=args.aff_pred, aff_target_scope=args.aff_target_scope)
     elif args.adaptive_homo:
         train_ds, val_ds, _ = make_indel_diploid_individual_splits(
@@ -1455,7 +1471,7 @@ def main():
         fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss,
         pair_emission=args.pair_emission, emission=args.emission,
         supervised_heads=args.supervised_heads, xo_placement=args.xo_placement,
-        het_prior=args.het_prior, no_distance=args.no_distance)
+        het_prior=args.het_prior, no_distance=args.no_distance, aff_source=args.aff_source)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate

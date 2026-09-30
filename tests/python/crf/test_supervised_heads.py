@@ -241,3 +241,16 @@ class TestWindowAffinityTarget(unittest.TestCase):
         win = individual_affinity_target(data, lin, K, 1)
         self.assertEqual(win.shape, (2 * G, K))
         np.testing.assert_allclose(win.reshape(2, G, K).mean(1), ind, atol=1e-6)
+
+
+class TestReadsAffinitySource(unittest.TestCase):
+    def test_prior_from_read_match_rate(self):
+        b = _batch()
+        m = _model(supervised_heads="stage2", aff_source="reads").eval()
+        with torch.no_grad():
+            m(b["input_embeds"], None, b["ext_emb"], b.get("count"), aff_pred=torch.rand(2, 5))
+        a = b["ext_emb"][:, :, 0].float().clamp(1e-3, 1.0)
+        la = torch.log(a / a.sum(1, keepdim=True))
+        exp = float(m.aff_w) * (la[:, m.pi.clamp(max=4)] + la[:, m.pj.clamp(max=4)])
+        real = (m.pi < 5) & (m.pj < 5)
+        self.assertTrue(torch.allclose(m._init_prior[:, real], exp[:, real], atol=1e-5))
