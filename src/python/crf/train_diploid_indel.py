@@ -1050,7 +1050,9 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
     if getattr(model, "supervised_heads", "off") != "off":
         # the heads decide the homozygous penalty (per row), the switch cost and the affinity
         # prior: the homo_scale and switch_scale chosen above are NOT used for this model
-        if aff_region > 0:
+        if getattr(model, "aff_source", "head") == "reads":
+            aff_pred = torch.tensor(affinity[:, 0])      # prior comes from ext_emb in the model
+        elif aff_region > 0:
             # regional prior: each window's affinity = mean head output over the windows within
             # +-aff_region on the same contig (follows a mosaic sample's local founders)
             if row_bin is None:
@@ -1109,6 +1111,7 @@ def regional_affinity(model, feats, count, ext_emb, device, batch_size, contig, 
     return out
 
 
+@torch.no_grad()
 def pooled_affinity(model, feats, count, ext_emb, device, batch_size=256):
     """Supervised-heads affinity for one sample: mean over ALL its windows of the per-window
     affinity-head probabilities -> [K] (the per-sample pooled prior)."""
