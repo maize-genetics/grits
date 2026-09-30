@@ -63,6 +63,11 @@ def main():
                     help="corrupt each homolog's read at a site independently (simulate per_read_bad)")
     ap.add_argument("--bad-frac", type=float, default=None,
                     help="override the recipe's bad_frac (0.05): P(a read is corrupted to a random founder)")
+    ap.add_argument("--founders", type=int, default=None,
+                    help="override the recipe's 25 founders (e.g. 27 for heldout_augment_v2.py, which hides 2)")
+    ap.add_argument("--ancestor-crossovers", type=float, default=None,
+                    help="ancestral-lineage switches per individual at the calibration depth (simulate default "
+                         "8; divided by --depth-factor like the default)")
     ap.add_argument("--read-snps", type=int, default=None,
                     help="override simulate's read_snps (8): SNPs a read must match exactly")
     ap.add_argument("--derived-sfs", type=float, default=None,
@@ -86,6 +91,8 @@ def main():
     recipe = dict(RECIPE)
     if args.bad_frac is not None:
         recipe["bad_frac"] = args.bad_frac
+    if args.founders is not None:
+        recipe["founders"] = args.founders
     if args.read_snps is not None:
         recipe["read_snps"] = args.read_snps
     if args.derived_sfs is not None:
@@ -94,12 +101,14 @@ def main():
     if f != 1.0:
         recipe["min_cross"] = max(0, int(round(RECIPE["min_cross"] / f)))
         recipe["max_cross"] = max(1, int(round(RECIPE["max_cross"] / f)))
-        recipe["ancestor_crossovers"] = 8.0 / f            # simulate() default is 8 per individual
+        recipe["ancestor_crossovers"] = (args.ancestor_crossovers or 8.0) / f   # simulate() default 8
         for k, sc in (("repl_mean_len", f), ("repl_shift_sites", f), ("repl_rate", 1.0 / f)):
             if k in repl:
                 repl[k] = repl[k] * sc
         if obs is not None:
             obs = dict(obs, bp_per_site=obs["bp_per_site"] / f)
+    if f == 1.0 and args.ancestor_crossovers is not None:
+        recipe["ancestor_crossovers"] = args.ancestor_crossovers
     print("depth factor", f, "| crossovers", recipe["min_cross"], "-", recipe["max_cross"],
           "| ancestor crossovers", recipe.get("ancestor_crossovers", 8), flush=True)
     print("repl params:", repl, "| obs_table:", "yes" if obs else "no (exact)", flush=True)

@@ -1,0 +1,20 @@
+{
+ "calib_IDX-INBRED": 0.0,
+ "calib_OUT-INBRED": 0.22421431988000373,
+ "ancestor_crossovers=8.0": {
+  "sim_inpanel": 0.013587294789383997,
+  "sim_hidden": 0.0766524048221137
+ },
+ "ancestor_crossovers=16.0": {
+  "sim_inpanel": 0.005509949706378278,
+  "sim_hidden": 0.1585290911120572
+ },
+ "ancestor_crossovers=32.0": {
+  "sim_inpanel": 0.00320666987333654,
+  "sim_hidden": 0.10906827297866084
+ },
+ "ancestor_crossovers=64.0": {
+  "sim_inpanel": 0.0021645021645021645,
+  "sim_hidden": 0.12799543347242967
+ }
+}
