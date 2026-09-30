@@ -234,7 +234,7 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
                  train_homo_scale=False, prov=None, aff_target=None, aff_pred=None):
         super().__init__(data, num_parents, lin)
         self.prov = prov                  # [N,T] int8 row provenance (--supervised-heads)
-        self.aff_target = aff_target      # [N/G,K] true per-individual affinity
+        self.aff_target = aff_target      # [N/G,K] per-individual or [N,K] per-window affinity
         self.aff_pred = aff_pred          # [N/G,K] pooled affinity-head prediction (stage2)
         G = windows_per_individual
         if len(data) % G:
@@ -263,7 +263,8 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
         if self.prov is not None:
             out["prov"] = torch.tensor(np.asarray(self.prov[idx], dtype=np.int64))
         if self.aff_target is not None:
-            out["aff_target"] = torch.tensor(self.aff_target[idx // self.G], dtype=torch.float32)
+            j = idx if len(self.aff_target) == len(self.data) else idx // self.G
+            out["aff_target"] = torch.tensor(self.aff_target[j], dtype=torch.float32)
         if self.aff_pred is not None:
             out["aff_pred"] = torch.tensor(self.aff_pred[idx // self.G], dtype=torch.float32)
         return out
@@ -290,7 +291,7 @@ def individual_affinity_target(data, lin, num_parents, G):
 def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G, limit_n=0,
                                        split_seed=0, legacy_tail_split=False, lin_path=None,
                                        train_homo_scale=False, prov_path=None, aff_targets=False,
-                                       aff_pred_path=None):
+                                       aff_pred_path=None, aff_target_scope="individual"):
     """Individual-aligned split, same boundaries as
     make_indel_diploid_individual_splits (mirrors train_diploid.py's
     make_diploid_affinity_splits intent)."""
@@ -312,7 +313,11 @@ def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G
         return IndelDiploidAffinityDataset(
             dr, num_parents, G, lr, train_homo_scale=train_homo_scale,
             prov=None if prov is None else prov[rows],
-            aff_target=(individual_affinity_target(dr, lr, num_parents, G) if aff_targets else None),
+            # window scope: each window's own founder fractions -- all a window can see; their mean
+            # over the individual's (equal-length) windows is the individual target exactly
+            aff_target=(individual_affinity_target(dr, lr, num_parents,
+                                                   1 if aff_target_scope == "window" else G)
+                        if aff_targets else None),
             aff_pred=None if aff_pred is None else aff_pred[ids])
     print(f"IndelDiploid(affinity) {Path(path).name}: N={N:,} individuals={n_ind} "
           f"train={len(splits[0]):,} val={len(splits[1]):,} test={len(splits[2]):,} "
@@ -1356,6 +1361,9 @@ def parse_args():
                         "clean from <data>.prov.npy, switch, het, per-individual affinity); stage2: "
                         "freeze everything but the CRF scalars and fit them with the CRF loss "
                         "(warm start from the stage-1 ckpt, --aff-pred for the pooled affinity)")
+    p.add_argument("--aff-target-scope", choices=["individual", "window"], default="individual",
+                   help="stage1 affinity-head target: the individual's genome-wide founder fractions "
+                        "(default) or each window's own (pooled over windows at decode = the former)")
     p.add_argument("--no-distance", action="store_true",
                    help="ablation: replace the anchor-distance channel with a constant 0 (train and "
                         "inference; saved in the checkpoint), so the encoder sees only the ternary array")
@@ -1419,7 +1427,7 @@ def main():
             split_seed=args.split_seed, legacy_tail_split=args.legacy_tail_split,
             lin_path=lin_path, train_homo_scale=args.train_homo_scale,
             prov_path=prov_path, aff_targets=args.supervised_heads == "stage1",
-            aff_pred_path=args.aff_pred)
+            aff_pred_path=args.aff_pred, aff_target_scope=args.aff_target_scope)
     elif args.adaptive_homo:
         train_ds, val_ds, _ = make_indel_diploid_individual_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,

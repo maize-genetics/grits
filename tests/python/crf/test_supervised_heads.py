@@ -227,3 +227,17 @@ class TestHetPriorModes(unittest.TestCase):
         self.assertIsNone(out["off"][1])
         self.assertIsNotNone(out["segment"][1])
         self.assertTrue(torch.allclose(out["segment"][0], out["off"][0]))
+
+
+class TestWindowAffinityTarget(unittest.TestCase):
+    def test_window_targets_pool_to_individual(self):
+        from python.crf.train_diploid_indel import individual_affinity_target
+        rng = np.random.default_rng(0)
+        G, T, K = 4, 16, 5
+        data = np.zeros((2 * G, T, 2 * K + 2), np.int8)
+        data[:, :, K:K + 2] = rng.integers(0, K, size=(2 * G, T, 2))
+        lin = rng.integers(0, 3, size=(2 * G, T, K))
+        ind = individual_affinity_target(data, lin, K, G)
+        win = individual_affinity_target(data, lin, K, 1)
+        self.assertEqual(win.shape, (2 * G, K))
+        np.testing.assert_allclose(win.reshape(2, G, K).mean(1), ind, atol=1e-6)
