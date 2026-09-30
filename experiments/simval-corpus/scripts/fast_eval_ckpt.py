@@ -62,6 +62,9 @@ def main():
                     help="scale the decoder's transition score (diagnostic; unset = 1.0, "
                          "or the router's choice with --route)")
     ap.add_argument("--decode", choices=["viterbi", "marginal"], default="viterbi")
+    ap.add_argument("--aff-region", type=int, default=0,
+                    help="supervised-heads models: regional affinity prior, +-N windows on the same "
+                         "contig (needs --route for the window positions); 0 = genome-wide (default)")
     ap.add_argument("--depth", default="0.1")
     ap.add_argument("--manifest", default=MANIFEST,
                     help="read-set manifest (default: the evaluation corpus; pass the calibration "
@@ -112,7 +115,8 @@ def main():
                                                             homo_scale=hs,
                                                             switch_scale=args.switch_scale,
                                                             route=args.route, row_bin=row_bin,
-                                                            decode=args.decode)
+                                                            decode=args.decode,
+                                                            aff_region=args.aff_region)
                 bed_dir = out_root / key / "bed"
                 hae.write_imputed_bed(ind, pred_lo, pred_hi, None,
                                       hae.load_gamete_names(src / "raw.npy.gametes.tsv"),

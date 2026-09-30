@@ -957,7 +957,7 @@ def route_real_sample(M, row_bin, informative_max=12):
 
 def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=256,
                              homo_scale=None, switch_scale=None, route=False,
-                             row_bin=None, decode="viterbi"):
+                             row_bin=None, decode="viterbi", aff_region=0):
     """THE single real-data inference recipe for GRITSCRFDiploidIndel --
     every eval script (real-data unit tests, depth sweeps, per-checkpoint
     comparisons) should call this instead of re-deriving the ext_emb /
@@ -1028,13 +1028,23 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
           f"switch_scale={switch_scale}", flush=True)
     ext_emb = torch.tensor(affinity, dtype=torch.float32).unsqueeze(0).expand(N, -1, -1)
 
-    aff_pred = None
+    aff_pred = aff_win = None
     if getattr(model, "supervised_heads", "off") != "off":
         # the heads decide the homozygous penalty (per row), the switch cost and the affinity
         # prior: the homo_scale and switch_scale chosen above are NOT used for this model
-        aff_pred = pooled_affinity(model, feats, count, ext_emb, device, batch_size)
+        if aff_region > 0:
+            # regional prior: each window's affinity = mean head output over the windows within
+            # +-aff_region on the same contig (follows a mosaic sample's local founders)
+            if row_bin is None:
+                raise ValueError("aff_region needs row_bin (contig of each window)")
+            aff_win = regional_affinity(model, feats, count, ext_emb, device, batch_size,
+                                        np.asarray(row_bin)[:, 0] >> 40, aff_region)
+            aff_pred = aff_win.mean(0)
+        else:
+            aff_pred = pooled_affinity(model, feats, count, ext_emb, device, batch_size)
         print(f"  supervised heads: router homo_scale/switch_scale unused, pooled affinity "
-              f"top founders {np.argsort(-aff_pred.cpu().numpy())[:4].tolist()}", flush=True)
+              f"top founders {np.argsort(-aff_pred.cpu().numpy())[:4].tolist()}"
+              + (f" (regional prior, +-{aff_region} windows)" if aff_region > 0 else ""), flush=True)
 
     preds_lo, preds_hi = [], []
     with torch.no_grad():
@@ -1043,7 +1053,8 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
             eb = ext_emb[s:s + batch_size].to(device)
             hs = torch.full((xb.shape[0],), homo_scale, device=device)
             cb = count[s:s + batch_size].to(device) if count is not None else None
-            ab = None if aff_pred is None else aff_pred.unsqueeze(0).expand(xb.shape[0], -1)
+            ab = (aff_win[s:s + batch_size].to(device) if aff_win is not None else
+                  None if aff_pred is None else aff_pred.unsqueeze(0).expand(xb.shape[0], -1))
             emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs, count=cb, aff_pred=ab)
             if aff_pred is not None:        # heads model: its own calibrated switch cost
                 pred = model.crf_decode(emis_p, c)
@@ -1057,6 +1068,29 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
 
 
 @torch.no_grad()
+def regional_affinity(model, feats, count, ext_emb, device, batch_size, contig, radius):
+    """[N,K]: per window, the mean affinity-head probability over the windows of the same contig
+    within +-radius windows (windows are in contig order, as windowed_k25native_wcount.npy)."""
+    rows = []
+    for s in range(0, len(feats), batch_size):
+        xb = feats[s:s + batch_size].to(device)
+        eb = ext_emb[s:s + batch_size].to(device)
+        cb = count[s:s + batch_size].to(device) if count is not None else None
+        with torch.no_grad():
+            model(xb, ext_emb=eb, count=cb)
+        rows.append(torch.sigmoid(model._heads["aff_logit"].float()).cpu())
+    a = torch.cat(rows)                                              # [N,K]
+    out = torch.empty_like(a)
+    contig = np.asarray(contig)
+    for c in np.unique(contig):
+        idx = np.nonzero(contig == c)[0]
+        cs = torch.cat([torch.zeros(1, a.shape[1]), a[idx].cumsum(0)])
+        lo = np.clip(np.arange(len(idx)) - radius, 0, len(idx))
+        hi = np.clip(np.arange(len(idx)) + radius + 1, 0, len(idx))
+        out[idx] = (cs[hi] - cs[lo]) / torch.tensor(hi - lo, dtype=torch.float32)[:, None]
+    return out
+
+
 def pooled_affinity(model, feats, count, ext_emb, device, batch_size=256):
     """Supervised-heads affinity for one sample: mean over ALL its windows of the per-window
     affinity-head probabilities -> [K] (the per-sample pooled prior)."""
