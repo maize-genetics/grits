@@ -15,11 +15,14 @@ TERN=$CK/diploid-indel-v3-k25-overlay-affinity/d-epoch=04-val_pair_acc=0.6820.ck
 log() { echo "$(date +%m-%d_%H:%M) $*" >> $J/done.txt; }
 until grep -q "BUILD DONE" $J/done.txt 2>/dev/null; do grep -q "FAILED" $J/done.txt 2>/dev/null && exit 1; sleep 60; done
 BASE="--data $DATA --workdir $D --num-parents 25 --time-local-emis --warmup-steps 500 --homo-penalty 3.0 --spike-skip --founder-affinity --windows-per-individual 117 --batch-size 64 --precision bf16-mixed --tie-aware-loss --pair-emission mixture --het-prior off --gate-target support --aff-source reads --emission likelihood --no-distance"
-evals() {   # GPU CKPT TAG
+evals() {   # GPU CKPT TAG -- one process per scope (scoring is CPU-bound, ~28 s/row)
   cd $WT/experiments/simval-corpus/scripts
   for dep in 0.1 1.0; do
     t=$3; [ $dep = 1.0 ] && t=${3}_1x
-    CUDA_VISIBLE_DEVICES=$1 $PY fast_eval_ckpt.py --tag $t --ckpt $2 --scope idx out mix --route --depth $dep --input-glob scratch/lift_s200_local20k > $J/eval_$t.log 2>&1; log "$t eval exit=$?"
+    for sc in idx out mix; do
+      CUDA_VISIBLE_DEVICES=$1 $PY fast_eval_ckpt.py --tag $t --ckpt $2 --scope $sc --route --depth $dep --input-glob scratch/lift_s200_local20k > $J/eval_${t}_$sc.log 2>&1 &
+    done
+    wait; log "$t eval done"
   done
   cd $WT
 }
