@@ -1092,19 +1092,22 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
         # prior: the homo_scale and switch_scale chosen above are NOT used for this model
         if getattr(model, "aff_source", "head") == "reads":
             aff_pred = torch.tensor(affinity[:, 0])      # prior comes from ext_emb in the model
-        elif aff_region > 0:
+        elif aff_region != 0:
             # regional prior: each window's affinity = mean head output over the windows within
-            # +-aff_region on the same contig (follows a mosaic sample's local founders)
+            # +-aff_region on the same contig (follows a mosaic sample's local founders);
+            # aff_region < 0: each window's OWN head output (its estimate of the global affinity,
+            # no pooling across windows)
             if row_bin is None:
                 raise ValueError("aff_region needs row_bin (contig of each window)")
             aff_win = regional_affinity(model, feats, count, ext_emb, device, batch_size,
-                                        np.asarray(row_bin)[:, 0] >> 40, aff_region)
+                                        np.asarray(row_bin)[:, 0] >> 40, max(aff_region, 0))
             aff_pred = aff_win.mean(0)
         else:
             aff_pred = pooled_affinity(model, feats, count, ext_emb, device, batch_size)
         print(f"  supervised heads: router homo_scale/switch_scale unused, pooled affinity "
               f"top founders {np.argsort(-aff_pred.cpu().numpy())[:4].tolist()}"
-              + (f" (regional prior, +-{aff_region} windows)" if aff_region > 0 else ""), flush=True)
+              + (f" (regional prior, +-{aff_region} windows)" if aff_region > 0 else
+                 " (per-window own prior)" if aff_region < 0 else ""), flush=True)
 
     preds_lo, preds_hi = [], []
     with torch.no_grad():

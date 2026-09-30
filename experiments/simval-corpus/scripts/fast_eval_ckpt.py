@@ -64,7 +64,8 @@ def main():
     ap.add_argument("--decode", choices=["viterbi", "marginal"], default="viterbi")
     ap.add_argument("--aff-region", type=int, default=0,
                     help="supervised-heads models: regional affinity prior, +-N windows on the same "
-                         "contig (needs --route for the window positions); 0 = genome-wide (default)")
+                         "contig (needs --route for the window positions); 0 = genome-wide (default); -1 = each "
+                         "window's own head output, no pooling")
     ap.add_argument("--depth", default="0.1")
     ap.add_argument("--manifest", default=MANIFEST,
                     help="read-set manifest (default: the evaluation corpus; pass the calibration "
