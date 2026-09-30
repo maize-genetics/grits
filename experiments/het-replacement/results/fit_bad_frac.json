@@ -1,0 +1,22 @@
+{
+ "per_read_bad=False bad_frac=0.05": {
+  "miss_frac": 0.019973624465811964,
+  "mean_run_len": 1.5322554826316632,
+  "bad_row_share": 0.03071998530982906
+ },
+ "per_read_bad=True bad_frac=0.015": {
+  "miss_frac": 0.006051348824786325,
+  "mean_run_len": 1.0083449235048678,
+  "bad_row_share": 0.009139623397435898
+ },
+ "per_read_bad=True bad_frac=0.02": {
+  "miss_frac": 0.008060813969017094,
+  "mean_run_len": 1.0112565445026178,
+  "bad_row_share": 0.012229984642094018
+ },
+ "per_read_bad=True bad_frac=0.025": {
+  "miss_frac": 0.010018112313034188,
+  "mean_run_len": 1.0158696572154042,
+  "bad_row_share": 0.015301565838675214
+ }
+}

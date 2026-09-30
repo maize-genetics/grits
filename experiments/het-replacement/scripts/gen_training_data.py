@@ -59,6 +59,10 @@ def main():
     ap.add_argument("--dist-structure", default=None,
                     help="measure_dist_structure.py JSON: refmap-like shared anchor-distance codes "
                          "(shared row mode + pooled off-mode levels) instead of per-founder draws")
+    ap.add_argument("--per-read-bad", action="store_true",
+                    help="corrupt each homolog's read at a site independently (simulate per_read_bad)")
+    ap.add_argument("--bad-frac", type=float, default=None,
+                    help="override the recipe's bad_frac (0.05): P(a read is corrupted to a random founder)")
     ap.add_argument("--per-read-snps", action="store_true",
                     help="each homolog's read at a site covers its own SNPs (simulate per_read_snps)")
     ap.add_argument("--no-obs-table", action="store_true",
@@ -76,6 +80,8 @@ def main():
     obs = None if args.no_obs_table else p.get("obs_table")
     dstruct = json.loads(Path(args.dist_structure).read_text()) if args.dist_structure else None
     recipe = dict(RECIPE)
+    if args.bad_frac is not None:
+        recipe["bad_frac"] = args.bad_frac
     f = args.depth_factor
     if f != 1.0:
         recipe["min_cross"] = max(0, int(round(RECIPE["min_cross"] / f)))
@@ -91,14 +97,14 @@ def main():
     print("repl params:", repl, "| obs_table:", "yes" if obs else "no (exact)", flush=True)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"{args.prefix}.recipe.json").write_text(json.dumps({"recipe": recipe, "depth_factor": f, "indel_model": args.indel_model, "obs_by_lineage": args.obs_by_lineage, "dist_structure": args.dist_structure, "per_read_snps": args.per_read_snps, "repl": repl, "obs_table": obs,
+    (out / f"{args.prefix}.recipe.json").write_text(json.dumps({"recipe": recipe, "depth_factor": f, "indel_model": args.indel_model, "obs_by_lineage": args.obs_by_lineage, "dist_structure": args.dist_structure, "per_read_snps": args.per_read_snps, "per_read_bad": args.per_read_bad, "repl": repl, "obs_table": obs,
                                                                 "windows": args.windows, "seeds": args.seeds}, indent=1))
     parts, prov_parts = [], []
     for inb, seed in zip(("1.0", "0.0"), args.seeds):
         o, ibd, _i, _p, _h, _c, refpos, short, _tc, *prov = simulate(
             np.random.default_rng(seed), windows=args.windows, inbreeding=float(inb),
             indel_model=args.indel_model, obs_table=obs, obs_by_lineage=args.obs_by_lineage, dist_structure=dstruct,
-            per_read_snps=args.per_read_snps, emit_row_provenance=args.emit_row_provenance, **recipe, **repl)
+            per_read_snps=args.per_read_snps, per_read_bad=args.per_read_bad, emit_row_provenance=args.emit_row_provenance, **recipe, **repl)
         if args.emit_row_provenance:
             prov_parts.append(prov[0])
         print(f"inb{inb}: {o.shape}  short windows {100 * short.mean():.2f}%", flush=True)

@@ -1,0 +1,63 @@
+{
+ "calib_CML247": {
+  "miss_frac": 0.012322183500914076,
+  "other_founder_matches": 1.0,
+  "mean_run_len": 1.0479805648344973,
+  "true_founder_state_on_miss(-1/0)": [
+   0.398725007244277,
+   0.6012749927557229
+  ]
+ },
+ "calib_Ki3": {
+  "miss_frac": 0.012294671474358974,
+  "other_founder_matches": 1.0,
+  "mean_run_len": 1.0402542372881356,
+  "true_founder_state_on_miss(-1/0)": [
+   0.384928716904277,
+   0.615071283095723
+  ]
+ },
+ "calib_M162W": {
+  "miss_frac": 0.012485532407407407,
+  "other_founder_matches": 1.0,
+  "mean_run_len": 1.0388203430634968,
+  "true_founder_state_on_miss(-1/0)": [
+   0.37108922363847047,
+   0.6289107763615296
+  ]
+ },
+ "calib_NC350": {
+  "miss_frac": 0.012700668418647166,
+  "other_founder_matches": 1.0,
+  "mean_run_len": 1.0437206572769953,
+  "true_founder_state_on_miss(-1/0)": [
+   0.3696935619904414,
+   0.6303064380095587
+  ]
+ },
+ "calib_Tzi8": {
+  "miss_frac": 0.012268285170250895,
+  "other_founder_matches": 1.0,
+  "mean_run_len": 1.0506594724220624,
+  "true_founder_state_on_miss(-1/0)": [
+   0.38487874465049926,
+   0.6151212553495007
+  ]
+ },
+ "sim_inbred_0.1x": {
+  "miss_frac_all_rows": 0.021196414262820512,
+  "miss_frac_clean_rows": 0.0,
+  "miss_frac_bad_site_rows": 0.6777599572306869,
+  "miss_frac_offsite_rows": 0.00015012197410395946,
+  "share_of_rows_bad_site": 0.031224959935897436,
+  "mean_run_len": 1.568076566841618
+ },
+ "sim_inbred_1x": {
+  "miss_frac_all_rows": 0.017081497061965812,
+  "miss_frac_clean_rows": 0.0,
+  "miss_frac_bad_site_rows": 0.5764788732394366,
+  "miss_frac_offsite_rows": 0.0,
+  "share_of_rows_bad_site": 0.02963074252136752,
+  "mean_run_len": 1.4754866618601297
+ }
+}

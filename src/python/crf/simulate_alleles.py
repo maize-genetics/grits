@@ -1112,7 +1112,7 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
                       h1, h2, rate, good, gamete, theta=None, max_lineages=None,
                       emit_panel=False, lineage=None, lineage_M=None,
                       per_gamete=False, subst_model="dense", subst_rate=0.018,
-                      per_read_snps=False):
+                      per_read_snps=False, good2=None):
     """Mini-haplotype match features [n, T, K] + IBD lineage labels [n, K, T].
 
     Each founder is a piecewise-constant mosaic over ancestral lineages (same
@@ -1188,7 +1188,7 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
     # path to founder k. Returned as [n,T,K,L] for per-site indexing (eval only).
     panel = np.transpose(G, (0, 2, 1, 3)).astype(np.int8) if emit_panel else None
 
-    def _match_for(active, rand_founder, G=G):
+    def _match_for(active, rand_founder, G=G, bad=bad):
         # Bad sites: corrupt the read to a RANDOM founder's mini-haplotype (the
         # read mis-maps to a wrong founder) rather than an out-of-panel marginal
         # draw. The latter usually matched no founder's exact L-SNP haplotype,
@@ -1206,7 +1206,8 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
         if per_read_snps:
             G2 = _alleles()[wi, lineage, ti]              # hap2's read: its own SNPs
         match1 = np.transpose(_match_for(h1, rf1), (0, 2, 1)).astype(np.int8)
-        match2 = np.transpose(_match_for(h2, rf2, G2), (0, 2, 1)).astype(np.int8)
+        bad2 = bad if good2 is None else ~good2          # --per-read-bad: hap2's read corrupted independently
+        match2 = np.transpose(_match_for(h2, rf2, G2, bad2), (0, 2, 1)).astype(np.int8)
         return (match1, match2), lineage, panel
 
     # One read per site, sampled from the active gamete (H1 if gamete else H2).
@@ -1221,7 +1222,7 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   max_stack, anchor_thresh, ref_founder, dist_scale,
                   coverage_model="linear", read_len=150, collapse_rows=False,
                   rep_grp=None, rep_shift=0.0, rep_cross_del=0.0, rep_cross_present=0.0,
-                  obs_table=None, obs_lineage=None, good=None, emit_provenance=False,
+                  obs_table=None, obs_lineage=None, good=None, emit_provenance=False, good2=None,
                   dist_structure=None):
     """Assemble one chunk's indel-mode output:
     `(tern, dist, count [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T]
@@ -1471,7 +1472,9 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                     prov[sel] |= np.where(rs[w[sel], t[sel]] != t[sel], PROV_OFF_SITE, 0).astype(np.int16)
             if good is None:
                 raise ValueError("emit_provenance needs the good-site mask")
-            prov |= np.where((kind <= 1) & ~good[w, t], PROV_BAD_SITE, 0).astype(np.int16)
+            g2 = good if good2 is None else good2
+            bad_row = ((kind == 0) & ~good[w, t]) | ((kind == 1) & ~g2[w, t])
+            prov |= np.where(bad_row, PROV_BAD_SITE, 0).astype(np.int16)
             prov_out[w, r] = prov.astype(np.int8)
         lab1_out[w, r] = h1[w, t].astype(np.int8)
         lab2_out[w, r] = h2[w, t].astype(np.int8)
@@ -1549,7 +1552,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              subst_model="dense",
              subst_rate=0.018, coverage_model="linear", read_len=150,
              emit_read_counts=False, collapse_rows=False, obs_table=None, obs_by_lineage=False,
-             dist_structure=None, per_read_snps=False,
+             dist_structure=None, per_read_snps=False, per_read_bad=False,
              emit_row_provenance=False):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
@@ -1776,12 +1779,16 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                         h2[outbred] = _build_paths(rng, outbred.size, R, K, nc2, r2)
 
             good = _good_mask(rng, n, R, bad_frac, error_block)
+            # --per-read-bad: each homolog's read at a site is corrupted independently (real
+            # true-founder misses are single reads: mean run 1.04 rows in the calibration corpus)
+            good2 = _good_mask(rng, n, R, bad_frac, error_block) if per_read_bad else None
             (match1, match2), lineage, _ = _coalescent_feats(
                 rng, n, R, K, ancestors, ancestor_crossovers, derived_sfs,
                 read_snps, h1, h2, None, good, gamete=None,
                 theta=sharing_theta, max_lineages=max_lin,
                 lineage=lineage, lineage_M=M, per_gamete=True,
-                subst_model=subst_model, subst_rate=subst_rate, per_read_snps=per_read_snps)
+                subst_model=subst_model, subst_rate=subst_rate, per_read_snps=per_read_snps,
+                good2=good2)
 
             (tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null,
              n_deleted, n_founder_sites, *prov) = _indel_chunk(
@@ -1795,7 +1802,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 rep_cross_present=repl_cross_present, obs_table=obs_table,
                 obs_lineage=lineage if obs_by_lineage else None,
                 dist_structure=dist_tabs,
-                good=good, emit_provenance=emit_row_provenance)
+                good=good, good2=good2, emit_provenance=emit_row_provenance)
             if emit_row_provenance:
                 prov_all[sl] = prov[0]
 

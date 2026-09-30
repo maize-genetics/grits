@@ -1,6 +1,6 @@
 """(A) simulator-derived likelihood table: l[state, band] = log P(state, band | founder is the
 row's source) - log P(state, band | founder is not the source), over CLEAN rows (prov_is_clean)
-of the TRAIN split of the simulated set. 'Source' = founders sharing the ancestral lineage (at
+of the TRAIN split of the simulated set (--rows all: every labelled row). 'Source' = founders sharing the ancestral lineage (at
 the row) of the true founder of the haplotype the row was read from (row kind 0/2/4 -> hap1,
 1/3/5 -> hap2). Bands as GRITSCRFDiploidIndel.dist_band_edges (8 = no anchor). Also the
 band-free 3-state table. Add-one smoothing."""
@@ -12,6 +12,11 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--data", required=True); ap.add_argument("--out", required=True)
 ap.add_argument("--windows-per-depth", type=int, default=6000)
 ap.add_argument("--n-depths", type=int, default=4)
+ap.add_argument("--rows", choices=["clean", "all"], default="clean",
+                help="clean: provenance-clean rows only (the source founder then always matches, so a "
+                     "mismatch is scored near-impossible); all: every labelled row incl. corrupted and "
+                     "off-site ones -- the emission then sees reads as they come and the gate is only "
+                     "the soft multiplier on top")
 a = ap.parse_args()
 K, G, T = 25, 117, 512
 data = np.load(a.data, mmap_mode="r"); lin = np.load(a.data[:-4] + ".lin.npy", mmap_mode="r")
@@ -31,7 +36,7 @@ for dpt in range(a.n_depths):
         X = np.asarray(data[r]); L = np.asarray(lin[r]).astype(np.int64); P = np.asarray(prov[r]).astype(np.int64)
         tern = X[..., :K].astype(np.int64); dist = torch.tensor(X[..., K + 2:2 * K + 2].astype(np.float32))
         band = torch.bucketize(dist, edges).numpy(); band[dist.numpy() < 0] = 8
-        clean = prov_is_clean(P)
+        clean = prov_is_clean(P) if a.rows == "clean" else P >= 0
         hap2 = (P & PROV_KIND_MASK) % 2 == 1
         h = np.where(hap2, X[..., K + 1], X[..., K]).astype(np.int64)
         clean &= h >= 0
