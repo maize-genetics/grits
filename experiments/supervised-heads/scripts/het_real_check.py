@@ -20,7 +20,7 @@ for key in keys:
                             aff_pred=ap.unsqueeze(0).expand(B, -1))
             pred = m.crf_decode(emis, c)
         h.append(torch.sigmoid(m._heads["het_logit"].float()).cpu().numpy().ravel()); g.append(gg.float().cpu().numpy().ravel())
-        lam.append((m.xo_scale * m._heads["xo_lam"].float()).cpu().numpy()); homo.append((m.pi[pred] == m.pj[pred]).float().cpu().numpy().ravel())
+        lam.append((m.xo_scale * m._heads["xo_lam"].float()).detach().cpu().numpy()); homo.append((m.pi[pred] == m.pj[pred]).float().cpu().numpy().ravel())
     h = np.concatenate(h)
     print(f"{key:<24} het mean {h.mean():.3f} median {np.median(h):.3f} | gate mean {np.concatenate(g).mean():.3f} | "
           f"xo_lam/window {np.concatenate(lam).mean():.3f} | decoded homozygous rows {np.concatenate(homo).mean():.3f}", flush=True)
