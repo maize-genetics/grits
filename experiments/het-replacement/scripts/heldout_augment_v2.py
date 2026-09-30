@@ -15,7 +15,8 @@ Supervised-head targets (het, lineage-aware switch, support gate, affinity) are 
 lineage-based, so they are unaffected by which mate is picked.
 
 In:  <in>_fullscale_sliced.{npy,lin.npy,prov.npy} generated with founders K+2 (3(K+2)+2 columns)
-Out: <out>_fullscale_sliced.{npy,lin.npy,prov.npy} with 3K+2 columns, + <out>.heldout.npy [n_ind,3]
+Out: <out>_fullscale_sliced.{npy,lin.npy,prov.npy} with 3K+2 columns, <out>_fullscale_sliced.ood.npy
+     [N,T] (bit 0/1 = hap1/hap2 true founder hidden; out-of-panel head target), + <out>.heldout.npy [n_ind,3]
      (mode 0/1/2, hidden founder a, hidden founder b)."""
 import argparse
 from pathlib import Path
@@ -49,6 +50,8 @@ def main():
     Lo = np.lib.format.open_memmap(a.out_prefix + "_fullscale_sliced.lin.npy", mode="w+", dtype=L.dtype, shape=(N, T, K))
     np.save(a.out_prefix + "_fullscale_sliced.prov.npy", np.asarray(P))
     meta = np.zeros((n_ind, 3), np.int16)
+    # out-of-panel sidecar [N,T] int8: bit 0 / bit 1 = hap1's / hap2's true founder is hidden here
+    Oo = np.lib.format.open_memmap(a.out_prefix + "_fullscale_sliced.ood.npy", mode="w+", dtype=np.int8, shape=(N, T))
     stats = np.zeros(4)
     for i in range(n_ind):
         sl = slice(i * G, (i + 1) * G)
@@ -71,10 +74,12 @@ def main():
         meta[i] = (mode, hid[0], hid[1])
         keep = np.setdiff1d(np.arange(K2), hid)                       # visible founders, K
         newidx = np.full(K2, -1); newidx[keep] = np.arange(K)
+        ood = np.zeros((G, T), np.int8)
         for c in range(2):
             h = lab[..., c]
             hc = np.clip(h, 0, K2 - 1)
             is_hid = (h >= 0) & np.isin(h, hid)
+            ood |= (is_hid.astype(np.int8) << c)
             lh = np.take_along_axis(lin, hc[..., None], 2)             # [G,T,1] true founder's lineage
             mates = (lin[..., keep] == lh)                             # [G,T,K]
             has = mates.any(-1)
@@ -91,7 +96,8 @@ def main():
         out[:, :, 2 * K + 2:3 * K + 2] = x[:, :, 2 * K2 + 2 + keep]
         Xo[sl] = out
         Lo[sl] = lin[..., keep].astype(L.dtype)
-    Xo.flush(); Lo.flush()
+        Oo[sl] = ood
+    Xo.flush(); Lo.flush(); Oo.flush()
     np.save(a.out_prefix + ".heldout.npy", meta)
     m = meta[:, 0]
     print(f"{n_ind} individuals: in-panel {np.mean(m == 0):.3f}, one hidden {np.mean(m == 1):.3f}, "

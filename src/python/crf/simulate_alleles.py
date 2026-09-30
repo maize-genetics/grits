@@ -86,6 +86,9 @@ DIST_NO_ANCHOR_BP = 2000   # refmap: a non-matching founder reads -1 when its ne
 # source site (shifted), bit 4 = bad site (bad_frac: collinear read corrupted
 # to a random founder's haplotype). PROV_PAD = padded row (short window).
 PROV_KIND_MASK, PROV_OFF_SITE, PROV_BAD_SITE, PROV_PAD = 7, 8, 16, -1
+# --prov-deletion-bits: bit 5 / bit 6 = hap1's / hap2's true founder is deleted (no B73 sequence,
+# nearest anchor beyond the -1 threshold) at the row's site -- the deletion-dosage head's target
+PROV_DEL_H1, PROV_DEL_H2 = 32, 64
 
 
 def prov_is_clean(prov):
@@ -1223,6 +1226,7 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
                   coverage_model="linear", read_len=150, collapse_rows=False,
                   rep_grp=None, rep_shift=0.0, rep_cross_del=0.0, rep_cross_present=0.0,
                   obs_table=None, obs_lineage=None, good=None, emit_provenance=False, good2=None,
+                  prov_deletion_bits=False,
                   dist_structure=None):
     """Assemble one chunk's indel-mode output:
     `(tern, dist, count [n,T,K] int8, lab1, lab2 [n,T] int8, refpos [n,T]
@@ -1466,6 +1470,10 @@ def _indel_chunk(rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
         dist_out[w, r] = dist_rows
         if emit_provenance:
             prov = kind.astype(np.int16)
+            if prov_deletion_bits:
+                del_kt = dist_kt > anchor_thresh                     # [n,K,R]
+                prov |= np.where(del_kt[w, h1[w, t], t], PROV_DEL_H1, 0).astype(np.int16)
+                prov |= np.where(del_kt[w, h2[w, t], t], PROV_DEL_H2, 0).astype(np.int16)
             if rs1 is not None:
                 for k_id, rs in ((4, rs1), (5, rs2)):
                     sel = kind == k_id
@@ -1552,7 +1560,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              subst_model="dense",
              subst_rate=0.018, coverage_model="linear", read_len=150,
              emit_read_counts=False, collapse_rows=False, obs_table=None, obs_by_lineage=False,
-             dist_structure=None, per_read_snps=False, per_read_bad=False,
+             dist_structure=None, per_read_snps=False, per_read_bad=False, prov_deletion_bits=False,
              emit_row_provenance=False):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
@@ -1802,7 +1810,8 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 rep_cross_present=repl_cross_present, obs_table=obs_table,
                 obs_lineage=lineage if obs_by_lineage else None,
                 dist_structure=dist_tabs,
-                good=good, good2=good2, emit_provenance=emit_row_provenance)
+                good=good, good2=good2, emit_provenance=emit_row_provenance,
+                prov_deletion_bits=prov_deletion_bits)
             if emit_row_provenance:
                 prov_all[sl] = prov[0]
 

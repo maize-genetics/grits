@@ -4,7 +4,11 @@ import sys
 import numpy as np
 D, prefix = sys.argv[1], sys.argv[2]
 parts = [f"{D}/{prefix}_d{d}" for d in ("0.1", "0.5", "1", "2")]
-for suf in ("_fullscale_sliced.npy", "_fullscale_sliced.lin.npy", "_fullscale_sliced.prov.npy"):
+import os
+SUFS = ["_fullscale_sliced.npy", "_fullscale_sliced.lin.npy", "_fullscale_sliced.prov.npy"]
+if all(os.path.exists(p + "_fullscale_sliced.ood.npy") for p in parts):
+    SUFS.append("_fullscale_sliced.ood.npy")            # held-out augment sidecar
+for suf in SUFS:
     arrs = [np.load(p + suf, mmap_mode="r") for p in parts]
     n = sum(len(a) for a in arrs)
     out = np.lib.format.open_memmap(f"{D}/{prefix}_multidepth{suf}", mode="w+", dtype=arrs[0].dtype,

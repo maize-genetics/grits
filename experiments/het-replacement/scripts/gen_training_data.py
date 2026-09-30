@@ -59,6 +59,9 @@ def main():
     ap.add_argument("--dist-structure", default=None,
                     help="measure_dist_structure.py JSON: refmap-like shared anchor-distance codes "
                          "(shared row mode + pooled off-mode levels) instead of per-founder draws")
+    ap.add_argument("--prov-deletion-bits", action="store_true",
+                    help="with --emit-row-provenance: also mark whether each haplotype's true founder is "
+                         "deleted at the row's site (bits 5/6; deletion-dosage head target)")
     ap.add_argument("--per-read-bad", action="store_true",
                     help="corrupt each homolog's read at a site independently (simulate per_read_bad)")
     ap.add_argument("--bad-frac", type=float, default=None,
@@ -121,7 +124,8 @@ def main():
         o, ibd, _i, _p, _h, _c, refpos, short, _tc, *prov = simulate(
             np.random.default_rng(seed), windows=args.windows, inbreeding=float(inb),
             indel_model=args.indel_model, obs_table=obs, obs_by_lineage=args.obs_by_lineage, dist_structure=dstruct,
-            per_read_snps=args.per_read_snps, per_read_bad=args.per_read_bad, emit_row_provenance=args.emit_row_provenance, **recipe, **repl)
+            per_read_snps=args.per_read_snps, per_read_bad=args.per_read_bad,
+            prov_deletion_bits=args.prov_deletion_bits, emit_row_provenance=args.emit_row_provenance, **recipe, **repl)
         if args.emit_row_provenance:
             prov_parts.append(prov[0])
         print(f"inb{inb}: {o.shape}  short windows {100 * short.mean():.2f}%", flush=True)
