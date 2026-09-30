@@ -56,10 +56,12 @@ def main():
         lab = x[:, :, K2:K2 + 2].astype(np.int64)
         carried = np.unique(lab[lab >= 0])
         others = np.setdiff1d(np.arange(K2), carried)
-        het = len(carried) > 1
+        # outbred = the two haplotypes ever differ (a simulated inbred carries several founders
+        # along the genome through crossovers, so "carries more than one founder" is not the test)
+        outbred = bool(((lab[..., 0] != lab[..., 1]) & (lab[..., 0] >= 0) & (lab[..., 1] >= 0)).any())
         mode = 0
         if rng.random() < a.frac and len(carried):
-            mode = 2 if (het and rng.random() >= a.p_one) else 1
+            mode = 2 if (outbred and len(carried) > 1 and rng.random() >= a.p_one) else 1
         if mode == 0:
             hid = rng.choice(others, 2, replace=False)
         elif mode == 1:
