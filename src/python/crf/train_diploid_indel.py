@@ -541,6 +541,11 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                 self.sup_ood_head = nn.Linear(d_model, 1)
                 self.dos_w = nn.Parameter(torch.tensor(0.0))
                 self.ood_w = nn.Parameter(torch.tensor(0.0))
+                # founder prior only for the in-panel share of the window: aff_w * max(0, 1 - s*ood);
+                # a sample-wide affinity prior pins hybrids to their two parents but penalises the
+                # locally right, genome-wide rare founders of an out-of-panel mosaic (sh5 fit B with
+                # the prior off: hybrids +0.5-0.7pp, OUT inbred/RIL -0.6-0.7pp). s = 1 in (A), fitted in B
+                self.aff_ood_s = nn.Parameter(torch.tensor(1.0))
             # het-head prior: "row" adds w_het*log(h | 1-h) to every row's emission (summed over
             # the window it can swamp the reads when the head is off on real data); "segment"
             # pays it once per segment (row 0 and each state change); "off" drops it
@@ -569,7 +574,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                 # stay_bonus stays at 0: a bonus on every stay is (up to multi-founder
                 # changes) the same as a higher switch cost, so fitting both is degenerate
                 keep = {"tern_loglik", "tern_dist_loglik", "het_w", "aff_w", "log_xo_scale",
-                        "dos_w", "ood_w"}
+                        "dos_w", "ood_w", "aff_ood_s"}
                 for n_, q in self.named_parameters():
                     q.requires_grad_(n_ in keep)
         self._heads = None
@@ -696,8 +701,12 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         a = torch.cat([a.float().clamp(1e-3, 1.0), torch.full_like(a[:, :1], 1e-3)], 1)
         la = torch.log(a / a[:, :Kf].sum(1, keepdim=True))                     # [B,K]
         la0 = torch.cat([la, torch.zeros_like(la[:, :1])], 1)                   # index K = none
-        self._trans_prior = self.aff_w * (la0[:, self.newf1] + la0[:, self.newf2])   # [B,P,P]
-        self._init_prior = self.aff_w * (la[:, self.pi] + la[:, self.pj])       # [B,P]
+        aw = self.aff_w * torch.ones(la.shape[0], device=la.device)             # [B]
+        if getattr(self, "extra_heads", False):
+            ood_score = torch.sigmoid(self._heads["ood_logit"].float()).mean(1)  # [B] window score
+            aw = aw * (1.0 - self.aff_ood_s * ood_score).clamp(0.0, 1.0)
+        self._trans_prior = aw.view(-1, 1, 1) * (la0[:, self.newf1] + la0[:, self.newf2])   # [B,P,P]
+        self._init_prior = aw.view(-1, 1) * (la[:, self.pi] + la[:, self.pj])  # [B,P]
         # switch probability per transition t-1 -> t (t >= 1) from the window crossover count
         lam = self.xo_scale * self._heads["xo_lam"].float()                  # [B]
         if getattr(self, "extra_heads", False):

@@ -291,9 +291,26 @@ class TestExtraHeads(unittest.TestCase):
         self.assertTrue(bool(tg["ood"][0, 1]) and not bool(tg["ood"][0, 0]))
         # with dos_w = ood_w = 0 the CRF inputs equal the model without the extra heads
         m2 = _model(supervised_heads="stage2", extra_heads=True).eval()
+        with torch.no_grad():
+            m2.aff_ood_s.fill_(0.0)            # affinity scaling off -> identical to no extra heads
         m3 = _model(supervised_heads="stage2").eval()
         m3.load_state_dict({k: v for k, v in m2.state_dict().items() if k in m3.state_dict()})
         with torch.no_grad():
             e2, _, c2 = m2(b["input_embeds"], None, b["ext_emb"], b.get("count"), aff_pred=torch.rand(B, 5))
             e3, _, c3 = m3(b["input_embeds"], None, b["ext_emb"], b.get("count"), aff_pred=torch.rand(B, 5))
         self.assertTrue(torch.allclose(e2, e3, atol=1e-5)); self.assertTrue(torch.allclose(c2, c3, atol=1e-5))
+
+
+class TestOodAffinityScaling(unittest.TestCase):
+    def test_prior_scaled_by_in_panel_share(self):
+        b = _batch()
+        m = _model(supervised_heads="stage2", extra_heads=True).eval()
+        B = b["h1"].shape[0]
+        with torch.no_grad():
+            m.sup_ood_head.weight.zero_(); m.sup_ood_head.bias.fill_(50.0)     # out-of-panel score 1
+            m(b["input_embeds"], None, b["ext_emb"], b.get("count"), aff_pred=torch.rand(B, 5))
+        self.assertTrue(torch.allclose(m._init_prior, torch.zeros_like(m._init_prior), atol=1e-5))
+        with torch.no_grad():
+            m.sup_ood_head.bias.fill_(-50.0)                                  # in-panel: full prior
+            m(b["input_embeds"], None, b["ext_emb"], b.get("count"), aff_pred=torch.rand(B, 5))
+        self.assertGreater(float(m._init_prior.abs().max()), 1e-3)
