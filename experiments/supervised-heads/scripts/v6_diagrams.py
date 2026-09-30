@@ -130,7 +130,7 @@ ax.text(8, 7.53, "each realism fix calibrated on the calibration corpus (never t
 box(ax, 0.3, 4.55, 2.6, 2.5, C["sim"], "Simulator", ["27 founders", "4 depths (0.1–2x)"], fs=13.5, lfs=11.5, tag="changed")
 arrow(ax, 2.95, 5.8, 3.55, 5.8)
 fixes = [("each read covers its own SNPs", "no identical neighbour rows", "new"),
-         ("per-read true-founder misses", "1.23% of reads, as in real data", "new"),
+         ("per-read true-founder misses", "1.23% of reads, like real", "new"),
          ("shared anchor distances", "real within-row structure", "new"),
          ("more founder sharing", "hybrids overlap like real", "new")]
 for i, (a, b, tag) in enumerate(fixes):
