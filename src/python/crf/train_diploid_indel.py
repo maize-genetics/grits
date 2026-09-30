@@ -231,9 +231,10 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
     has no calibration constants to shift, just mean/centered-mean over the
     MATCH view) attached to every window of the individual."""
     def __init__(self, data, num_parents, windows_per_individual, lin=None,
-                 train_homo_scale=False, prov=None, aff_target=None, aff_pred=None):
+                 train_homo_scale=False, prov=None, aff_target=None, aff_pred=None, ood=None):
         super().__init__(data, num_parents, lin)
         self.prov = prov                  # [N,T] int8 row provenance (--supervised-heads)
+        self.ood = ood                    # [N,T] int8 held-out sidecar (bit 0/1: hap1/hap2 hidden)
         self.aff_target = aff_target      # [N/G,K] per-individual or [N,K] per-window affinity
         self.aff_pred = aff_pred          # [N/G,K] pooled affinity-head prediction (stage2)
         G = windows_per_individual
@@ -262,6 +263,8 @@ class IndelDiploidAffinityDataset(IndelDiploidDataset):
             out["homo_scale"] = torch.tensor(self.homo_scale[idx // self.G], dtype=torch.float32)
         if self.prov is not None:
             out["prov"] = torch.tensor(np.asarray(self.prov[idx], dtype=np.int64))
+        if self.ood is not None:
+            out["ood"] = torch.tensor(np.asarray(self.ood[idx], dtype=np.int64))
         if self.aff_target is not None:
             j = idx if len(self.aff_target) == len(self.data) else idx // self.G
             out["aff_target"] = torch.tensor(self.aff_target[j], dtype=torch.float32)
@@ -291,7 +294,7 @@ def individual_affinity_target(data, lin, num_parents, G):
 def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G, limit_n=0,
                                        split_seed=0, legacy_tail_split=False, lin_path=None,
                                        train_homo_scale=False, prov_path=None, aff_targets=False,
-                                       aff_pred_path=None, aff_target_scope="individual"):
+                                       aff_pred_path=None, aff_target_scope="individual", ood_path=None):
     """Individual-aligned split, same boundaries as
     make_indel_diploid_individual_splits (mirrors train_diploid.py's
     make_diploid_affinity_splits intent)."""
@@ -305,6 +308,7 @@ def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G
     lin = _load_lineage(lin_path, data)
     prov = None if prov_path is None else np.load(prov_path, mmap_mode="r")[:N]
     aff_pred = None if aff_pred_path is None else np.load(aff_pred_path)[:n_ind]
+    ood = None if ood_path is None else np.load(ood_path, mmap_mode="r")[:N]
 
     def mk(rows):
         ids = rows[::G] // G
@@ -318,7 +322,8 @@ def make_indel_diploid_affinity_splits(path, num_parents, val_frac, test_frac, G
             aff_target=(individual_affinity_target(dr, lr, num_parents,
                                                    1 if aff_target_scope == "window" else G)
                         if aff_targets else None),
-            aff_pred=None if aff_pred is None else aff_pred[ids])
+            aff_pred=None if aff_pred is None else aff_pred[ids],
+            ood=None if ood is None else ood[rows])
     print(f"IndelDiploid(affinity) {Path(path).name}: N={N:,} individuals={n_ind} "
           f"train={len(splits[0]):,} val={len(splits[1]):,} test={len(splits[2]):,} "
           f"split={'legacy-tail' if legacy_tail_split else f'shuffled(seed={split_seed})'}")
@@ -435,7 +440,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  learned_het=False, founder_affinity=False, fast_cells=False,
                  tie_aware_loss=False, pair_emission="sum", emission="learned",
                  supervised_heads="off", xo_placement=False, het_prior="row", no_distance=False,
-                 aff_source="head", gate_target="prov"):
+                 aff_source="head", gate_target="prov", extra_heads=False):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
@@ -525,6 +530,17 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             # (uniformly, or with --xo-placement in proportion to the per-row switch head)
             self.sup_xo_head = nn.Linear(d_model, 1)
             self.xo_placement = xo_placement
+            # --extra-heads: per-row deletion dosage (0/1/2 haplotypes lacking the B73 sequence)
+            # and per-row out-of-panel probability (the row's true founder is not in the panel).
+            # CRF use, weights 0 in (A) and fitted in stage 2 (B): dosage adds
+            # dos_w * g * log P(dosage = #founders of the pair reading -1) per row; the window's
+            # mean out-of-panel score scales the switch probability by exp(ood_w * score)
+            self.extra_heads = extra_heads
+            if extra_heads:
+                self.sup_dos_head = nn.Linear(d_model, 3)
+                self.sup_ood_head = nn.Linear(d_model, 1)
+                self.dos_w = nn.Parameter(torch.tensor(0.0))
+                self.ood_w = nn.Parameter(torch.tensor(0.0))
             # het-head prior: "row" adds w_het*log(h | 1-h) to every row's emission (summed over
             # the window it can swamp the reads when the head is off on real data); "segment"
             # pays it once per segment (row 0 and each state change); "off" drops it
@@ -552,7 +568,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             if supervised_heads == "stage2":
                 # stay_bonus stays at 0: a bonus on every stay is (up to multi-founder
                 # changes) the same as a higher switch cost, so fitting both is degenerate
-                keep = {"tern_loglik", "tern_dist_loglik", "het_w", "aff_w", "log_xo_scale"}
+                keep = {"tern_loglik", "tern_dist_loglik", "het_w", "aff_w", "log_xo_scale",
+                        "dos_w", "ood_w"}
                 for n_, q in self.named_parameters():
                     q.requires_grad_(n_ in keep)
         self._heads = None
@@ -597,6 +614,9 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             xo_lam = F.softplus(self.sup_xo_head(H.float().mean(1)).squeeze(-1))   # [B]
             self._heads = dict(gate_logit=gate_logit, het_logit=het_logit,
                                aff_logit=aff_logit, c=c, xo_lam=xo_lam)
+            if getattr(self, "extra_heads", False):
+                self._heads["dos_logit"] = self.sup_dos_head(H).float()           # [B,T,3]
+                self._heads["ood_logit"] = self.sup_ood_head(H).squeeze(-1)       # [B,T]
         else:
             emis_f, g, c = self.encoder(X_pad, founder_mask, ext_emb=ext_emb,
                                         count=count)  # [B,T,K]
@@ -680,6 +700,13 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         self._init_prior = self.aff_w * (la[:, self.pi] + la[:, self.pj])       # [B,P]
         # switch probability per transition t-1 -> t (t >= 1) from the window crossover count
         lam = self.xo_scale * self._heads["xo_lam"].float()                  # [B]
+        if getattr(self, "extra_heads", False):
+            ood_w = torch.sigmoid(self._heads["ood_logit"].float()).mean(1)     # [B] window score
+            lam = lam * torch.exp(self.ood_w * ood_w)
+            deleted = (X_pad[..., 0].round() == -1).long()                      # [B,T,K]
+            dos_obs = deleted[..., self.pi] + deleted[..., self.pj]             # [B,T,P] 0..2
+            logp = F.log_softmax(self._heads["dos_logit"].float(), -1)          # [B,T,3]
+            emis_p = emis_p + self.dos_w * g.float().unsqueeze(-1) * logp.gather(2, dos_obs)
         if self.xo_placement:
             w = torch.sigmoid(-c_head.float()[:, 1:])
             w = w / w.sum(1, keepdim=True).clamp_min(1e-12)
@@ -716,7 +743,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         e1, e2 = eq(h1), eq(h2)
         return (e1[..., self.pi] & e2[..., self.pj]) | (e1[..., self.pj] & e2[..., self.pi])
 
-    def head_targets(self, h1, h2, lin, prov=None, tern=None):
+    def head_targets(self, h1, h2, lin, prov=None, tern=None, ood=None):
         """Simulator-truth targets for --supervised-heads (masks: True = row counts).
           gate   [B,T]   row clean per simulate_alleles.prov_is_clean (needs prov)
           switch [B,T-1] lineage-aware switch between rows t and t+1 (no pair state
@@ -740,6 +767,12 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             from python.crf.simulate_alleles import PROV_OFF_SITE, PROV_BAD_SITE
             out["gate"] = (prov >= 0) & ((prov & (PROV_OFF_SITE | PROV_BAD_SITE)) == 0)
             out["gate_mask"] = prov >= 0
+            if getattr(self, "extra_heads", False):
+                from python.crf.simulate_alleles import PROV_DEL_H1, PROV_DEL_H2
+                out["dos"] = ((prov & PROV_DEL_H1) > 0).long() + ((prov & PROV_DEL_H2) > 0).long()
+                out["dos_mask"] = (prov >= 0) & real
+                out["ood"] = (ood > 0) if ood is not None else torch.zeros_like(prov, dtype=torch.bool)
+                out["ood_mask"] = prov >= 0
             if getattr(self, "gate_target", "prov") == "support":
                 if tern is None:
                     raise ValueError("gate_target='support' needs the ternary rows")
@@ -768,6 +801,12 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         if aff_target is not None:
             parts["aff"] = F.binary_cross_entropy_with_logits(heads["aff_logit"].float(),
                                                               aff_target.float())
+        if "dos" in tg and "dos_logit" in heads:
+            ce = F.cross_entropy(heads["dos_logit"].float().flatten(0, 1), tg["dos"].flatten(),
+                                 reduction="none").view_as(tg["dos"])
+            m = tg["dos_mask"].float()
+            parts["dos"] = (ce * m).sum() / m.sum().clamp_min(1.0)
+            parts["ood"] = bce(heads["ood_logit"], tg["ood"], tg["ood_mask"])
         return sum(parts.values()), parts
 
     def _step(self, batch):
@@ -777,7 +816,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         tags = self._pair_labels(h1, h2)
         self._head_parts = None
         if self.supervised_heads == "stage1":
-            tg = self.head_targets(h1, h2, batch["lin"], batch.get("prov"), tern=X[..., 0])
+            tg = self.head_targets(h1, h2, batch["lin"], batch.get("prov"), tern=X[..., 0],
+                                   ood=batch.get("ood"))
             loss, self._head_parts = self.head_loss(self._heads, tg, batch.get("aff_target"))
             return loss, loss, g, c, emis_p, tags
         if self.supervised_heads != "off":
@@ -1428,6 +1468,9 @@ def parse_args():
                         "clean from <data>.prov.npy, switch, het, per-individual affinity); stage2: "
                         "freeze everything but the CRF scalars and fit them with the CRF loss "
                         "(warm start from the stage-1 ckpt, --aff-pred for the pooled affinity)")
+    p.add_argument("--extra-heads", action="store_true",
+                   help="--supervised-heads: add the deletion-dosage and out-of-panel heads (targets: "
+                        "--prov-deletion-bits provenance and <data>.ood.npy from heldout_augment_v2.py)")
     p.add_argument("--gate-target", choices=["prov", "support"], default="prov",
                    help="--supervised-heads gate target: simulator provenance (default) or 'the row "
                         "matches the true founder of the haplotype it was read from'")
@@ -1501,7 +1544,9 @@ def main():
             lin_path=lin_path, train_homo_scale=args.train_homo_scale,
             prov_path=prov_path,
             aff_targets=args.supervised_heads == "stage1" and args.aff_source == "head",
-            aff_pred_path=args.aff_pred, aff_target_scope=args.aff_target_scope)
+            aff_pred_path=args.aff_pred, aff_target_scope=args.aff_target_scope,
+            ood_path=(str(Path(args.data).with_suffix("")) + ".ood.npy"
+                      if args.extra_heads and args.supervised_heads == "stage1" else None))
     elif args.adaptive_homo:
         train_ds, val_ds, _ = make_indel_diploid_individual_splits(
             args.data, args.num_parents, args.val_frac, args.test_frac,
@@ -1530,7 +1575,7 @@ def main():
         pair_emission=args.pair_emission, emission=args.emission,
         supervised_heads=args.supervised_heads, xo_placement=args.xo_placement,
         het_prior=args.het_prior, no_distance=args.no_distance, aff_source=args.aff_source,
-        gate_target=args.gate_target)
+        gate_target=args.gate_target, extra_heads=args.extra_heads)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate

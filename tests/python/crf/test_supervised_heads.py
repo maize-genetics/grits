@@ -272,3 +272,28 @@ class TestSupportGateTarget(unittest.TestCase):
         self.assertEqual(tg["gate"].tolist(), [[True, True, False]])
         m.gate_target = "prov"
         self.assertEqual(m.head_targets(h1, h2, lin, prov)["gate"].tolist(), [[True, False, False]])
+
+
+class TestExtraHeads(unittest.TestCase):
+    def test_targets_loss_and_crf_neutral_at_zero_weight(self):
+        b = _batch()
+        m = _model(supervised_heads="stage1", extra_heads=True).train()
+        B, T = b["h1"].shape
+        b["prov"] = torch.tensor([[0, 1 | 32, 0 | 32 | 64] + [0] * (T - 3)] * B)
+        b["ood"] = torch.zeros(B, T, dtype=torch.long); b["ood"][:, 1] = 2
+        loss, *_ = m._step(b)
+        self.assertIn("dos", m._head_parts); self.assertIn("ood", m._head_parts)
+        loss.backward()
+        self.assertIsNotNone(m.sup_dos_head.weight.grad)
+        self.assertIsNotNone(m.sup_ood_head.weight.grad)
+        tg = m.head_targets(b["h1"], b["h2"], b["lin"], b["prov"], tern=b["input_embeds"][..., 0], ood=b["ood"])
+        self.assertEqual(tg["dos"][0, :3].tolist(), [0, 1, 2])
+        self.assertTrue(bool(tg["ood"][0, 1]) and not bool(tg["ood"][0, 0]))
+        # with dos_w = ood_w = 0 the CRF inputs equal the model without the extra heads
+        m2 = _model(supervised_heads="stage2", extra_heads=True).eval()
+        m3 = _model(supervised_heads="stage2").eval()
+        m3.load_state_dict({k: v for k, v in m2.state_dict().items() if k in m3.state_dict()})
+        with torch.no_grad():
+            e2, _, c2 = m2(b["input_embeds"], None, b["ext_emb"], b.get("count"), aff_pred=torch.rand(B, 5))
+            e3, _, c3 = m3(b["input_embeds"], None, b["ext_emb"], b.get("count"), aff_pred=torch.rand(B, 5))
+        self.assertTrue(torch.allclose(e2, e3, atol=1e-5)); self.assertTrue(torch.allclose(c2, c3, atol=1e-5))
