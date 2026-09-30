@@ -435,7 +435,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  learned_het=False, founder_affinity=False, fast_cells=False,
                  tie_aware_loss=False, pair_emission="sum", emission="learned",
                  supervised_heads="off", xo_placement=False, het_prior="row", no_distance=False,
-                 aff_source="head"):
+                 aff_source="head", gate_target="prov"):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
@@ -446,6 +446,14 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         if aff_source not in ("head", "reads"):
             raise ValueError(f"aff_source must be head/reads, got {aff_source!r}")
         self.aff_source = aff_source
+        # gate head target: "prov" = simulator provenance (collinear or insertion read, or a
+        # replacement read at its own site, not on a bad site); "support" = the row matches the
+        # true founder of the haplotype it was read from (an off-site replacement read that still
+        # carries that founder's signal counts as trustworthy; a corrupted read that happens to
+        # match it too is harmless)
+        if gate_target not in ("prov", "support"):
+            raise ValueError(f"gate_target must be prov/support, got {gate_target!r}")
+        self.gate_target = gate_target
         if pair_emission not in ("sum", "mixture"):
             raise ValueError(f"pair_emission must be 'sum' or 'mixture', got {pair_emission!r}")
         self.pair_emission = pair_emission
@@ -708,7 +716,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         e1, e2 = eq(h1), eq(h2)
         return (e1[..., self.pi] & e2[..., self.pj]) | (e1[..., self.pj] & e2[..., self.pi])
 
-    def head_targets(self, h1, h2, lin, prov=None):
+    def head_targets(self, h1, h2, lin, prov=None, tern=None):
         """Simulator-truth targets for --supervised-heads (masks: True = row counts).
           gate   [B,T]   row clean per simulate_alleles.prov_is_clean (needs prov)
           switch [B,T-1] lineage-aware switch between rows t and t+1 (no pair state
@@ -732,6 +740,16 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             from python.crf.simulate_alleles import PROV_OFF_SITE, PROV_BAD_SITE
             out["gate"] = (prov >= 0) & ((prov & (PROV_OFF_SITE | PROV_BAD_SITE)) == 0)
             out["gate_mask"] = prov >= 0
+            if getattr(self, "gate_target", "prov") == "support":
+                if tern is None:
+                    raise ValueError("gate_target='support' needs the ternary rows")
+                from python.crf.simulate_alleles import PROV_KIND_MASK
+                hap2 = (prov & PROV_KIND_MASK) % 2 == 1
+                hs = torch.where(hap2, h2, h1)
+                real_src = hs < Kf
+                sup = tern.gather(2, hs.clamp(max=Kf - 1).unsqueeze(-1)).squeeze(-1).round() == 1
+                out["gate"] = (prov >= 0) & real_src & sup
+                out["gate_mask"] = (prov >= 0) & real_src
         return out
 
     def head_loss(self, heads, tg, aff_target=None):
@@ -759,7 +777,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         tags = self._pair_labels(h1, h2)
         self._head_parts = None
         if self.supervised_heads == "stage1":
-            tg = self.head_targets(h1, h2, batch["lin"], batch.get("prov"))
+            tg = self.head_targets(h1, h2, batch["lin"], batch.get("prov"), tern=X[..., 0])
             loss, self._head_parts = self.head_loss(self._heads, tg, batch.get("aff_target"))
             return loss, loss, g, c, emis_p, tags
         if self.supervised_heads != "off":
@@ -1407,6 +1425,9 @@ def parse_args():
                         "clean from <data>.prov.npy, switch, het, per-individual affinity); stage2: "
                         "freeze everything but the CRF scalars and fit them with the CRF loss "
                         "(warm start from the stage-1 ckpt, --aff-pred for the pooled affinity)")
+    p.add_argument("--gate-target", choices=["prov", "support"], default="prov",
+                   help="--supervised-heads gate target: simulator provenance (default) or 'the row "
+                        "matches the true founder of the haplotype it was read from'")
     p.add_argument("--aff-source", choices=["head", "reads"], default="head",
                    help="--supervised-heads CRF founder prior: pooled affinity head, or the sample's "
                         "genome-wide read match rate (no affinity head/loss in stage 1)")
@@ -1505,7 +1526,8 @@ def main():
         fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss,
         pair_emission=args.pair_emission, emission=args.emission,
         supervised_heads=args.supervised_heads, xo_placement=args.xo_placement,
-        het_prior=args.het_prior, no_distance=args.no_distance, aff_source=args.aff_source)
+        het_prior=args.het_prior, no_distance=args.no_distance, aff_source=args.aff_source,
+        gate_target=args.gate_target)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate

@@ -58,7 +58,8 @@ for di, dname in enumerate(DEP):
             H = {k: v.float() for k, v in m._heads.items()}
             ap_ = torch.sigmoid(H["aff_logit"]).mean(0)
             aff_p.append(ap_.cpu().numpy())
-            tg = m.head_targets(B["h1"], B["h2"], B["lin"], torch.tensor(np.asarray(prov[rows]).astype(np.int64)).cuda())
+            tg = m.head_targets(B["h1"], B["h2"], B["lin"], torch.tensor(np.asarray(prov[rows]).astype(np.int64)).cuda(),
+                                tern=B["input_embeds"][..., 0])
             gm = tg["gate_mask"]
             gs.append(torch.sigmoid(H["gate_logit"])[gm].cpu().numpy()); gy.append(tg["gate"][gm].cpu().numpy())
             p = torch.sigmoid(-H["c"][:, 1:]) * tg["switch_mask"]

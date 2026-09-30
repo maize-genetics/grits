@@ -254,3 +254,21 @@ class TestReadsAffinitySource(unittest.TestCase):
         exp = float(m.aff_w) * (la[:, m.pi.clamp(max=4)] + la[:, m.pj.clamp(max=4)])
         real = (m.pi < 5) & (m.pj < 5)
         self.assertTrue(torch.allclose(m._init_prior[:, real], exp[:, real], atol=1e-5))
+
+
+class TestSupportGateTarget(unittest.TestCase):
+    def test_support_label(self):
+        m = _model(supervised_heads="stage1", gate_target="support")
+        K = m.num_parents
+        h1 = torch.tensor([[0, 0, 1]]); h2 = torch.tensor([[2, 2, 2]])
+        lin = torch.arange(K).view(1, 1, K).expand(1, 3, K).clone()
+        # row kinds: 0 hap1 collinear, 5 hap2 replacement off-site (5|8), 0 hap1 on a bad site (0|16)
+        prov = torch.tensor([[0, 5 | 8, 0 | 16]])
+        tern = torch.zeros(1, 3, K)
+        tern[0, 0, 0] = 1            # row 0 matches hap1's founder 0
+        tern[0, 1, 2] = 1            # row 1 (hap2) matches hap2's founder 2
+        tern[0, 2, 3] = 1            # row 2 (hap1, founder 1) matches only founder 3
+        tg = m.head_targets(h1, h2, lin, prov, tern=tern)
+        self.assertEqual(tg["gate"].tolist(), [[True, True, False]])
+        m.gate_target = "prov"
+        self.assertEqual(m.head_targets(h1, h2, lin, prov)["gate"].tolist(), [[True, False, False]])
