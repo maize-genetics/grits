@@ -63,6 +63,10 @@ def main():
                     help="corrupt each homolog's read at a site independently (simulate per_read_bad)")
     ap.add_argument("--bad-frac", type=float, default=None,
                     help="override the recipe's bad_frac (0.05): P(a read is corrupted to a random founder)")
+    ap.add_argument("--read-snps", type=int, default=None,
+                    help="override simulate's read_snps (8): SNPs a read must match exactly")
+    ap.add_argument("--derived-sfs", type=float, default=None,
+                    help="override simulate's derived_sfs (0.3): Beta(a,1) shape of per-SNP derived freq")
     ap.add_argument("--per-read-snps", action="store_true",
                     help="each homolog's read at a site covers its own SNPs (simulate per_read_snps)")
     ap.add_argument("--no-obs-table", action="store_true",
@@ -82,6 +86,10 @@ def main():
     recipe = dict(RECIPE)
     if args.bad_frac is not None:
         recipe["bad_frac"] = args.bad_frac
+    if args.read_snps is not None:
+        recipe["read_snps"] = args.read_snps
+    if args.derived_sfs is not None:
+        recipe["derived_sfs"] = args.derived_sfs
     f = args.depth_factor
     if f != 1.0:
         recipe["min_cross"] = max(0, int(round(RECIPE["min_cross"] / f)))
