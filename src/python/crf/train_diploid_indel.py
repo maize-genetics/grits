@@ -429,10 +429,11 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  loss_spike_mult=5.0,
                  learned_het=False, founder_affinity=False, fast_cells=False,
                  tie_aware_loss=False, pair_emission="sum", emission="learned",
-                 supervised_heads="off", xo_placement=False, het_prior="row"):
+                 supervised_heads="off", xo_placement=False, het_prior="row", no_distance=False):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
+        self.no_distance = no_distance
         if pair_emission not in ("sum", "mixture"):
             raise ValueError(f"pair_emission must be 'sum' or 'mixture', got {pair_emission!r}")
         self.pair_emission = pair_emission
@@ -540,6 +541,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
               f"{n_params:,} params")
 
     def forward(self, X, homo_scale=None, ext_emb=None, count=None, aff_pred=None):
+        if getattr(self, "no_distance", False):      # ablation: the ternary array alone
+            X = torch.stack([X[..., 0], torch.zeros_like(X[..., 1])], dim=-1)
         B, T, K_feat, _ = X.shape
         K = self.num_parents + 1
         # Null-founder pad: (TERN_DIV, DIST_PAD), not zeros — DIST_PAD=-1 is
@@ -1353,6 +1356,9 @@ def parse_args():
                         "clean from <data>.prov.npy, switch, het, per-individual affinity); stage2: "
                         "freeze everything but the CRF scalars and fit them with the CRF loss "
                         "(warm start from the stage-1 ckpt, --aff-pred for the pooled affinity)")
+    p.add_argument("--no-distance", action="store_true",
+                   help="ablation: replace the anchor-distance channel with a constant 0 (train and "
+                        "inference; saved in the checkpoint), so the encoder sees only the ternary array")
     p.add_argument("--het-prior", choices=["row", "segment", "off"], default="row",
                    help="--supervised-heads: het-head prior on every row (row), once per segment "
                         "(segment: row 0 and each pair-state change) or not at all (off)")
@@ -1441,7 +1447,7 @@ def main():
         fast_cells=args.fast_cells, tie_aware_loss=args.tie_aware_loss,
         pair_emission=args.pair_emission, emission=args.emission,
         supervised_heads=args.supervised_heads, xo_placement=args.xo_placement,
-        het_prior=args.het_prior)
+        het_prior=args.het_prior, no_distance=args.no_distance)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate

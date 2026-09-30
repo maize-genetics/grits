@@ -1111,7 +1111,8 @@ def _lineage_substitutions(rng, n, M, T, L, rate, sfs_shape):
 def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
                       h1, h2, rate, good, gamete, theta=None, max_lineages=None,
                       emit_panel=False, lineage=None, lineage_M=None,
-                      per_gamete=False, subst_model="dense", subst_rate=0.018):
+                      per_gamete=False, subst_model="dense", subst_rate=0.018,
+                      per_read_snps=False):
     """Mini-haplotype match features [n, T, K] + IBD lineage labels [n, K, T].
 
     Each founder is a piecewise-constant mosaic over ancestral lineages (same
@@ -1151,6 +1152,13 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
     not a fresh coin-flip every site) -- see that function's docstring.
     `subst_rate` is `_lineage_substitutions`'s events/site Poisson rate,
     unused when `subst_model="dense"`.
+
+    `per_read_snps` (per_gamete only): hap2's read at a site covers its OWN L SNPs (a second,
+    independent allele draw over the same lineages) instead of the same L SNPs as hap1's read.
+    Real reads at one site sit at different positions and cover different SNPs, so an inbred's
+    two reads there generally match different founder sets; with shared SNPs they are identical
+    rows, which a model learns as "identical neighbouring rows = homozygous" (the supervised het
+    head did). Same IBD lineages, so the true founders still match both reads.
     """
     L = read_snps
     if lineage is None:
@@ -1160,14 +1168,15 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
             raise ValueError("lineage_M must be given alongside a precomputed lineage array")
         M = lineage_M
 
-    if subst_model == "dense":
-        f = rng.beta(sfs_shape, 1.0, size=(n, 1, T, L))     # per-SNP derived freq
-        lin_alleles = (rng.random((n, M, T, L)) < f).astype(np.int8)  # [n,M,T,L]
-    elif subst_model == "sparse":
-        lin_alleles = _lineage_substitutions(rng, n, M, T, L, subst_rate, sfs_shape)
-    else:
+    def _alleles():
+        if subst_model == "dense":
+            f = rng.beta(sfs_shape, 1.0, size=(n, 1, T, L))     # per-SNP derived freq
+            return (rng.random((n, M, T, L)) < f).astype(np.int8)  # [n,M,T,L]
+        if subst_model == "sparse":
+            return _lineage_substitutions(rng, n, M, T, L, subst_rate, sfs_shape)
         raise ValueError(f"subst_model must be 'dense' or 'sparse', got {subst_model!r}")
 
+    lin_alleles = _alleles()
     wi = np.arange(n)[:, None, None]
     ti = np.arange(T)[None, None, :]
     G = lin_alleles[wi, lineage, ti]                    # [n,K,T,L] mini-haplotypes
@@ -1179,7 +1188,7 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
     # path to founder k. Returned as [n,T,K,L] for per-site indexing (eval only).
     panel = np.transpose(G, (0, 2, 1, 3)).astype(np.int8) if emit_panel else None
 
-    def _match_for(active, rand_founder):
+    def _match_for(active, rand_founder, G=G):
         # Bad sites: corrupt the read to a RANDOM founder's mini-haplotype (the
         # read mis-maps to a wrong founder) rather than an out-of-panel marginal
         # draw. The latter usually matched no founder's exact L-SNP haplotype,
@@ -1193,8 +1202,11 @@ def _coalescent_feats(rng, n, T, K, A, anc_cx, sfs_shape, read_snps,
     if per_gamete:
         rf1 = rng.integers(0, K, size=(n, T))           # independent corruption
         rf2 = rng.integers(0, K, size=(n, T))            # draw per homolog
+        G2 = G
+        if per_read_snps:
+            G2 = _alleles()[wi, lineage, ti]              # hap2's read: its own SNPs
         match1 = np.transpose(_match_for(h1, rf1), (0, 2, 1)).astype(np.int8)
-        match2 = np.transpose(_match_for(h2, rf2), (0, 2, 1)).astype(np.int8)
+        match2 = np.transpose(_match_for(h2, rf2, G2), (0, 2, 1)).astype(np.int8)
         return (match1, match2), lineage, panel
 
     # One read per site, sampled from the active gamete (H1 if gamete else H2).
@@ -1537,7 +1549,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
              subst_model="dense",
              subst_rate=0.018, coverage_model="linear", read_len=150,
              emit_read_counts=False, collapse_rows=False, obs_table=None, obs_by_lineage=False,
-             dist_structure=None,
+             dist_structure=None, per_read_snps=False,
              emit_row_provenance=False):
     """... (see module docstring / experiments/simulator-indels/PLAN.md
     for the full --simulate-indels design). All `simulate_indels=False`
@@ -1769,7 +1781,7 @@ def simulate(rng, windows, sites, founders, min_cross, max_cross,
                 read_snps, h1, h2, None, good, gamete=None,
                 theta=sharing_theta, max_lineages=max_lin,
                 lineage=lineage, lineage_M=M, per_gamete=True,
-                subst_model=subst_model, subst_rate=subst_rate)
+                subst_model=subst_model, subst_rate=subst_rate, per_read_snps=per_read_snps)
 
             (tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null,
              n_deleted, n_founder_sites, *prov) = _indel_chunk(
