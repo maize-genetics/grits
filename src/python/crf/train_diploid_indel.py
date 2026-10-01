@@ -1146,23 +1146,25 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
               f"(window het fraction mean {float(hw.mean()):.3f})", flush=True)
 
     # decode-time knockouts (diagnostics): gate1 / gatemean / xoconst / ood0 (dosage: set dos_w = 0)
+    # several may be combined with commas, e.g. "xoconst,ood0"
     model._knock = {}
-    if knockout == "gate1":
-        model._knock = {"gate": "one"}
-    elif knockout == "gatemean":
-        model._knock = {"gate": "mean"}
-    elif knockout == "ood0":
-        model._knock = {"ood0": True}
-    elif knockout == "xoconst":
-        xs = []
-        with torch.no_grad():
-            for s in range(0, N, batch_size):
-                cb = count[s:s + batch_size].to(device) if count is not None else None
-                model(feats[s:s + batch_size].to(device), ext_emb=ext_emb[s:s + batch_size].to(device), count=cb)
-                xs.append(model._heads["xo_lam"].float().cpu())
-        model._knock = {"xo": float(torch.cat(xs).mean())}
-    elif knockout is not None:
-        raise ValueError(f"unknown knockout {knockout!r}")
+    for ko in ([] if knockout is None else knockout.split(",")):
+        if ko == "gate1":
+            model._knock["gate"] = "one"
+        elif ko == "gatemean":
+            model._knock["gate"] = "mean"
+        elif ko == "ood0":
+            model._knock["ood0"] = True
+        elif ko == "xoconst":
+            xs = []
+            with torch.no_grad():
+                for s in range(0, N, batch_size):
+                    cb = count[s:s + batch_size].to(device) if count is not None else None
+                    model(feats[s:s + batch_size].to(device), ext_emb=ext_emb[s:s + batch_size].to(device), count=cb)
+                    xs.append(model._heads["xo_lam"].float().cpu())
+            model._knock["xo"] = float(torch.cat(xs).mean())
+        else:
+            raise ValueError(f"unknown knockout {ko!r}")
 
     preds_lo, preds_hi = [], []
     with torch.no_grad():

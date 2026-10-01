@@ -66,8 +66,9 @@ def main():
                     help="supervised-heads models: once-per-segment het prior from the pooled het head "
                          "(sample / chromosome / +-het-region windows); default: no het prior change")
     ap.add_argument("--het-region", type=int, default=5)
-    ap.add_argument("--knockout", choices=["gate1", "gatemean", "xoconst", "ood0"], default=None,
-                    help="diagnostic: decode with one supervised-head output neutralised")
+    ap.add_argument("--knockout", default=None,
+                    help="diagnostic: decode with supervised-head outputs neutralised, comma-separated from "
+                         "gate1, gatemean, xoconst, ood0")
     ap.add_argument("--aff-region", type=int, default=0,
                     help="supervised-heads models: regional affinity prior, +-N windows on the same "
                          "contig (needs --route for the window positions); 0 = genome-wide (default); -1 = each "
