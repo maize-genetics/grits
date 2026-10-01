@@ -582,7 +582,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         print(f"GRITSCRFDiploidIndel: K={K} states, P={self.P} pair-states, "
               f"{n_params:,} params")
 
-    def forward(self, X, homo_scale=None, ext_emb=None, count=None, aff_pred=None):
+    def forward(self, X, homo_scale=None, ext_emb=None, count=None, aff_pred=None, het_pred=None):
         if getattr(self, "no_distance", False):      # ablation: the ternary array alone
             X = torch.stack([X[..., 0], torch.zeros_like(X[..., 1])], dim=-1)
         B, T, K_feat, _ = X.shape
@@ -635,7 +635,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             band = torch.where(d < 0, torch.full_like(band, 8), band)            # no anchor -> 8
             emis_f = g.unsqueeze(-1) * self.tern_dist_loglik[tern_idx, band]
         if sup:
-            return self._heads_crf(X_pad, g, c, het_logit, aff_logit, aff_pred, ext_emb)
+            return self._heads_crf(X_pad, g, c, het_logit, aff_logit, aff_pred, ext_emb, het_pred)
         if self.pair_emission == "mixture":
             # each row comes from one haplotype or the other: a het pair is credited when
             # EITHER founder explains the row, so two founders explaining different reads
@@ -665,7 +665,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             state_dict[prefix + "log_xo_scale"] = torch.log(state_dict.pop(k).float().clamp_min(1e-6))
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
-    def _heads_crf(self, X_pad, g, c_head, het_logit, aff_logit, aff_pred, ext_emb=None):
+    def _heads_crf(self, X_pad, g, c_head, het_logit, aff_logit, aff_pred, ext_emb=None, het_pred=None):
         """Supervised-heads CRF inputs. Returns (emis_p [B,T,P], g, c [B,T]) and stores the
         transition prior self._trans_prior [B,P,P] and initial prior self._init_prior [B,P]
         (consumed by crf_nll_prior / crf_viterbi_prior). homo_scale is not used."""
@@ -685,6 +685,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         gf = g.float().clamp(1e-6, 1 - 1e-6).unsqueeze(-1)
         emis_p = torch.logaddexp(torch.log(gf) + mix, torch.log1p(-gf))
         h = torch.sigmoid(het_logit.float()).clamp(1e-4, 1 - 1e-4).unsqueeze(-1)
+        if het_pred is not None:            # a pooled (window / chromosome / sample) het rate per window
+            h = het_pred.float().clamp(1e-4, 1 - 1e-4).view(-1, 1, 1).expand_as(h)
         lq = self.het_w * (self.homo_mask * torch.log1p(-h) + (1 - self.homo_mask) * torch.log(h))
         self._seg_prior = None
         hp = getattr(self, "het_prior", "row")
@@ -1024,7 +1026,7 @@ def route_real_sample(M, row_bin, informative_max=12):
 
 def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=256,
                              homo_scale=None, switch_scale=None, route=False,
-                             row_bin=None, decode="viterbi", aff_region=0):
+                             row_bin=None, decode="viterbi", aff_region=0, het_scale=None, het_region=5):
     """THE single real-data inference recipe for GRITSCRFDiploidIndel --
     every eval script (real-data unit tests, depth sweeps, per-checkpoint
     comparisons) should call this instead of re-deriving the ext_emb /
@@ -1118,6 +1120,19 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
               + (f" (regional prior, +-{aff_region} windows)" if aff_region > 0 else
                  " (per-window own prior)" if aff_region < 0 else ""), flush=True)
 
+    het_win = None
+    if het_scale is not None and getattr(model, "supervised_heads", "off") != "off":
+        # pooled het rate as a once-per-segment prior: each window's het fraction (mean of the
+        # per-row het head), averaged over the whole sample, its chromosome, or +-het_region windows
+        if row_bin is None and het_scale != "global":
+            raise ValueError("het_scale chrom/region needs row_bin (contig of each window)")
+        hw = window_het_fraction(model, feats, count, ext_emb, device, batch_size)       # [N]
+        contig = np.zeros(N, np.int64) if row_bin is None else np.asarray(row_bin)[:, 0] >> 40
+        het_win = pool_windows(hw, contig, {"global": -1, "chrom": 0, "region": het_region}[het_scale])
+        model.het_prior = "segment"
+        print(f"  het prior per segment from {het_scale} het rate: mean {float(het_win.mean()):.3f} "
+              f"(window het fraction mean {float(hw.mean()):.3f})", flush=True)
+
     preds_lo, preds_hi = [], []
     with torch.no_grad():
         for s in range(0, N, batch_size):
@@ -1127,7 +1142,8 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
             cb = count[s:s + batch_size].to(device) if count is not None else None
             ab = (aff_win[s:s + batch_size].to(device) if aff_win is not None else
                   None if aff_pred is None else aff_pred.unsqueeze(0).expand(xb.shape[0], -1))
-            emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs, count=cb, aff_pred=ab)
+            hp = None if het_win is None else het_win[s:s + batch_size].to(device)
+            emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs, count=cb, aff_pred=ab, het_pred=hp)
             if aff_pred is not None:        # heads model: its own calibrated switch cost
                 pred = model.crf_decode(emis_p, c)
             else:
@@ -1140,6 +1156,36 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
 
 
 @torch.no_grad()
+@torch.no_grad()
+def window_het_fraction(model, feats, count, ext_emb, device, batch_size):
+    """[N]: each window's het fraction = mean over its rows of the supervised het head."""
+    out = []
+    for s in range(0, len(feats), batch_size):
+        cb = count[s:s + batch_size].to(device) if count is not None else None
+        model(feats[s:s + batch_size].to(device), ext_emb=ext_emb[s:s + batch_size].to(device), count=cb)
+        out.append(torch.sigmoid(model._heads["het_logit"].float()).mean(1).cpu())
+    return torch.cat(out)
+
+
+def pool_windows(v, contig, radius):
+    """Pool a per-window value [N] (windows in contig order): radius < 0 -> whole-sample mean,
+    0 -> mean over the window's contig, > 0 -> mean over +-radius windows of the same contig."""
+    if radius < 0:
+        return torch.full_like(v, float(v.mean()))
+    out = torch.empty_like(v)
+    for c in np.unique(contig):
+        idx = np.nonzero(contig == c)[0]
+        x = v[idx]
+        if radius == 0:
+            out[idx] = x.mean()
+            continue
+        cs = torch.cat([torch.zeros(1), x.cumsum(0)])
+        lo = np.clip(np.arange(len(idx)) - radius, 0, len(idx))
+        hi = np.clip(np.arange(len(idx)) + radius + 1, 0, len(idx))
+        out[idx] = (cs[hi] - cs[lo]) / torch.tensor(hi - lo, dtype=torch.float32)
+    return out
+
+
 def regional_affinity(model, feats, count, ext_emb, device, batch_size, contig, radius):
     """[N,K]: per window, the mean affinity-head probability over the windows of the same contig
     within +-radius windows (windows are in contig order, as windowed_k25native_wcount.npy)."""

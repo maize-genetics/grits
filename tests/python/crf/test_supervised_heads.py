@@ -314,3 +314,14 @@ class TestOodAffinityScaling(unittest.TestCase):
             m.sup_ood_head.bias.fill_(-50.0)                                  # in-panel: full prior
             m(b["input_embeds"], None, b["ext_emb"], b.get("count"), aff_pred=torch.rand(B, 5))
         self.assertGreater(float(m._init_prior.abs().max()), 1e-3)
+
+
+class TestPoolWindows(unittest.TestCase):
+    def test_scales(self):
+        from python.crf.train_diploid_indel import pool_windows
+        v = torch.tensor([0.0, 1.0, 0.0, 1.0, 0.5, 0.5])
+        contig = np.array([0, 0, 0, 0, 1, 1])
+        self.assertTrue(torch.allclose(pool_windows(v, contig, -1), torch.full((6,), 0.5)))
+        self.assertTrue(torch.allclose(pool_windows(v, contig, 0), torch.tensor([0.5, 0.5, 0.5, 0.5, 0.5, 0.5])))
+        r = pool_windows(v, contig, 1)
+        self.assertTrue(torch.allclose(r[:4], torch.tensor([0.5, 1 / 3, 2 / 3, 0.5])))
