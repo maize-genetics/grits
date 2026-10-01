@@ -682,6 +682,11 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         # null founder: log-LR 0 (uninformative) -- it is never a row's source in the simulator
         ll = torch.cat([ll[..., :Kf], torch.zeros_like(ll[..., :1])], -1)
         mix = torch.logaddexp(ll[..., self.pi], ll[..., self.pj]) - math.log(2.0)   # [B,T,P]
+        knock = getattr(self, "_knock", None) or {}      # decode-time knockouts (diagnostics)
+        if knock.get("gate") == "one":
+            g = torch.ones_like(g)
+        elif knock.get("gate") == "mean":
+            g = g.float().mean(1, keepdim=True).expand_as(g)
         gf = g.float().clamp(1e-6, 1 - 1e-6).unsqueeze(-1)
         emis_p = torch.logaddexp(torch.log(gf) + mix, torch.log1p(-gf))
         h = torch.sigmoid(het_logit.float()).clamp(1e-4, 1 - 1e-4).unsqueeze(-1)
@@ -706,13 +711,19 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         aw = self.aff_w * torch.ones(la.shape[0], device=la.device)             # [B]
         if getattr(self, "extra_heads", False):
             ood_score = torch.sigmoid(self._heads["ood_logit"].float()).mean(1)  # [B] window score
+            if knock.get("ood0"):
+                ood_score = torch.zeros_like(ood_score)
             aw = aw * (1.0 - self.aff_ood_s * ood_score).clamp(0.0, 1.0)
         self._trans_prior = aw.view(-1, 1, 1) * (la0[:, self.newf1] + la0[:, self.newf2])   # [B,P,P]
         self._init_prior = aw.view(-1, 1) * (la[:, self.pi] + la[:, self.pj])  # [B,P]
         # switch probability per transition t-1 -> t (t >= 1) from the window crossover count
         lam = self.xo_scale * self._heads["xo_lam"].float()                  # [B]
+        if knock.get("xo") is not None:                 # one crossover estimate for every window
+            lam = self.xo_scale * torch.full_like(lam, float(knock["xo"]))
         if getattr(self, "extra_heads", False):
             ood_w = torch.sigmoid(self._heads["ood_logit"].float()).mean(1)     # [B] window score
+            if knock.get("ood0"):
+                ood_w = torch.zeros_like(ood_w)
             lam = lam * torch.exp(self.ood_w * ood_w)
             deleted = (X_pad[..., 0].round() == -1).long()                      # [B,T,K]
             dos_obs = deleted[..., self.pi] + deleted[..., self.pj]             # [B,T,P] 0..2
@@ -1026,7 +1037,8 @@ def route_real_sample(M, row_bin, informative_max=12):
 
 def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=256,
                              homo_scale=None, switch_scale=None, route=False,
-                             row_bin=None, decode="viterbi", aff_region=0, het_scale=None, het_region=5):
+                             row_bin=None, decode="viterbi", aff_region=0, het_scale=None, het_region=5,
+                             knockout=None):
     """THE single real-data inference recipe for GRITSCRFDiploidIndel --
     every eval script (real-data unit tests, depth sweeps, per-checkpoint
     comparisons) should call this instead of re-deriving the ext_emb /
@@ -1132,6 +1144,25 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
         model.het_prior = "segment"
         print(f"  het prior per segment from {het_scale} het rate: mean {float(het_win.mean()):.3f} "
               f"(window het fraction mean {float(hw.mean()):.3f})", flush=True)
+
+    # decode-time knockouts (diagnostics): gate1 / gatemean / xoconst / ood0 (dosage: set dos_w = 0)
+    model._knock = {}
+    if knockout == "gate1":
+        model._knock = {"gate": "one"}
+    elif knockout == "gatemean":
+        model._knock = {"gate": "mean"}
+    elif knockout == "ood0":
+        model._knock = {"ood0": True}
+    elif knockout == "xoconst":
+        xs = []
+        with torch.no_grad():
+            for s in range(0, N, batch_size):
+                cb = count[s:s + batch_size].to(device) if count is not None else None
+                model(feats[s:s + batch_size].to(device), ext_emb=ext_emb[s:s + batch_size].to(device), count=cb)
+                xs.append(model._heads["xo_lam"].float().cpu())
+        model._knock = {"xo": float(torch.cat(xs).mean())}
+    elif knockout is not None:
+        raise ValueError(f"unknown knockout {knockout!r}")
 
     preds_lo, preds_hi = [], []
     with torch.no_grad():

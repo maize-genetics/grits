@@ -66,6 +66,8 @@ def main():
                     help="supervised-heads models: once-per-segment het prior from the pooled het head "
                          "(sample / chromosome / +-het-region windows); default: no het prior change")
     ap.add_argument("--het-region", type=int, default=5)
+    ap.add_argument("--knockout", choices=["gate1", "gatemean", "xoconst", "ood0"], default=None,
+                    help="diagnostic: decode with one supervised-head output neutralised")
     ap.add_argument("--aff-region", type=int, default=0,
                     help="supervised-heads models: regional affinity prior, +-N windows on the same "
                          "contig (needs --route for the window positions); 0 = genome-wide (default); -1 = each "
@@ -122,7 +124,8 @@ def main():
                                                             route=args.route, row_bin=row_bin,
                                                             decode=args.decode,
                                                             aff_region=args.aff_region,
-                                                            het_scale=args.het_scale, het_region=args.het_region)
+                                                            het_scale=args.het_scale, het_region=args.het_region,
+                                                            knockout=args.knockout)
                 bed_dir = out_root / key / "bed"
                 hae.write_imputed_bed(ind, pred_lo, pred_hi, None,
                                       hae.load_gamete_names(src / "raw.npy.gametes.tsv"),
