@@ -1557,6 +1557,8 @@ def parse_args():
                         "clean from <data>.prov.npy, switch, het, per-individual affinity); stage2: "
                         "freeze everything but the CRF scalars and fit them with the CRF loss "
                         "(warm start from the stage-1 ckpt, --aff-pred for the pooled affinity)")
+    p.add_argument("--no-founder-prior", action="store_true",
+                   help="--supervised-heads stage2: freeze the CRF founder (affinity) prior weight at 0")
     p.add_argument("--extra-heads", action="store_true",
                    help="--supervised-heads: add the deletion-dosage and out-of-panel heads (targets: "
                         "--prov-deletion-bits provenance and <data>.ood.npy from heldout_augment_v2.py)")
@@ -1690,6 +1692,15 @@ def main():
         missing, unexpected = model.load_state_dict(sd, strict=False)
         print(f"--warm-start-ckpt {args.warm_start_ckpt}: "
               f"missing={missing} unexpected={unexpected}")
+    if args.no_founder_prior and args.supervised_heads != "off":
+        # founder prior frozen at 0 (no sample-match-rate prior in the CRF); the other CRF numbers
+        # are fitted around its absence. On v6 fit B, zeroing it after fitting helped every MIX/OUT class
+        with torch.no_grad():
+            model.aff_w.zero_()
+        model.aff_w.requires_grad_(False)
+        if hasattr(model, "aff_ood_s"):
+            model.aff_ood_s.requires_grad_(False)
+        print("--no-founder-prior: aff_w frozen at 0", flush=True)
 
     # Checkpoint/stop on val/pair_acc (max), matching train_diploid.py: the CRF
     # partition NLL can spike on long-block data even as Viterbi accuracy stays
