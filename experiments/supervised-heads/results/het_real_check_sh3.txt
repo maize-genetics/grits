@@ -1,0 +1,9 @@
+IDX-INBRED__B73          het mean 0.890 median 0.999 | gate mean 0.851 | xo_lam/window 0.119 | decoded homozygous rows 0.075
+IDX-INBRED__Oh43         het mean 0.703 median 0.966 | gate mean 0.564 | xo_lam/window 0.207 | decoded homozygous rows 0.278
+IDX-INBRED__CML103       het mean 0.730 median 0.976 | gate mean 0.550 | xo_lam/window 0.213 | decoded homozygous rows 0.251
+IDX-RIL2__B73xOh43       het mean 0.783 median 0.994 | gate mean 0.681 | xo_lam/window 0.178 | decoded homozygous rows 0.190
+IDX-HYB__B73xOh43        het mean 0.936 median 1.000 | gate mean 0.765 | xo_lam/window 0.214 | decoded homozygous rows 0.037
+IDX-HYB__B97xCML103      het mean 0.837 median 0.995 | gate mean 0.610 | xo_lam/window 0.234 | decoded homozygous rows 0.120
+OUT-INBRED__Ia453        het mean 0.663 median 0.939 | gate mean 0.534 | xo_lam/window 0.214 | decoded homozygous rows 0.318
+OUT-INBRED__Tx303        het mean 0.737 median 0.977 | gate mean 0.568 | xo_lam/window 0.225 | decoded homozygous rows 0.236
+OUT-HYB__EP1xIa453       het mean 0.780 median 0.989 | gate mean 0.576 | xo_lam/window 0.234 | decoded homozygous rows 0.185

@@ -26,7 +26,6 @@ import subprocess
 import sys
 import os
 import tempfile
-from collections import Counter
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Iterator
 from enum import Enum
@@ -169,10 +168,15 @@ def allele_multiset_score(
         matches = sum(1 for t, i in zip(truth_alleles, imputed_alleles) if t == i)
         return matches / float(len(truth_alleles))
     else:
-        # Multiset comparison (current logic)
-        t = Counter(truth_alleles)
-        i = Counter(imputed_alleles)
-        inter = sum((t & i).values())
+        # Multiset intersection without Counter: genotypes are tiny (usually
+        # ploidy 2-4), so a plain list scan avoids Counter's dict/ABC
+        # construction overhead, which dominates this hot path at genome scale.
+        remaining = list(imputed_alleles)
+        inter = 0
+        for a in truth_alleles:
+            if a in remaining:
+                remaining.remove(a)
+                inter += 1
         return inter / float(len(truth_alleles))
 
 

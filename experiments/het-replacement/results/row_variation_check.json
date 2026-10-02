@@ -1,0 +1,44 @@
+{
+ "calib_inbred": {
+  "differ": 0.7843561643835616,
+  "jaccard": 0.3928245648239301,
+  "disjoint": 0.01693542074363992,
+  "match_per_row": 9.665084635416667
+ },
+ "calib_hybrid": {
+  "differ": 0.8253124592302674,
+  "jaccard": 0.48064108463377536,
+  "disjoint": 0.1424487932159165,
+  "match_per_row": 9.638286458333333
+ },
+ "calib_out_inbred": {
+  "differ": 0.7736347031963471,
+  "jaccard": 0.4096519030308999,
+  "disjoint": 0.08408610567514677,
+  "match_per_row": 9.27321484375
+ },
+ "sim_shared_inbred": {
+  "differ": 0.5587781067233122,
+  "jaccard": 0.23278693681376578,
+  "disjoint": 0.028534631274357302,
+  "match_per_row": 7.666357839209402
+ },
+ "sim_shared_hybrid": {
+  "differ": 0.8254776679434214,
+  "jaccard": 0.6319684549141694,
+  "disjoint": 0.4197428649483444,
+  "match_per_row": 7.713441506410256
+ },
+ "sim_perread_inbred": {
+  "differ": 0.776002029426687,
+  "jaccard": 0.33466177079243525,
+  "disjoint": 0.02728017796510947,
+  "match_per_row": 7.6670227920227925
+ },
+ "sim_perread_hybrid": {
+  "differ": 0.906479111958564,
+  "jaccard": 0.6547219182412681,
+  "disjoint": 0.3891620809429029,
+  "match_per_row": 7.722812054843305
+ }
+}

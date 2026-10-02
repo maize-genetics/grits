@@ -86,15 +86,23 @@ def output_collapse_bed(bed_df, output_bed):
             (bed_df["chrom"] != bed_df["chrom"].shift())
     )
     group_id = group_change.cumsum()
-    # Collapse into ranges
+    # Collapse into ranges. NOTE: "end" must come from the "end" column's own
+    # max, not "start"'s max -- aggregating "start" with both min/max (as a
+    # prior version of this function did) gives [min(start), max(start)],
+    # which for a group of exactly one row degenerates to start==end (an
+    # invalid, zero-width interval that crashes downstream BED->VCF
+    # conversion), and for multi-row groups silently under-reports the true
+    # end by exactly one base (the last row's own 1bp span was never
+    # included).
     ranges_df = bed_df.groupby(group_id).agg({
         "chrom": "first",
-        "start": ["min", "max"],
+        "start": "min",
+        "end": "max",
         "parent1": "first",
         "parent2": "first"
     }).reset_index(drop=True)
-    # Clean up MultiIndex columns
-    ranges_df.columns = ["chrom", "start", "end", "parent1", "parent2"]
+    # Clean up column order/names
+    ranges_df = ranges_df[["chrom", "start", "end", "parent1", "parent2"]]
     # Save to BED file
     ranges_df.to_csv(output_bed, sep="\t", index=False)
 

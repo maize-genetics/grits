@@ -1,0 +1,11 @@
+GRITSCRFDiploidIndel: K=26 states, P=351 pair-states, 5,072,183 params
+IDX-INBRED__B73          het mean 0.261 median 0.014 | gate mean 0.991 | xo_lam/window 0.102 | decoded homozygous rows 0.972 | out-of-panel mean 0.156 | dosage 0/1/2 [0.6880000233650208, 0.02199999988079071, 0.28999999165534973]
+IDX-INBRED__Oh43         het mean 0.317 median 0.037 | gate mean 0.994 | xo_lam/window 0.099 | decoded homozygous rows 0.997 | out-of-panel mean 0.181 | dosage 0/1/2 [0.5389999747276306, 0.032999999821186066, 0.42800000309944153]
+IDX-INBRED__CML103       het mean 0.361 median 0.072 | gate mean 0.995 | xo_lam/window 0.067 | decoded homozygous rows 0.998 | out-of-panel mean 0.187 | dosage 0/1/2 [0.5389999747276306, 0.03700000047683716, 0.42399999499320984]
+IDX-RIL2__B73xOh43       het mean 0.293 median 0.027 | gate mean 0.993 | xo_lam/window 0.103 | decoded homozygous rows 0.869 | out-of-panel mean 0.170 | dosage 0/1/2 [0.6000000238418579, 0.028999999165534973, 0.3720000088214874]
+IDX-HYB__B73xOh43        het mean 0.542 median 0.659 | gate mean 0.993 | xo_lam/window 0.083 | decoded homozygous rows 0.038 | out-of-panel mean 0.173 | dosage 0/1/2 [0.6230000257492065, 0.08699999749660492, 0.28999999165534973]
+IDX-HYB__B97xCML103      het mean 0.618 median 0.863 | gate mean 0.994 | xo_lam/window 0.057 | decoded homozygous rows 0.013 | out-of-panel mean 0.189 | dosage 0/1/2 [0.546999990940094, 0.09700000286102295, 0.35600000619888306]
+OUT-INBRED__Ia453        het mean 0.319 median 0.042 | gate mean 0.994 | xo_lam/window 0.091 | decoded homozygous rows 0.390 | out-of-panel mean 0.216 | dosage 0/1/2 [0.5120000243186951, 0.03999999910593033, 0.4480000138282776]
+OUT-INBRED__Tx303        het mean 0.393 median 0.141 | gate mean 0.994 | xo_lam/window 0.104 | decoded homozygous rows 0.165 | out-of-panel mean 0.177 | dosage 0/1/2 [0.5339999794960022, 0.04800000041723251, 0.4180000126361847]
+OUT-HYB__EP1xIa453       het mean 0.571 median 0.755 | gate mean 0.995 | xo_lam/window 0.069 | decoded homozygous rows 0.032 | out-of-panel mean 0.227 | dosage 0/1/2 [0.5180000066757202, 0.10100000351667404, 0.38100001215934753]
+MIX-HYB__B73xTx303       het mean 0.564 median 0.717 | gate mean 0.993 | xo_lam/window 0.082 | decoded homozygous rows 0.035 | out-of-panel mean 0.164 | dosage 0/1/2 [0.6179999709129333, 0.09099999815225601, 0.28999999165534973]
