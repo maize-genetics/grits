@@ -1,6 +1,7 @@
 # v6 supervised heads: current state and handoff
 
-Start here. The history of everything tried (and why) is in `HISTORY.md`; the removed worktrees are
+Start here. The history of everything tried (and why) is in `HISTORY.md`; what each branch
+investigated and why we moved on is in `BRANCHES.md`; the removed worktrees are
 listed in `CLEANUP_LOG.md`.
 
 ## Current best: v6 fit B
