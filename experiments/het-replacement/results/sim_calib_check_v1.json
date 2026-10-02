@@ -1,0 +1,97 @@
+{
+ "repl": {
+  "repl_rate": 0.09480355889498611,
+  "repl_mean_len": 7.197939857306709,
+  "repl_max_share": 22,
+  "repl_shift_sites": 13.129860521627597,
+  "repl_cross_present": 0.0727070422012593
+ },
+ "inbred": {
+  "deleted_founder_site_frac": 0.22820355555555555,
+  "tern_share": {
+   "match": 0.3636522222222222,
+   "div": 0.4729767777777778,
+   "del": 0.163371
+  },
+  "dist_code_p5_50_95": {
+   "del": [
+    89,
+    99,
+    115
+   ],
+   "div": [
+    0,
+    55,
+    84
+   ],
+   "match": [
+    0,
+    63,
+    106
+   ]
+  },
+  "p_minus1_given_del_nonmatch": 0.7105055573985184,
+  "p_minus1_given_present_nonmatch": 0.10375842915540465,
+  "p_match_given_del": 0.2969575895204671,
+  "n_deleted_mean": 5.705088888888889,
+  "pair_both_deleted": 0.14409175000000005,
+  "pair_exactly_one": 0.16822361111111112
+ },
+ "hybrid": {
+  "deleted_founder_site_frac": 0.22696133333333332,
+  "tern_share": {
+   "match": 0.36340177777777777,
+   "div": 0.4740692222222222,
+   "del": 0.162529
+  },
+  "dist_code_p5_50_95": {
+   "del": [
+    89,
+    99,
+    115
+   ],
+   "div": [
+    0,
+    55,
+    84
+   ],
+   "match": [
+    0,
+    63,
+    106
+   ]
+  },
+  "p_minus1_given_del_nonmatch": 0.7112954421066391,
+  "p_minus1_given_present_nonmatch": 0.10355440948462866,
+  "p_match_given_del": 0.2996168706172172,
+  "n_deleted_mean": 5.674033333333333,
+  "pair_both_deleted": 0.14288435185185183,
+  "pair_exactly_one": 0.16815396296296295,
+  "row_share_by_dosage": [
+   0.7366,
+   0.1570777777777778,
+   0.10632222222222222
+  ]
+ },
+ "real": {
+  "deleted_bp_frac": 0.40104474887812963,
+  "panel": {
+   "mean_n_deleted": 9.519510362564686,
+   "pair_both_deleted": 0.2120503464799721,
+   "pair_exactly_one": 0.3374601360452307
+  },
+  "tern_share": {
+   "match": 0.3865330908203125,
+   "div": 0.4073941308593749,
+   "del": 0.2060727783203125
+  },
+  "p_minus1_given_del_nonmatch": 0.6848151451033779,
+  "p_minus1_given_present_nonmatch": 0.10357786481653514,
+  "p_match_given_del": 0.22396574454379992,
+  "hyb_rel_read_density_by_dosage": {
+   "0": 1.0,
+   "1": 0.5723950896911818,
+   "2": 0.5078213660563372
+  }
+ }
+}
