@@ -421,6 +421,10 @@ def write_imputed_bed(sample, pi_arr, pj_arr, dropped_idx, gamete_names, bins_pa
                 "parent1": gamete_names[src1],
                 "parent2": gamete_names[src2],
             })
+        if not rows:
+            # whole contig decoded to the null state: no BED, so the scorer leaves it uncompared
+            print(f"  {contig}: all {n_skipped:,} sites null-state, no BED written")
+            continue
         out_bed = bed_dir / f"{sample}_{contig}_imputed.bed"
         output_collapse_bed(pd.DataFrame(rows), str(out_bed))
         written.append(out_bed)
