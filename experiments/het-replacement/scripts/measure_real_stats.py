@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-SCRIPTS = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/regionfix-out-snprc-wt/experiments/simval-corpus/scripts")
+SCRIPTS = Path(str(Path(__file__).resolve().parents[2] / "simval-corpus/scripts"))
 sys.path.insert(0, str(SCRIPTS))
 import fast_snprc_score as fss  # noqa: E402
 
