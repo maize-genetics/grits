@@ -2,7 +2,7 @@
 # Big-picture comparison over every corpus depth: align the depths not yet on the -s 200 pipeline
 # (0.01x, 0.5x, 2x), then score v6 fit B, ternary-baseline and diploid-affinity at each depth.
 # Scoring: one process per scope, at most 3 processes per GPU at a time.
-WT=/local/workdir/zrm22/HackathonJun2026/grits_workdir/sh-distfix-wt
+WT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)   # this checkout
 E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
 PY=$E/bin/python; export LD_LIBRARY_PATH=$E/lib PYTHONPATH=$WT/src
 CK=/workdir/zrm22/HackathonJun2026/grits_workdir/indel_baseline/checkpoints

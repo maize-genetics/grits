@@ -2,7 +2,7 @@
 baseline decode (from the BEDs fast_eval_ckpt.py wrote). Needs no truth. Per class mean over samples."""
 import glob, sys, collections
 import numpy as np
-sys.path.insert(0, "/local/workdir/zrm22/HackathonJun2026/grits_workdir/regionfix-out-snprc-wt/experiments/simval-corpus/scripts")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "simval-corpus/scripts"))
 import fast_snprc_score as fss  # noqa: E402
 S = "/workdir/zrm22/HackathonJun2026/grits_workdir/scratch"
 base, kos = sys.argv[1], sys.argv[2:]

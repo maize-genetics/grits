@@ -3,7 +3,7 @@
 #   per-read SNPs, per-read bad reads at the calibrated 1.23% true-founder-miss rate, dist structure,
 #   more founder sharing (read_snps 5 / derived_sfs 0.15), 27 founders -> 25 with 2 hidden per
 #   individual (30% held out), ancestral switching 16/individual (OUT churn calibration)
-WT=/local/workdir/zrm22/HackathonJun2026/grits_workdir/sh-distfix-wt
+WT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)   # this checkout
 E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
 PY=$E/bin/python; export LD_LIBRARY_PATH=$E/lib PYTHONPATH=$WT/src
 TD=/workdir/zrm22/HackathonJun2026/grits_workdir/indel_baseline/data/training

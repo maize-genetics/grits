@@ -1,7 +1,7 @@
 #!/bin/bash
 # sh5 variant: no affinity head/loss in stage 1; CRF founder prior = the sample's genome-wide
 # read match rate (diploid-affinity's _founder_affinity), same data/recipe as sh5 otherwise.
-WT=/local/workdir/zrm22/HackathonJun2026/grits_workdir/sh-distfix-wt
+WT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)   # this checkout
 E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
 PY=$E/bin/python
 export LD_LIBRARY_PATH=$E/lib PYTHONPATH=$WT/src

@@ -2,7 +2,7 @@
 # supervised heads v2 (window crossover head): lik table || stage1 (GPU0) -> pool -> A, A_place
 #  GPU1 queue: hq A, evals A, hq A_place, evals A_place, [wait B_place] evals B_place
 #  GPU0 queue: fit B (from A), fit B_place (from A_place), hq B, hq B_place, evals B
-WT=/local/workdir/zrm22/HackathonJun2026/grits_workdir/supervised-heads-wt
+WT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)   # this checkout
 E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
 PY=$E/bin/python
 export LD_LIBRARY_PATH=$E/lib PYTHONPATH=$WT/src

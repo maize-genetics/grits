@@ -1,7 +1,7 @@
 #!/bin/bash
 # supervised heads: verify+concat -> lik table -> stage1 (GPU0) -> pool affinity -> (A) ckpt
 #   -> [GPU1: head quality A + evals A 0.1x/1x]  [GPU0: stage2 (B) -> head quality B -> evals B 0.1x/1x]
-WT=/local/workdir/zrm22/HackathonJun2026/grits_workdir/supervised-heads-wt
+WT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)   # this checkout
 E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
 PY=$E/bin/python
 export LD_LIBRARY_PATH=$E/lib PYTHONPATH=$WT/src

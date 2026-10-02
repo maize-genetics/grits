@@ -3,7 +3,7 @@
 # sh5 (ternary + distance, likelihood_dist emission) and sh5nd (--no-distance, ternary only,
 # likelihood emission). Het prior off in decoding. Each: A, real het check, head quality,
 # stage-2 B, 0.1x + 1x scoring of A and B.
-WT=/local/workdir/zrm22/HackathonJun2026/grits_workdir/sh-distfix-wt
+WT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)   # this checkout
 E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
 PY=$E/bin/python
 export LD_LIBRARY_PATH=$E/lib PYTHONPATH=$WT/src

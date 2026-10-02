@@ -4,7 +4,7 @@
 #             prior off, support gate, emission table from all rows, + dosage/out-of-panel heads
 #   v6base  : the same without the two new heads (isolates their effect)
 # Each: A (lik_table --rows all), real het/heads check, head quality, stage-2 B, 0.1x + 1x scoring.
-WT=/local/workdir/zrm22/HackathonJun2026/grits_workdir/sh-distfix-wt
+WT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)   # this checkout
 E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
 PY=$E/bin/python; export LD_LIBRARY_PATH=$E/lib PYTHONPATH=$WT/src
 D=/workdir/zrm22/HackathonJun2026/grits_workdir/indel_baseline; CK=$D/checkpoints

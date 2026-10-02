@@ -18,7 +18,7 @@ from python.crf.train_diploid_indel import GRITSCRFDiploidIndel, _founder_affini
 SC = Path(__file__).resolve().parents[2] / "simval-corpus/scripts"
 sys.path.insert(0, str(SC))
 import heldout_assembly_eval as hae  # noqa: E402
-sys.path.insert(0, "/local/workdir/zrm22/HackathonJun2026/grits_workdir/regionfix-out-snprc-wt/experiments/simval-corpus/scripts")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "simval-corpus/scripts"))
 import fast_snprc_score as fss  # noqa: E402
 
 ap = argparse.ArgumentParser()

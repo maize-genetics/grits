@@ -2,7 +2,7 @@
 # --dist-structure rebuild of the 4-depth supervised-heads training set, then the sh3 recipe
 # unchanged: stage 1 -> (A) ckpt (+ het_w=0 variant) -> head checks -> real 0.1x/1x scoring,
 # and the (B) stage-2 fit. Only the simulated anchor-distance feature differs from sh3.
-WT=/local/workdir/zrm22/HackathonJun2026/grits_workdir/sh-distfix-wt
+WT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)   # this checkout
 E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
 PY=$E/bin/python
 export LD_LIBRARY_PATH=$E/lib PYTHONPATH=$WT/src
