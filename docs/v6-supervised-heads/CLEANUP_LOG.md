@@ -56,15 +56,24 @@ committed result was lost. Uncommitted files worth keeping were copied first (se
 | `RW/lift-syntenic-anchors`, `RW/refmap-read-filters`, `RW/refmap-multi-speedup` | (see pushes) | pushed above; nothing references their binaries. `refmap-multi-speedup/tmp_bench/` (1.1 GB of July benchmark output) discarded |
 | stale `/tmp/.../refmap-before-baseline` | detached | directory already gone; `git worktree prune` |
 
+## Second pass (user-approved): orphaned watchers killed, 4 more worktrees removed
+
+14 orphaned log-watcher shells (`tail -f` / `until` loops, 9-17 days old, left by earlier Claude
+sessions) were killed: pids 192504 3867628 3892874 1117801 1328953 1450005 1538196 4006336 4035428
+3207118 3581363 497836 3311956 3610456 (8 needed SIGKILL). Then removed:
+
+| Worktree | Branch | Why safe |
+|---|---|---|
+| `GW/indel-baseline-run-wt` | indel-baseline-run | on origin; its one untracked `.md` is identical to the tracked copy in supervised-heads-distfix |
+| `GW/indel-v3-simulator-wt` | indel-heldout-augment | clean, on origin |
+| `AG/agent-aa0329c51068b915c` | worktree-agent-aa0329c51068b915c (local branch also deleted) | tip contained in origin/indel-readcount-row-collapse |
+| `AG/agent-af19f5a0eaeb11150` | indel-collapse-bigmodel-moredata | clean, on origin (negative result) |
+
 ## Kept, and why
 
 - `HJ/test_crf_relatedness` (main checkout): its `.pixi` environment runs every job.
 - `GW/sh-distfix-wt`: active; the all-depth comparison pipeline runs from it.
 - `GW/v6-wt`: this branch.
-- `GW/indel-baseline-run-wt`, `GW/indel-v3-simulator-wt`, `AG/agent-aa0329c51068b915c`,
-  `AG/agent-af19f5a0eaeb11150`: content is all on origin, but each still has orphaned log-watcher
-  shells (`tail -f` / `until` loops, 9–17 days old) running in it. Killing them needs the user's
-  go-ahead; after that these four can be removed.
 - ropebwt3 `RW/lift-adaptive-projection` (running alignments use its binary),
   `RW/lift-ridx-ternary-dist-map`, `RW/pav-ps4g-insertion-rows`, `RW/refmap-ps4g-numpy`
   (scripts point at their built binaries).
