@@ -1,0 +1,11 @@
+GRITSCRFDiploidIndel: K=26 states, P=351 pair-states, 5,071,152 params
+IDX-INBRED__B73          het mean 0.406 median 0.129 | gate mean 0.991 | xo_lam/window 0.099 | decoded homozygous rows 0.971
+IDX-INBRED__Oh43         het mean 0.381 median 0.071 | gate mean 0.993 | xo_lam/window 0.087 | decoded homozygous rows 0.998
+IDX-INBRED__CML103       het mean 0.405 median 0.068 | gate mean 0.994 | xo_lam/window 0.059 | decoded homozygous rows 0.999
+IDX-RIL2__B73xOh43       het mean 0.411 median 0.128 | gate mean 0.992 | xo_lam/window 0.093 | decoded homozygous rows 0.874
+IDX-HYB__B73xOh43        het mean 0.726 median 0.994 | gate mean 0.992 | xo_lam/window 0.098 | decoded homozygous rows 0.039
+IDX-HYB__B97xCML103      het mean 0.713 median 0.994 | gate mean 0.993 | xo_lam/window 0.070 | decoded homozygous rows 0.013
+OUT-INBRED__Ia453        het mean 0.420 median 0.122 | gate mean 0.994 | xo_lam/window 0.076 | decoded homozygous rows 0.392
+OUT-INBRED__Tx303        het mean 0.482 median 0.388 | gate mean 0.993 | xo_lam/window 0.091 | decoded homozygous rows 0.165
+OUT-HYB__EP1xIa453       het mean 0.665 median 0.983 | gate mean 0.993 | xo_lam/window 0.077 | decoded homozygous rows 0.031
+MIX-HYB__B73xTx303       het mean 0.751 median 0.996 | gate mean 0.993 | xo_lam/window 0.091 | decoded homozygous rows 0.036
