@@ -70,9 +70,8 @@ PANEL_VCF_DEFAULT = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/da
                           "maize_panel_vcf/panel_25founders.vcf")
 SAMPLE_BIN = Path("/local/workdir/zrm22/HackathonJun2026/DebugSim/sample-1.0-SNAPSHOT/bin/sample")
 BUILD_TRUTH_GVCF_SH = Path(__file__).parent / "build_truth_gvcf.sh"
-COMPARE_SCRIPT = Path("/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/"
-                       "src/python/vcf_eval/compare_gvcf_truth.py")
-CRF_REPO_ROOT = Path("/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness")
+CRF_REPO_ROOT = Path(__file__).resolve().parents[3]   # this checkout, not a fixed one
+COMPARE_SCRIPT = CRF_REPO_ROOT / "src/python/vcf_eval/compare_gvcf_truth.py"
 CRF_SRC = CRF_REPO_ROOT / "src"
 sys.path.insert(0, str(CRF_SRC))         # for `python.crf...` (train_diploid, etc.)
 sys.path.insert(0, str(CRF_REPO_ROOT))   # for `src.python.bed_io...` (bed.py)

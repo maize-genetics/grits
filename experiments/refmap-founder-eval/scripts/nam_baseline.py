@@ -48,7 +48,7 @@ LIFT = REFMAP_ROOT / "rope_bwt_index/maizeFastaIndex_SampleContig.lift"
 FMD = REFMAP_ROOT / "rope_bwt_index/maizeFastaIndex_SampleContig.fmd"
 LABELS_TEMPLATE = REFMAP_ROOT / "bench_ps4g_npy/labels_full.bed"
 
-CRF_SRC = Path("/workdir/zrm22/HackathonJun2026/test_crf_relatedness/src")
+CRF_SRC = Path(__file__).resolve().parents[3] / "src"   # this checkout
 WINDOW_SCRIPT = CRF_SRC / "python/crf/ropebwt_npy_to_matrix.py"
 CKPT = Path("/workdir/zrm22/HackathonJun2026/grits_workdir/checkpoints/haploid-sim/last.ckpt")
 
