@@ -360,3 +360,13 @@ def test_read_windows(tmp_path):
     p.write_text("a\tb\n")
     with pytest.raises(ValueError, match="header"):
         read_windows(p)
+
+
+def test_ok_clamped_segment_is_used_and_counted(world):
+    asm, _ = world
+    rows = [Projection("chr1", 0, 40, "A", "A_chr1", 30, 40, "+", "ok_clamped")]
+    b = HaplotypeBuilder(bed((0, 40, "A", "A")), asm, TableProvider(rows))
+    r = b.build(W(0, 40), 1)
+    assert r.seq == A[30:40] and r.failures == [] and r.n_clamped == 1
+    assert r.segments[0].status == "ok_clamped" and ":ok_clamped" in r.segments[0].describe()
+    assert metadata_row(r)[-1] == 1

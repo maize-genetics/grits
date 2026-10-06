@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from .fai import FastaIndexError, RegionError
-from .projection import OK, Projection, ProjectionQuery, bare_chrom
+from .projection import OK, Projection, ProjectionQuery, bare_chrom, is_usable
 
 GAP_POLICIES = ("N", "skip", "extend")
 _INF = 1 << 62
@@ -66,8 +66,10 @@ class Segment:
     start: int | None = None
     end: int | None = None
     strand: str = "+"
-    status: str = "gap"          # ok | gap | <failure status>
+    status: str = "gap"          # ok | ok_clamped | gap | <failure status>
     emitted: int = 0             # bases contributed to the output
+    snap: tuple | None = None    # (start label, end label) when the provider snapped the ends
+    snap_shift: tuple | None = None
 
     @property
     def ref_len(self):
@@ -77,8 +79,13 @@ class Segment:
         r = f"{self.ref_start}-{self.ref_end}"
         if self.founder is None:
             return f"GAP:{r}"
-        if self.status == OK:
-            return f"{self.founder}:{r}>{self.contig}:{self.start}-{self.end}:{self.strand}"
+        if is_usable(self.status):
+            d = f"{self.founder}:{r}>{self.contig}:{self.start}-{self.end}:{self.strand}"
+            if self.status != OK:
+                d += f":{self.status}"
+            if self.snap:
+                d += f"[{','.join(self.snap)}]"
+            return d
         return f"{self.founder}:{r}!{self.status}"
 
 
@@ -104,7 +111,11 @@ class HaplotypeResult:
 
     @property
     def failures(self) -> list[Segment]:
-        return [s for s in self.founder_segments if s.status != OK]
+        return [s for s in self.founder_segments if not is_usable(s.status)]
+
+    @property
+    def n_clamped(self) -> int:
+        return sum(1 for s in self.founder_segments if s.status == "ok_clamped")
 
     @property
     def failed_bases(self) -> int:
@@ -339,9 +350,10 @@ class HaplotypeBuilder:
             pr = self._project(chrom, s, e, f)
             if pr.ok:
                 seg.contig, seg.start, seg.end, seg.strand = pr.contig, pr.start, pr.end, pr.strand
+                seg.snap, seg.snap_shift = pr.snap, pr.snap_shift
                 try:
                     seq = self.assemblies.fetch(pr.contig, pr.start, pr.end, pr.strand, upper=self.upper)
-                    seg.status = OK
+                    seg.status = pr.status
                 except (RegionError, FastaIndexError, FileNotFoundError) as ex:
                     seq = None
                     seg.status = f"extract_error:{type(ex).__name__}"
@@ -361,7 +373,7 @@ class HaplotypeBuilder:
 
 
 METADATA_COLUMNS = ["wid", "hap", "chrom", "start", "end", "seq_len", "n_segments", "n_switches", "gap_bases",
-                    "n_failures", "failed_bases", "founders", "segments", "failures"]
+                    "n_failures", "failed_bases", "founders", "segments", "failures", "n_clamped"]
 
 
 def metadata_row(r: HaplotypeResult) -> list:
@@ -369,4 +381,4 @@ def metadata_row(r: HaplotypeResult) -> list:
     return [w.wid, r.hap, w.chrom, w.start, w.end, len(r.seq), len(r.founder_segments), r.n_switches,
             r.gap_bases, len(r.failures), r.failed_bases, ",".join(r.founders) or ".",
             ";".join(s.describe() for s in r.segments) or ".",
-            ";".join(s.describe() for s in r.failures) or "."]
+            ";".join(s.describe() for s in r.failures) or ".", r.n_clamped]

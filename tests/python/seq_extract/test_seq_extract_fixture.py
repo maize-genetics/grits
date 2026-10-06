@@ -17,13 +17,14 @@ from python.seq_extract.assembly import AssemblySet
 from python.seq_extract.cli import main as cli_main
 from python.seq_extract.fai import build_fai
 from python.seq_extract.haplotype import BedInterval, HaplotypeBuilder, Window, group_bed
-from python.seq_extract.projection import TruthMapProvider
+from python.seq_extract.projection import Projection, TruthMapProvider, read_projection_table
+from python.seq_extract.snap import SnapProvider
 
 REPO = Path(__file__).resolve().parents[3]
 SIM = REPO / "experiments" / "seq-extract" / "simulate_pangenome.py"
 SAMTOOLS = os.environ.get("SAMTOOLS", "/programs/samtools-1.20/bin/samtools")
-SMALL_ARGS = ["--seed", "7", "--chrom-lens", "40000", "30000", "--founders", "Oh43", "Mo17", "Ki3",
-              "--large-rate", "1e-4", "--te-copies", "3", "--n-direct", "150", "--n-ref", "150", "--window", "3000"]
+SMALL_ARGS = ["--seed", "7", "--chrom-lens", "60000", "40000", "--founders", "Oh43", "Mo17", "Ki3",
+              "--large-rate", "3e-5", "--te-copies", "3", "--n-direct", "150", "--n-ref", "150", "--window", "8000"]
 
 
 def read_fasta(path):
@@ -218,3 +219,74 @@ def test_stitching_matches_independent_truth(fx, policy):
     if policy != "extend":
         assert total["gaps"] > 0
     print(f"\nstitching[{policy}]: {total}")
+
+
+# --------------------------------------------------------------------------- end snapping
+
+class PerturbedProvider:
+    """Truth projection with each end moved by a random offset: a stand-in for an unsnapped lift. The offset
+    mix follows the C --no-snap lift on the full fixture (65.6% exact, 32.5% 1-40 bp off, 1.6% > 250 bp)."""
+
+    def __init__(self, base, asm, seed=0):
+        self.base, self.asm, self.rng = base, asm, np.random.default_rng(seed)
+
+    def _off(self):
+        u = self.rng.random()
+        if u < 0.6:
+            return 0
+        if u < 0.97:
+            return int(self.rng.choice([-1, 1]) * self.rng.integers(1, 41))
+        return int(self.rng.choice([-1, 1]) * self.rng.integers(250, 3000))
+
+    def project(self, *a):
+        pr = self.base.project(*a)
+        if not pr.ok:
+            return pr
+        L = self.asm.length(pr.contig)
+        s = min(max(pr.start + self._off(), 0), L - 2)
+        e = min(max(pr.end + self._off(), s + 1), L)
+        return Projection(pr.ref_chrom, pr.ref_start, pr.ref_end, pr.assembly, pr.contig, s, e, "+", "ok")
+
+
+def test_snap_recovers_truth_from_perturbed_projections(fx):
+    d, meta, asm, _ = fx
+    truth = TruthMapProvider(d / "maps")
+    sp = SnapProvider(PerturbedProvider(truth, asm, seed=3), asm, asm)
+    n = ends_exact = intervals = 0
+    labels = {}
+    for q in read_tsv(d / "ref_queries.tsv"):
+        args = (q["ref_contig"], int(q["ref_start"]), int(q["ref_end"]), q["assembly"])
+        p = sp.project(*args)
+        t = (int(q["true_start"]), int(q["true_end"]))
+        n += 1
+        ends_exact += (p.start == t[0]) + (p.end == t[1])
+        intervals += (p.start, p.end) == t
+        for lab in p.snap:
+            labels[lab] = labels.get(lab, 0) + 1
+    print(f"\nsnap vs truth (perturbed raw): ends {ends_exact}/{2 * n}, intervals {intervals}/{n}, labels {labels}")
+    assert ends_exact >= 0.97 * 2 * n
+    assert labels.get("snap_wide", 0) > 0
+
+
+FULL_FIXTURE = Path(os.environ.get("SEQ_EXTRACT_FULL_FIXTURE",
+                                   "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_fixture"))
+C_TABLES = Path(os.environ.get("SEQ_EXTRACT_SNAP_TABLES",
+                               "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_snapcheck"))
+
+
+@pytest.mark.skipif(not (C_TABLES / "fx_nosnap.tsv").exists() or not (FULL_FIXTURE / "B73.fa").exists(),
+                    reason="C ropebwt3 --project-only tables for the full fixture not available")
+def test_snap_identical_to_c_on_full_fixture(tmp_path):
+    """Python snap over C `--no-snap --project-only` == C `--project-only`, per end (coords, labels, shifts)."""
+    asm = AssemblySet.from_dir(FULL_FIXTURE, "{asm}.fa", assemblies=["B73", "Oh43", "Mo17", "Ki3", "CML247", "Tx303"],
+                               fai_dir=tmp_path / "fai", build_missing=True)
+    sp = SnapProvider(None, asm, asm)
+    c = {r.qid: r for r in read_projection_table(C_TABLES / "fx_snap.tsv")}
+    raw = read_projection_table(C_TABLES / "fx_nosnap.tsv")
+    bad = []
+    for r in raw:
+        p, w = sp.snap(r), c[r.qid]
+        if (p.status, p.contig, p.start, p.end, p.strand, p.snap, p.snap_shift) != \
+                (w.status, w.contig, w.start, w.end, w.strand, w.snap, w.snap_shift):
+            bad.append((r.qid, p, w))
+    assert len(raw) == 500 and bad == []

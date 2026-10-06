@@ -130,7 +130,7 @@ def test_table_provider_roundtrip(tmp_path):
             Projection("chr2", 0, 10, "Mo17", None, None, None, "+", "deleted", "c")]
     p = tmp_path / "t.tsv"
     write_projection_table(p, rows)
-    assert p.read_text().startswith(HEADER)
+    assert p.read_text().startswith(HEADER.rstrip("\n") + "\tmethod\tsnap\tsnap_shift\n")
     assert "B73_chr1" in p.read_text()
     back = read_projection_table(p)
     assert back == [Projection("B73_chr1", 0, 10, "Oh43", "Oh43_chr1", 5, 16, "+", "ok", "a"),
@@ -188,3 +188,29 @@ def test_queries_and_identity(tmp_path):
     assert lines[2] == "q1\tB73_chr2\t3\t9\tB"
     ids = identity_projections(qs)
     assert ids[1] == Projection("chr2", 3, 9, "B", "B_chr2", 3, 9, "+", "ok", "q1")
+
+
+def test_table_snap_columns_and_ok_clamped(tmp_path):
+    p = tmp_path / "t.tsv"
+    p.write_text(HEADER.rstrip("\n") + "\tmethod\tsnap\tsnap_shift\n"
+                 "p0\tB73_chr1\t0\t50\tOh43\tOh43_chr1\t3\t60\t+\tok\tlocal,local\tsnap,snap_walk\t0,-8\n"
+                 "p1\tB73_chr1\t50\t90\tOh43\tOh43_chr1\t60\t100\t-\tok_clamped\tlocal1,local1\tproj_lowid,snap\t0,-9006\n"
+                 "p2\tB73_chr1\t90\t99\tOh43\t.\t.\t.\t.\tprojection_failed: projected end precedes projected start"
+                 "\tmedian,local1\tsnap_walk,snap\t6688,0\n")
+    rows = read_projection_table(p)
+    assert rows[0].method == "local,local" and rows[0].snap == ("snap", "snap_walk") and rows[0].snap_shift == (0, -8)
+    assert rows[0].ok and not rows[0].clamped
+    assert rows[1].ok and rows[1].clamped and rows[1].strand == "-"
+    assert not rows[2].ok and rows[2].status.startswith("projection_failed")
+    t = TableProvider(rows)
+    assert t.project("chr1", 50, 90, "Oh43").clamped
+    out = tmp_path / "o.tsv"
+    write_projection_table(out, rows)
+    assert read_projection_table(out) == rows
+
+
+def test_table_ok_clamped_requires_coordinates(tmp_path):
+    p = tmp_path / "t.tsv"
+    p.write_text(HEADER + "q\tchr1\t0\t5\tA\t.\t.\t.\t.\tok_clamped\n")
+    with pytest.raises(ValueError, match="missing"):
+        read_projection_table(p)

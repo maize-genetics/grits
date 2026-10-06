@@ -173,3 +173,32 @@ def test_module_entry_point(world):
     r = subprocess.run([sys.executable, "-m", "python.seq_extract", "--help"], capture_output=True, text=True,
                        env=env)
     assert r.returncode == 0 and "haplotypes" in r.stdout
+
+
+def test_haplotypes_snap_flag(tmp_path):
+    import random
+    rng = random.Random(8)
+    ref = "".join(rng.choice("ACGT") for _ in range(4000))
+    fnd = ref[:2000] + "GATTACAGATTACA" + ref[2000:2600] + ref[2610:]
+    d = tmp_path / "fa"
+    d.mkdir()
+    _fa(d / "B73.fa", [("B73_chr1", ref)], 60)
+    _fa(d / "A.fa", [("A_chr1", fnd)], 60)
+    bd = tmp_path / "bed"
+    bd.mkdir()
+    (bd / "S_chr1_imputed.bed").write_text("chrom\tstart\tend\tparent1\tparent2\nchr1\t0\t4000\tA\tB73\n")
+    w = tmp_path / "w.tsv"
+    w.write_text("wid\tchrom\tstart\tend\ng1\tchr1\t1000\t3000\n")
+    tab = tmp_path / "t.tsv"
+    tab.write_text("qid\tref_contig\tref_start\tref_end\tassembly\tcontig\tstart\tend\tstrand\tstatus\tmethod\tsnap\t"
+                   "snap_shift\nq0\tB73_chr1\t1000\t3000\tA\tA_chr1\t1003\t2990\t+\tok\tlocal,local\tproj,proj\t0,0\n")
+    truth = fnd[1000:3000 + 14 - 10]
+    base = ["haplotypes", "--fasta-dir", str(d), "--fai-dir", str(tmp_path / "fai"), "--build-fai", "--bed", str(bd),
+            "--windows", str(w), "--provider", "table", "--table", str(tab)]
+    main(base + ["--out-dir", str(tmp_path / "ns")])
+    assert list(_read_fa(tmp_path / "ns" / "hap1.fa").values())[0] == fnd[1003:2990]
+    main(base + ["--snap", "--out-dir", str(tmp_path / "s")])
+    assert list(_read_fa(tmp_path / "s" / "hap1.fa").values())[0] == truth
+    assert "[snap,snap]" in (tmp_path / "s" / "metadata.tsv").read_text()
+    main(base + ["--snap", "--snap-min-id", "1.01", "--snap-radius2", "0", "--out-dir", str(tmp_path / "s2")])
+    assert "[proj_lowid,proj_lowid]" in (tmp_path / "s2" / "metadata.tsv").read_text()

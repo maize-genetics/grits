@@ -12,6 +12,7 @@ from .assembly import AssemblySet, fai_path_for
 from .fai import FastaFile, FastaIndexError, RegionError, index_fasta
 from .haplotype import METADATA_COLUMNS, HaplotypeBuilder, metadata_row, read_bed_dir, read_windows
 from .projection import TableProvider, TruthMapProvider, identity_projections, write_projection_queries
+from .snap import SnapProvider
 
 PLACEHOLDER_TAG = "PLACEHOLDER_IDENTITY_PROJECTION_NOT_MEANINGFUL"
 
@@ -152,6 +153,12 @@ def cmd_haplotypes(a):
     else:
         builder.provider = TableProvider(identity_projections(builder.projection_queries(windows)),
                                          a.ref_assembly)
+    if a.snap:
+        ref = asm
+        if a.ref_fasta:
+            ref = AssemblySet({a.ref_assembly: a.ref_fasta}, fai_dir=a.fai_dir, build_missing=a.build_fai)
+        builder.provider = SnapProvider(builder.provider, ref, asm, a.ref_assembly, a.snap_flank, a.snap_radius,
+                                        a.snap_radius2, a.snap_min_id, a.snap_margin)
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     tag = f" {PLACEHOLDER_TAG}" if placeholder else ""
@@ -217,6 +224,17 @@ def build_parser():
     p.add_argument("--ref-assembly", default="B73")
     p.add_argument("--no-reference-identity", action="store_true",
                    help="project reference-assembly segments through the provider too")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--snap", dest="snap", action="store_true",
+                   help="refine projected ends by flank alignment, as ropebwt3 extract --lift does")
+    g.add_argument("--no-snap", dest="snap", action="store_false", help="use projections as given [default]")
+    p.set_defaults(snap=False)
+    p.add_argument("--ref-fasta", help="reference FASTA for the snap flanks [the --ref-assembly file in --fasta-dir]")
+    p.add_argument("--snap-flank", type=int, default=64)
+    p.add_argument("--snap-radius", type=int, default=200)
+    p.add_argument("--snap-radius2", type=int, default=6000, help="0 = no wide retry / walk")
+    p.add_argument("--snap-min-id", type=float, default=0.85)
+    p.add_argument("--snap-margin", type=int, default=5)
     p.add_argument("--emit-queries", help="write the projection queries this run needs and exit")
     p.add_argument("--out-dir", help="output directory")
     p.add_argument("--prefix", default="", help="output file prefix")

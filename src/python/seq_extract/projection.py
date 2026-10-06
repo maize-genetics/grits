@@ -8,8 +8,13 @@ reference-assembly prefix stripped.
 
 Projection table TSV (shared with `ropebwt3 extract --project-only`), header required:
     qid  ref_contig  ref_start  ref_end  assembly  contig  start  end  strand  status
-status "ok" means [start, end) on `contig`/`strand` is the projection; anything else (deleted, unmapped,
-...) is a failure, and contig/start/end/strand may then be '.'.
+optionally followed by `method  snap  snap_shift` (ropebwt3 a4df980+: start/end projector, start,end snap
+labels, start,end shifts in bp); further columns are ignored.
+status "ok" means [start, end) on `contig`/`strand` is the projection. "ok_clamped" (ropebwt3: the projected
+end ran past the contig end and was clamped to it) is usable as well, but flagged (Projection.clamped):
+the interval is real founder sequence, it just stops at the contig end, so the stitched haplotype may lack
+the bases beyond it. Anything else (deleted, unmapped, "projection_failed: ...") is a failure, and
+contig/start/end/strand may then be '.'.
 A projection *query* TSV (what a projecting tool needs) is the first five columns.
 """
 from __future__ import annotations
@@ -22,6 +27,9 @@ from typing import Iterable, Protocol
 import numpy as np
 
 OK = "ok"
+OK_CLAMPED = "ok_clamped"
+USABLE_STATUSES = frozenset((OK, OK_CLAMPED))
+EXTRA_COLUMNS = ["method", "snap", "snap_shift"]
 TABLE_COLUMNS = ["qid", "ref_contig", "ref_start", "ref_end", "assembly", "contig", "start", "end", "strand",
                  "status"]
 QUERY_COLUMNS = TABLE_COLUMNS[:5]
@@ -39,10 +47,22 @@ class Projection:
     strand: str = "+"
     status: str = OK
     qid: str | None = None
+    method: str | None = None
+    snap: tuple[str, str] | None = None
+    snap_shift: tuple[int, int] | None = None
 
     @property
     def ok(self) -> bool:
-        return self.status == OK
+        """Usable: status ok or ok_clamped."""
+        return self.status in USABLE_STATUSES
+
+    @property
+    def clamped(self) -> bool:
+        return self.status == OK_CLAMPED
+
+
+def is_usable(status: str) -> bool:
+    return status in USABLE_STATUSES
 
 
 @dataclass(frozen=True)
@@ -130,6 +150,15 @@ def _int_or_none(x):
     return None if x in (".", "", "NA") else int(x)
 
 
+def _pair(x, conv):
+    if x in (None, "", "."):
+        return None
+    p = x.split(",")
+    if len(p) != 2:
+        raise ValueError(f"expected 'a,b', got {x!r}")
+    return conv(p[0]), conv(p[1])
+
+
 def read_projection_table(path) -> list[Projection]:
     rows = []
     with open(path, newline="") as f:
@@ -137,6 +166,7 @@ def read_projection_table(path) -> list[Projection]:
         header = next(rd, None)
         if header is None or [h.strip() for h in header[:len(TABLE_COLUMNS)]] != TABLE_COLUMNS:
             raise ValueError(f"{path}: header must start with {' '.join(TABLE_COLUMNS)}; got {header}")
+        extra = {h.strip(): k for k, h in enumerate(header) if h.strip() in EXTRA_COLUMNS}
         for ln, p in enumerate(rd, 2):
             if not p or not "".join(p).strip():
                 continue
@@ -144,15 +174,20 @@ def read_projection_table(path) -> list[Projection]:
                 raise ValueError(f"{path}: line {ln}: expected {len(TABLE_COLUMNS)} columns")
             qid, rc, rs, re_, asm, contig, s, e, strand, status = p[:10]
             status = status.strip()
+
+            def col(name):
+                k = extra.get(name)
+                return p[k].strip() if k is not None and k < len(p) else None
             try:
                 pr = Projection(rc, int(rs), int(re_), asm, None if contig in (".", "") else contig,
                                 _int_or_none(s), _int_or_none(e), strand if strand in ("+", "-") else "+",
-                                status, qid)
+                                status, qid, None if col("method") in (None, "", ".") else col("method"), _pair(col("snap"), str),
+                                _pair(col("snap_shift"), int))
             except ValueError as ex:
                 raise ValueError(f"{path}: line {ln}: {ex}") from None
             if pr.ok:
                 if pr.contig is None or pr.start is None or pr.end is None or strand not in ("+", "-"):
-                    raise ValueError(f"{path}: line {ln}: status ok but contig/start/end/strand missing")
+                    raise ValueError(f"{path}: line {ln}: status {status} but contig/start/end/strand missing")
                 if pr.end <= pr.start or pr.start < 0:
                     raise ValueError(f"{path}: line {ln}: invalid interval [{pr.start},{pr.end})")
             rows.append(pr)
@@ -161,12 +196,14 @@ def read_projection_table(path) -> list[Projection]:
 
 def write_projection_table(path, rows: Iterable[Projection], ref_assembly: str = "B73"):
     with open(path, "w") as f:
-        f.write("\t".join(TABLE_COLUMNS) + "\n")
+        f.write("\t".join(TABLE_COLUMNS + EXTRA_COLUMNS) + "\n")
         for k, r in enumerate(rows):
             f.write("\t".join(map(str, (
                 r.qid or f"p{k}", f"{ref_assembly}_{bare_chrom(r.ref_chrom, ref_assembly)}", r.ref_start,
                 r.ref_end, r.assembly, r.contig or ".", "." if r.start is None else r.start,
-                "." if r.end is None else r.end, r.strand if r.ok else ".", r.status))) + "\n")
+                "." if r.end is None else r.end, r.strand if r.ok else ".", r.status, r.method or ".",
+                ",".join(r.snap) if r.snap else ".",
+                ",".join(map(str, r.snap_shift)) if r.snap_shift else "."))) + "\n")
 
 
 def write_projection_queries(path, queries: Iterable[ProjectionQuery], ref_assembly: str = "B73"):
