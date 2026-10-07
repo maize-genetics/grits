@@ -28,22 +28,24 @@ from gw_align import ALL_LINES, norm_chrom, split_pair  # noqa: E402
 CLASSES = ["IDX-INBRED", "IDX-HYB", "IDX-RIL2", "MIX-HYB", "MIX-RIL2", "OUT-INBRED", "OUT-HYB", "OUT-RIL2"]
 READS = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/read_datasets"
 SNPRC = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/results/eval_suite/v6cfullfe_homo/per_sample.tsv"
+TRIM_KS = (50, 20)
+TCOLS = ("anchored", "matches", "errors", "trimmed_bp", "called")
 INT = ["qlen", "query_N", "n_blocks", "aligned_q", "matches", "mismatches", "ins", "dels", "unaligned", "truth_N",
-       "errors"]
+       "errors"] + [f"t{K}_{x}" for K in TRIM_KS for x in TCOLS]
 
 
 def load_scores(align_dir):
     sc = {}
     for line in ALL_LINES:
-        p = Path(align_dir) / f"scores_{line}.tsv"
-        if not p.exists():
-            print(f"missing {p}", file=sys.stderr)
-            continue
-        with open(p) as f:
-            for r in csv.DictReader(f, delimiter="\t"):
-                for k in INT:
-                    r[k] = int(r[k])
-                sc[(r["seq_hash"], line)] = r
+        ps = [p for p in (Path(align_dir) / f"scores_{line}{x}.tsv" for x in ("", ".model", ".panel")) if p.exists()]
+        if not ps:
+            print(f"missing scores for {line}", file=sys.stderr)
+        for p in ps:
+            with open(p) as f:
+                for r in csv.DictReader(f, delimiter="\t"):
+                    for k in INT:
+                        r[k] = int(r[k])
+                    sc[(r["seq_hash"], line)] = r
     return sc
 
 
@@ -89,7 +91,7 @@ def main():
     panel = defaultdict(dict)
     for r in csv.DictReader(open(Path(a.stitch) / "panel.tsv"), delimiter="\t"):
         panel[r["wid"]][r["founder"]] = r
-    ceil = {}
+    ceil, tceil = {}, {}
     with open(out / "ceiling.tsv", "w") as fo:
         fo.write("wid\tline\tbest_founder\terrors\tcalled\tmatches\tn_ok_founders\tn_scored_founders\t"
                  "self_in_panel_errors\n")
@@ -107,6 +109,19 @@ def main():
                     key = (s["errors"], s["query_N"], -s["matches"])
                     if best is None or key < best[0]:
                         best = (key, f, s)
+                for K in TRIM_KS:
+                    tb = None
+                    for f, pr in panel[wid].items():
+                        if pr["status"] != "ok":
+                            continue
+                        s = sc.get((pr["seq_hash"], line))
+                        if state(s, w["chrom"]) != "scored" or not s[f"t{K}_anchored"]:
+                            continue
+                        key = (s[f"t{K}_errors"], s[f"t{K}_trimmed_bp"], -s[f"t{K}_matches"])
+                        if tb is None or key < tb[0]:
+                            tb = (key, f, s)
+                    if tb:
+                        tceil[(wid, line, K)] = (tb[1], tb[2])
                 nok = sum(1 for pr in panel[wid].values() if pr["status"] == "ok")
                 selfe = "."
                 if line in panel[wid] and panel[wid][line]["status"] == "ok":
@@ -128,7 +143,9 @@ def main():
     cols = ["depth", "class", "sample", "wid", "chrom", "hap", "truth", "model_founders", "n_switches", "gap_bases",
             "failed_bases", "state", "qlen", "query_N", "asm_N", "n_blocks", "aligned_q", "matches", "mismatches",
             "ins", "dels", "unaligned", "errors", "contig", "mapq", "ceil_founder", "ceil_state", "ceil_errors",
-            "ceil_called", "ceil_matches", "founder_eq_ceil"]
+            "ceil_called", "ceil_matches", "founder_eq_ceil"] + \
+        [f"t{K}_{x}" for K in TRIM_KS for x in TCOLS] + \
+        [f"ceil_t{K}_{x}" for K in TRIM_KS for x in ("founder", "matches", "errors", "trimmed_bp", "called")]
     rows = []
     rilchk = defaultdict(lambda: defaultdict(int))
     first_depth = sorted({k[0] for k in haps})[0]
@@ -195,6 +212,13 @@ def main():
             row["ceil_called"] = (cs_["qlen"] - cs_["query_N"]) if cs_ else ""
             row["ceil_matches"] = cs_["matches"] if cs_ else ""
             row["founder_eq_ceil"] = (founders == row["ceil_founder"]) if row["n_switches"] == 0 else ""
+            for K in TRIM_KS:
+                for x in TCOLS:
+                    row[f"t{K}_{x}"] = s[f"t{K}_{x}"] if s else 0
+                tc = tceil.get((wid, line, K))
+                row[f"ceil_t{K}_founder"] = tc[0] if tc else "."
+                for x in ("matches", "errors", "trimmed_bp", "called"):
+                    row[f"ceil_t{K}_{x}"] = tc[1][f"t{K}_{x}"] if tc else ""
             rows.append(row)
     with open(out / "per_hapwin.tsv", "w") as fo:
         fo.write("\t".join(cols) + "\n")

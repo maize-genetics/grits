@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from python.seq_extract import AssemblySet, read_projection_table  # noqa: E402
 
-RB3 = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_ropebwt/ropebwt3"
+RB3 = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_ropebwt/ropebwt3_v3"
 FMD = "/workdir/zrm22/HackathonJun2026/ropebwt_refMap/rope_bwt_index_v2/maizeFastaIndex_SampleContig_v2.fmd"
 RENAMED = "/workdir/zrm22/HackathonJun2026/ropebwt_refMap/rope_bwt_index_v2/renamedFastas"
 FAI_DIR = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_fai"
@@ -42,6 +42,7 @@ def main():
     ap.add_argument("outdir")
     ap.add_argument("--isa", required=True)
     ap.add_argument("--threads", type=int, default=3)
+    ap.add_argument("--rb3", default=RB3)
     ap.add_argument("--max", type=int, default=0)
     ap.add_argument("--seed", type=int, default=1)
     a = ap.parse_args()
@@ -56,7 +57,7 @@ def main():
             f.write(f"{r.qid}\t{r.contig}\t{r.start}\t{r.end}\t{r.strand}\n")
     t0 = time.time()
     with open(out / "rb3.fa", "w") as fo, open(out / "rb3.log", "w") as fe:
-        rc = subprocess.run([RB3, "extract", "-t", str(a.threads), "-I", a.isa, "-f",
+        rc = subprocess.run([a.rb3, "extract", "-t", str(a.threads), "-I", a.isa, "-f",
                              str(out / "direct_queries.tsv"), FMD], stdout=fo, stderr=fe).returncode
     t_rb3 = time.time() - t0
     rb3 = read_fasta(out / "rb3.fa")

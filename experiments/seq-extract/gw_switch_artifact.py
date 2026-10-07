@@ -16,10 +16,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from python.seq_extract import AssemblySet, Projection, TableProvider  # noqa: E402
+from python.seq_extract import AssemblySet, TableProvider  # noqa: E402
 import gw_align as G  # noqa: E402
 
-RB3 = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_ropebwt/ropebwt3"
+RB3 = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_ropebwt/ropebwt3_v3"
 IDX = "/workdir/zrm22/HackathonJun2026/ropebwt_refMap/rope_bwt_index_v2"
 FMD = f"{IDX}/maizeFastaIndex_SampleContig_v2.fmd"
 LIFT = f"{IDX}/maizeFastaIndex_SampleContig_v2_s200.lift"
@@ -28,22 +28,14 @@ RENAMED = f"{IDX}/renamedFastas"
 FAI_DIR = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_fai"
 
 
-MAX_EXTRA = 50000
-
-
-def plausible(p):
-    """Same rule as gw_filter_proj.py: projected span > reference span + 50 kb counts as a failure."""
-    if p.ok and (p.end - p.start) - (p.ref_end - p.ref_start) > MAX_EXTRA:
-        return Projection(p.ref_chrom, p.ref_start, p.ref_end, p.assembly, status="implausible_length")
-    return p
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--windows", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--lines", nargs="+", default=["B97", "CML103", "Il14H", "Oh43"])
     ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--rb3", default=RB3)
+    ap.add_argument("--rb3-args", default="", help="extra ropebwt3 extract options, e.g. --no-snap")
     a = ap.parse_args()
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -58,8 +50,8 @@ def main():
                 for tag, x, y in (("full", s, e), ("left", s, m), ("right", m, e)):
                     f.write(f"{w['wid']}|{L}|{tag}\tB73_{w['chrom']}\t{x}\t{y}\t{L}\n")
     with open(out / "proj.tsv", "w") as fo:
-        subprocess.run([RB3, "extract", f"--lift={LIFT}", "--ref-prefix=B73", "--project-only", "-I", ISA, "-f",
-                        str(q), FMD], stdout=fo, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run([a.rb3, "extract", f"--lift={LIFT}", "--ref-prefix=B73", "--project-only", "-I", ISA]
+                       + a.rb3_args.split() + ["-f", str(q), FMD], stdout=fo, stderr=subprocess.DEVNULL, check=True)
     prov = TableProvider.from_tsv(out / "proj.tsv")
     asm = AssemblySet.from_dir(RENAMED, "{asm}_renamed.fa", fai_dir=FAI_DIR)
     rows = []
@@ -68,7 +60,7 @@ def main():
         for w in wins:
             s, e = int(w["start"]), int(w["end"])
             m = (s + e) // 2
-            pf, pl, pr = (plausible(prov.project(w["chrom"], x, y, L)) for x, y in ((s, e), (s, m), (m, e)))
+            pf, pl, pr = (prov.project(w["chrom"], x, y, L) for x, y in ((s, e), (s, m), (m, e)))
             info = dict(wid=w["wid"], line=L, full_ok=pf.ok, split_ok=pl.ok and pr.ok)
             if pf.ok:
                 seqs[f"{w['wid']}|full"] = asm.fetch(pf.contig, pf.start, pf.end, pf.strand, upper=True)

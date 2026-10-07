@@ -32,8 +32,28 @@ def summarize(d):
     ce_match = ce.ceil_matches.astype(float)
     tot = d.qlen.sum()
     has_aln = d[d.state.isin(["scored", "mislocated"])]
+    out = {}
+    for K in (50, 20):
+        an = sc[sc[f"t{K}_anchored"] == 1]
+        tc = an[f"t{K}_called"].sum()
+        sw = an.n_switches > 0
+        diff = an.errors - an[f"t{K}_errors"]
+        ce_t = an[an[f"ceil_t{K}_founder"].astype(str) != "."]
+        out.update({
+            f"t{K}_err_per_kb": 1000 * an[f"t{K}_errors"].sum() / tc,
+            f"t{K}_identity": an[f"t{K}_matches"].sum() / (an[f"t{K}_matches"].sum() + an[f"t{K}_errors"].sum()),
+            f"t{K}_pct_exact": 100 * (an[f"t{K}_errors"] == 0).mean(),
+            f"t{K}_mean_trimmed_bp": an[f"t{K}_trimmed_bp"].mean(),
+            f"t{K}_pct_unanchored": 100 * (sc[f"t{K}_anchored"] == 0).mean(),
+            f"t{K}_full_err_per_kb_anchored": 1000 * an.errors.sum() / (an.qlen - an.query_N).sum(),
+            f"t{K}_pct_diff_from_switch_win": 100 * diff[sw].sum() / diff.sum() if diff.sum() else np.nan,
+            f"t{K}_model_err_per_kb_ceilrows": 1000 * ce_t[f"t{K}_errors"].sum() / ce_t[f"t{K}_called"].sum(),
+            f"t{K}_ceil_err_per_kb": 1000 * ce_t[f"ceil_t{K}_errors"].astype(float).sum() /
+                                     ce_t[f"ceil_t{K}_called"].astype(float).sum(),
+            f"t{K}_ceil_pct_exact": 100 * (ce_t[f"ceil_t{K}_errors"].astype(float) == 0).mean(),
+        })
     return pd.Series({
-        "n_hapwin": len(d),
+        **{"n_hapwin": len(d)},
         "scored": len(sc),
         "pct_all_N": 100 * (d.state == "all_N").mean(),
         "pct_mislocated": 100 * (has_aln.state == "mislocated").mean() if len(has_aln) else np.nan,
@@ -73,6 +93,7 @@ def summarize(d):
         "pct_mislocated_to_scaffold": 100 * ((has_aln.state == "mislocated") &
                                              ~has_aln.contig.astype(str).str.fullmatch(r"chr\d+")).mean()
         if len(has_aln) else np.nan,
+        **out,
     })
 
 
@@ -92,13 +113,13 @@ def main():
     ps.to_csv(rd / "per_sample.tsv", sep="\t", index=False, float_format="%.4g")
     lines = []
     for depth, g in ps.groupby("depth"):
-        r, p = spearmanr(g.err_per_kb, g.snprc_err)
-        r2, p2 = spearmanr(g.err_per_kb, g.all_err)
-        lines.append(f"depth {depth}: n={len(g)} spearman(err_per_kb, snprc_err)={r:.3f} (p={p:.2g}); "
-                     f"vs all_err={r2:.3f} (p={p2:.2g})")
-        for cls, gg in g.groupby("class", observed=True):
-            rr, _ = spearmanr(gg.err_per_kb, gg.snprc_err)
-            lines.append(f"  {cls}: spearman={rr:.2f}")
+        for m in ("err_per_kb", "t50_err_per_kb", "t20_err_per_kb"):
+            r, p = spearmanr(g[m], g.snprc_err)
+            r2, p2 = spearmanr(g[m], g.all_err)
+            lines.append(f"depth {depth} {m}: n={len(g)} spearman vs snprc_err={r:.3f} (p={p:.2g}); "
+                         f"vs all_err={r2:.3f} (p={p2:.2g})")
+            lines.append("    per class vs snprc_err: " + ", ".join(
+                f"{cls} {spearmanr(gg[m], gg.snprc_err)[0]:.2f}" for cls, gg in g.groupby("class", observed=True)))
     (rd / "snprc_agreement.txt").write_text("\n".join(lines) + "\n")
     pd.set_option("display.width", 250)
     pd.set_option("display.max_columns", 50)
