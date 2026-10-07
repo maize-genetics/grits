@@ -38,7 +38,7 @@ ALL_LINES = IDX_LINES + OUT_LINES
 CS_OP = re.compile(r"(:\d+|\*[a-z]{2}|[+\-][a-z]+|~[a-z]{2}\d+[a-z]{2})")
 SCORE_COLS = ["seq_hash", "line", "qlen", "query_N", "status", "contig", "tstart", "tend", "strand", "mapq",
               "n_blocks", "aligned_q", "matches", "mismatches", "ins", "dels", "unaligned", "truth_N", "errors", "rescued",
-              "truth_uncalled"] + [f"t{K}_{x}" for K in (50, 20)
+              "truth_uncalled", "n_noncollinear"] + [f"t{K}_{x}" for K in (50, 20)
                                    for x in ("anchored", "matches", "errors", "trimmed_bp", "called")]
 
 
@@ -109,6 +109,21 @@ def overlap(parts, s, e):
 
 
 TRIM_KS = (50, 20)
+COLLINEAR = True
+COLLINEAR_TOL = 50
+
+
+def collinear_with(b, blocks):
+    """Supplementary block b is kept only if, against every block already kept, query order equals
+    target order (reversed on '-'): target gap >= min(query gap, 0) - COLLINEAR_TOL and
+    <= max(query gap, 0) + SLOP."""
+    for c in blocks:
+        left, right = (b, c) if b["qs"] < c["qs"] else (c, b)
+        qgap = right["qs"] - left["qe"]
+        tgap = (right["ts"] - left["te"]) if b["strand"] == "+" else (left["ts"] - right["te"])
+        if tgap < min(qgap, 0) - COLLINEAR_TOL or tgap > max(qgap, 0) + SLOP:
+            return False
+    return True
 
 
 def score_query(qlen, nprefix, blocks, expect=None):
@@ -123,7 +138,7 @@ def score_query(qlen, nprefix, blocks, expect=None):
     errors are counted only inside [L, R) of the query (deletions strictly inside; gaps between blocks
     if both flanking block ends are inside), the non-N query bases outside are t<K>_trimmed_bp.
     No such run: t<K>_anchored = 0 (unanchored). Internal switch junctions are never trimmed."""
-    r = dict(rescued=0, truth_uncalled=0, status="unaligned", contig=".", tstart=".", tend=".", strand=".",
+    r = dict(rescued=0, truth_uncalled=0, n_noncollinear=0, status="unaligned", contig=".", tstart=".", tend=".", strand=".",
              mapq=".", n_blocks=0, aligned_q=0, matches=0, mismatches=0, ins=0, dels=0, unaligned=0, truth_N=0)
     called_all = int(qlen - nprefix[qlen])
     for K in TRIM_KS:
@@ -149,6 +164,9 @@ def score_query(qlen, nprefix, blocks, expect=None):
     cl = Claimed()
     ev = []    # (kind, pos, n): M matches [pos, n=end); X mismatch; I inserted base; D deletion at boundary pos
     for b in [p] + sorted(sup, key=lambda b: -b["AS"]):
+        if COLLINEAR and b is not p and not collinear_with(b, [c for c, _ in chosen]):
+            r["n_noncollinear"] += 1
+            continue
         parts = cl.free_parts(b["qs"], b["qe"])
         if not parts:
             continue
@@ -268,7 +286,7 @@ def nprefix_of(seq):
 
 
 def main():
-    global SLOP
+    global SLOP, COLLINEAR
     ap = argparse.ArgumentParser()
     ap.add_argument("--stitch", required=True)
     ap.add_argument("--out-dir", required=True)
@@ -276,11 +294,14 @@ def main():
     ap.add_argument("--threads", type=int, default=3)
     ap.add_argument("--preset", default="asm20")
     ap.add_argument("--chain-slop", type=int, default=20000)
+    ap.add_argument("--no-collinear", action="store_true",
+                    help="v1/v2 behaviour: combine supplementary blocks without the collinearity check")
     ap.add_argument("--set", choices=["all", "model", "panel"], default="all",
                     help="align the model haplotypes, the panel windows, or both; scores_<line>[.<set>].tsv")
     ap.add_argument("--rescore-only", action="store_true", help="reuse existing PAFs")
     a = ap.parse_args()
     SLOP = a.chain_slop
+    COLLINEAR = not a.no_collinear
     st, out = Path(a.stitch), Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     need = defaultdict(set)
@@ -354,7 +375,7 @@ def main():
                 fo.write("\t".join(str(r[c]) for c in SCORE_COLS) + "\n")
             for h in sorted(empty):
                 fo.write("\t".join(map(str, [h, line, qinfo[h][0], qinfo[h][1], "all_N", ".", ".", ".", ".", ".",
-                                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] + [0] * 10)) + "\n")
+                                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] + [0] * 10)) + "\n")
         print(f"{line}: {len(hs)} queries ({len(empty)} all-N), minimap2 {t1 - t0:.0f}s, "
               f"score+rescue {time.time() - t1:.0f}s; off-chromosome primaries {len(off)}, rescued {n_res}",
               file=sys.stderr, flush=True)

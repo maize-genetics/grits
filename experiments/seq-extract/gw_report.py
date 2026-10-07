@@ -41,6 +41,7 @@ def summarize(d):
         ce_t = an[an[f"ceil_t{K}_founder"].astype(str) != "."]
         out.update({
             f"t{K}_err_per_kb": 1000 * an[f"t{K}_errors"].sum() / tc,
+            f"t{K}_err_per_kb_capped": 1000 * np.minimum(an[f"t{K}_errors"], an[f"t{K}_called"]).sum() / tc,
             f"t{K}_identity": an[f"t{K}_matches"].sum() / (an[f"t{K}_matches"].sum() + an[f"t{K}_errors"].sum()),
             f"t{K}_pct_exact": 100 * (an[f"t{K}_errors"] == 0).mean(),
             f"t{K}_mean_trimmed_bp": an[f"t{K}_trimmed_bp"].mean(),
@@ -63,6 +64,7 @@ def summarize(d):
         "identity": sc.matches.sum() / (sc.matches.sum() + sc.errors.sum()),
         "mean_identity": ident.mean(),
         "err_per_kb": 1000 * sc.errors.sum() / called,
+        "err_per_kb_capped": 1000 * np.minimum(sc.errors, sc.qlen - sc.query_N).sum() / called,
         "mism_per_kb": 1000 * sc.mismatches.sum() / called,
         "indel_per_kb": 1000 * (sc.ins.sum() + sc.dels.sum()) / called,
         "unaln_per_kb": 1000 * sc.unaligned.sum() / called,
@@ -70,6 +72,7 @@ def summarize(d):
         "pct_exact_called": 100 * (sc.errors == 0).mean(),
         "model_err_per_kb_ceilrows": 1000 * ce.errors.sum() / (ce.qlen - ce.query_N).sum(),
         "ceil_err_per_kb": 1000 * ce_err.sum() / ce_called,
+        "ceil_err_per_kb_capped": 1000 * np.minimum(ce_err, ce.ceil_called.astype(float)).sum() / ce_called,
         "ceil_identity": ce_match.sum() / (ce_match.sum() + ce_err.sum()),
         "ceil_pct_exact_called": 100 * (ce_err == 0).mean(),
         "pct_win_switch": 100 * (sc.n_switches > 0).mean(),
@@ -113,7 +116,7 @@ def main():
     ps.to_csv(rd / "per_sample.tsv", sep="\t", index=False, float_format="%.4g")
     lines = []
     for depth, g in ps.groupby("depth"):
-        for m in ("err_per_kb", "t50_err_per_kb", "t20_err_per_kb"):
+        for m in ("err_per_kb", "err_per_kb_capped", "t50_err_per_kb", "t50_err_per_kb_capped", "t20_err_per_kb"):
             r, p = spearmanr(g[m], g.snprc_err)
             r2, p2 = spearmanr(g[m], g.all_err)
             lines.append(f"depth {depth} {m}: n={len(g)} spearman vs snprc_err={r:.3f} (p={p:.2g}); "

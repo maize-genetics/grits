@@ -70,6 +70,8 @@ def rows_for(aligner, sc, base, hashes, wins, ceil):
         for k in ("qlen", "query_N", "matches", "mismatches", "ins", "dels", "unaligned", "errors", "n_blocks",
                   "aligned_q", "t50_anchored", "t50_errors", "t50_called", "t50_matches", "t50_trimmed_bp"):
             row[k] = s[k] if s else 0
+        for k in ("structural", "n_struct", "snps", "n_small_ins", "n_small_del"):
+            row[k] = int(s[k]) if s and k in s else np.nan
         row["ceil_errors"] = c["errors"] if c else np.nan
         row["ceil_called"] = (c["qlen"] - c["query_N"]) if c else np.nan
         row["ceil_t50_errors"] = tc["t50_errors"] if tc else np.nan
@@ -89,6 +91,12 @@ def summarize(d):
         "n_hapwin": len(d), "scored": len(sc),
         "pct_mislocated": 100 * (has.state == "mislocated").mean(),
         "err_per_kb": 1000 * sc.errors.sum() / called,
+        "err_per_kb_capped": 1000 * np.minimum(sc.errors, sc.qlen - sc.query_N).sum() / called,
+        "t50_err_per_kb_capped": 1000 * np.minimum(an.t50_errors, an.t50_called).sum() / an.t50_called.sum(),
+        "snps_per_kb": 1000 * sc.snps.sum() / called,
+        "small_indel_events_per_kb": 1000 * (sc.n_small_ins + sc.n_small_del).sum() / called,
+        "structural_bp_per_kb": 1000 * sc.structural.sum() / called,
+        "sv_blocks_per_100win": 100 * sc.n_struct.sum() / max(1, len(sc)),
         "t50_err_per_kb": 1000 * an.t50_errors.sum() / an.t50_called.sum(),
         "identity": sc.matches.sum() / (sc.matches.sum() + sc.errors.sum()),
         "pct_exact_called": 100 * (sc.errors == 0).mean(),
@@ -97,6 +105,7 @@ def summarize(d):
         "unaln_share_of_errors": 100 * sc.unaligned.sum() / max(1, sc.errors.sum()),
         "mean_blocks": sc.n_blocks.mean(),
         "ceil_err_per_kb": 1000 * ce.ceil_errors.sum() / ce.ceil_called.sum(),
+        "ceil_err_per_kb_capped": 1000 * np.minimum(ce.ceil_errors, ce.ceil_called).sum() / ce.ceil_called.sum(),
         "ceil_t50_err_per_kb": 1000 * ct.ceil_t50_errors.sum() / ct.ceil_t50_called.sum(),
     })
 
@@ -104,7 +113,8 @@ def summarize(d):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--v2", required=True)
-    ap.add_argument("--rb3", nargs="+", required=True)
+    ap.add_argument("--rb3", "--other", dest="rb3", nargs="+", required=True,
+                    help="NAME=DIR of score files to compare with minimap2 (sw, MEM-chain, minimap2 variants)")
     ap.add_argument("--lines", nargs="+", default=["Oh43", "Tx303"])
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
@@ -138,7 +148,7 @@ def main():
     pc.to_csv(out / "pilot_per_class.tsv", sep="\t", index=False, float_format="%.4g")
 
     # per query agreement (unique (hash, line): model haps + panel), both scored on the right chromosome
-    agree_rows, top = [], []
+    agree_rows, top, level_rows = [], [], []
     mm = scores["minimap2"]
     for name in aligners:
         if name == "minimap2":
@@ -157,6 +167,15 @@ def main():
             e2 = np.array([p[2]["errors"] for p in pairs])
             m = np.maximum(e1, e2)
             d = np.abs(e1 - e2)
+            lvl = np.select([e1 == 0, e1 <= 10, e1 <= 100, e1 <= 1000], ["0", "1-10", "11-100", "101-1k"], ">1k")
+            for lv in ("0", "1-10", "11-100", "101-1k", ">1k"):
+                k = lvl == lv
+                if k.any():
+                    level_rows.append(dict(other=name, line=line, mm2_errors=lv, n=int(k.sum()),
+                                           pct_equal=100 * (d[k] == 0).mean(),
+                                           pct_within_1pct=100 * ((d[k] <= 0.01 * m[k]) | (m[k] == 0)).mean(),
+                                           pct_diff_gt_100bp=100 * (d[k] > 100).mean(),
+                                           pct_diff_gt_1kb=100 * (d[k] > 1000).mean()))
             agree_rows.append(dict(rb3=name, line=line, n=len(pairs), pct_equal=100 * (d == 0).mean(),
                                    pct_within_1pct=100 * ((d <= 0.01 * m) | (m == 0)).mean(),
                                    pct_diff_gt_100bp=100 * (d > 100).mean(), pct_diff_gt_1kb=100 * (d > 1000).mean(),
@@ -170,7 +189,8 @@ def main():
                                 **{f"mm2_{k}": s[k] for k in ("errors", "mismatches", "ins", "dels", "unaligned",
                                                                "n_blocks", "aligned_q", "tstart", "tend")},
                                 **{f"rb3_{k}": t[k] for k in ("errors", "mismatches", "ins", "dels", "unaligned",
-                                                               "n_blocks", "aligned_q", "tstart", "tend")}))
+                                                               "n_blocks", "aligned_q", "tstart", "tend")},
+                                **{f"rb3_{k}": t.get(k, "") for k in ("structural", "n_struct")}))
             # status disagreements
             st = defaultdict(int)
             for (h, l), s in mm.items():
@@ -180,6 +200,8 @@ def main():
             agree_rows[-1]["status_pairs"] = "; ".join(f"{k}:{v}" for k, v in sorted(st.items(), key=lambda x: -x[1]))
     pd.DataFrame(agree_rows).to_csv(out / "pilot_agreement.tsv", sep="\t", index=False, float_format="%.3f")
     pd.DataFrame(top).to_csv(out / "pilot_top_disagreements.tsv", sep="\t", index=False)
+    pd.DataFrame(level_rows).to_csv(out / "pilot_agreement_by_level.tsv", sep="\t", index=False,
+                                    float_format="%.3f")
     pd.set_option("display.width", 250)
     pd.set_option("display.max_columns", 40)
     print(pc.to_string(index=False, float_format=lambda v: f"{v:.3g}"))
