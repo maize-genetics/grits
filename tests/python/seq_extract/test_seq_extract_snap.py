@@ -310,12 +310,14 @@ def test_deleted_end_base_walks_over():
     assert (p.start, p.end) == want and p.snap[0] == "snap"
 
 
-def test_deletion_boundary_residual_like_c():
-    # Known limitation shared with snap.c (README: "deletion-boundary placements"): with ref [995,1005)
-    # deleted, flank bases 1000-1004 align by chance to founder bases left of the true start, which
-    # scores better than the 5 bp terminal deletion, so the start lands 3 bp early.
-    p, want, _ = run([(995, "del", 10)], d0=-2)
+def test_deletion_boundary_residual_v3():
+    # v3 limitation (README: "deletion-boundary placements"): with ref [995,1005) deleted, flank bases
+    # 1000-1004 align by chance to founder bases left of the true start, scoring better than the 5 bp
+    # terminal deletion, so the start lands 3 bp early. v4 places it from the left flank instead.
+    p, want, _ = run([(995, "del", 10)], d0=-2, snap_version="v3")
     assert want[0] == 995 and p.start == 992 and p.snap[0] == "snap"
+    p, want, _ = run([(995, "del", 10)], d0=-2)
+    assert p.start == want[0] == 995 and p.snap[0] == "snap_x"
 
 
 def test_founder_only_bases_next_to_end_excluded():
@@ -331,8 +333,8 @@ def test_equal_base_insertion_maps_to_own_copy():
     assert (p.start, p.end) == want
 
 
-def test_repeat_gives_ambiguity_and_keeps_projection():
-    p, want, raw = run([(900, "ins", R[1000:1064])], d0=2)
+def test_repeat_gives_ambiguity_and_keeps_projection_v3():
+    p, want, raw = run([(900, "ins", R[1000:1064])], d0=2, snap_version="v3")
     assert p.snap[0] == "proj_ambiguous" and p.start == raw.start and p.snap_shift[0] == 0
     assert p.snap[1] == "snap" and p.end == want[1]
 
@@ -344,10 +346,10 @@ def test_minus_strand_locus():
     assert p.snap_shift == (-5, 9) or p.snap_shift == (5, -9)
 
 
-def test_flank_shorter_than_F_and_too_short():
-    p, want, _ = run([], rst=1000, ren=1040, d0=3, d1=-3)
+def test_flank_shorter_than_F_and_too_short_v3():
+    p, want, _ = run([], rst=1000, ren=1040, d0=3, d1=-3, snap_version="v3")
     assert (p.start, p.end) == want and p.snap == ("snap", "snap")
-    p, want, raw = run([], rst=1000, ren=1010, d0=3, d1=-3)
+    p, want, raw = run([], rst=1000, ren=1010, d0=3, d1=-3, snap_version="v3")
     assert p.snap == ("proj_short", "proj_short") and (p.start, p.end) == (raw.start, raw.end)
 
 
@@ -372,14 +374,15 @@ def test_low_identity_keeps_projection():
 
 
 @pytest.mark.parametrize("strand", ["+", "-"])
-def test_walk_end_and_start(strand):
-    p, want, _ = run([(2880, "del", 150)], d1=5, strand=strand)
+def test_walk_end_and_start_v3(strand):
+    p, want, _ = run([(2880, "del", 150)], d1=5, strand=strand, snap_version="v3")
     assert (p.start, p.end) == want and p.snap == ("snap", "snap_walk")
-    p, want, _ = run([(930, "del", 200)], d0=-3, strand=strand)
+    p, want, _ = run([(930, "del", 200)], d0=-3, strand=strand, snap_version="v3")
     assert (p.start, p.end) == want and p.snap == ("snap_walk", "snap")
 
 
 def test_walk_partial_flank_falls_back_like_c():
+    # same in v3 and v4
     # ref [2900,3100) deleted: the first inward flank [2872,2936) keeps 28 present bases plus 9 chance-aligned
     # ones (37 >= 32, accepted), so the stretch [2872,3000) has < F/2 = 32 alignable bases -> proj_lowid.
     p, want, raw = run([(2900, "del", 200)], d1=5)
@@ -426,3 +429,186 @@ def test_snap_through_builder_with_table(tmp_path):
     r = b.build(Window("w", "chr1", 1000, 3000), 1)
     assert r.seq == fs[ts:te] and r.segments[0].snap == ("snap", "snap")
     assert "[snap,snap]" in r.segments[0].describe()
+
+
+# --------------------------------------------------------------------------- v4: shared boundary computation
+
+def pieces(edits, m, a=1000, b=3000, strand="+", d=(3, -4, 5, -6), **kw):
+    """Project [a,m) and [m,b) separately (raw ends offset by d) and return both plus the truth fenceposts."""
+    left, wl, _ = run(edits, a, m, d[0], d[1], strand, **kw)
+    right, wr, _ = run(edits, m, b, d[2], d[3], strand, **kw)
+    return left, right, wl, wr
+
+
+def junction(left, right, strand):
+    return (left.end, right.start) if strand == "+" else (left.start, right.end)
+
+
+@pytest.mark.parametrize("strand", ["+", "-"])
+def test_v4_deletion_spanning_boundary_shared_junction(strand):
+    # exact case: both pieces meet at the deletion junction
+    left, right, wl, wr = pieces([(1994, "del", 9)], 2000, strand=strand)
+    assert (left.start, left.end) == wl and (right.start, right.end) == wr
+    j = junction(left, right, strand)
+    assert j[0] == j[1]
+    # typical case (as in C): the deleted tail of the placed flank is aligned as mismatches/chance matches
+    # (a terminal 1 bp gap costs 7, a mismatch 4), so the shared junction is a few bp off the truth --
+    # but the two pieces still meet exactly
+    left, right, wl, wr = pieces([(1985, "del", 25)], 2000, strand=strand)
+    j = junction(left, right, strand)
+    assert j[0] == j[1] and right.snap[0] == "snap"
+
+
+@pytest.mark.parametrize("strand", ["+", "-"])
+def test_v4_insertion_at_boundary_in_neither_piece(strand):
+    ins = "ACGTTTGCA"
+    left, right, wl, wr = pieces([(2000, "ins", ins)], 2000, strand=strand)
+    assert (left.start, left.end) == wl and (right.start, right.end) == wr
+    j = junction(left, right, strand)
+    assert abs(j[1] - j[0]) == len(ins)
+    assert left.snap[1] == "snap" and right.snap[0] == "snap"
+
+
+class StubSides(SnapProvider):
+    """snap_boundary with scripted flank placements: sides[(left, walk)] = (label, u, edge)."""
+
+    def __init__(self, sides):
+        super().__init__(None, None, None)
+        self.sides, self.calls = sides, []
+
+    def _side(self, x, left, sign, contig, L, ref_contig, Lr, p, walk):
+        self.calls.append((left, walk, p))
+        return self.sides.get((left, walk), ("proj_short", -1, False))
+
+
+def boundary(sides, is_start, x=500, u_raw=1000):
+    sp = StubSides(sides)
+    lab, U = sp.snap_boundary(x, is_start, 1, "A_chr1", 5000, "B73_chr1", 5000, u_raw)
+    return lab, U, sp.calls
+
+
+def test_v4_rule1_both_flanks_insertion_gap_in_neither_piece():
+    sides = {(True, False): ("snap", 900, True), (False, False): ("snap_wide", 910, True)}
+    assert boundary(sides, True)[:2] == ("snap_wide", 910)          # start = right flank
+    lab, U, calls = boundary(sides, False)
+    assert (lab, U) == ("snap", 901) and [c[0] for c in calls] == [True]   # end: left only
+    assert calls[0][2] == 999                                       # left side probes u_raw - 1
+
+
+@pytest.mark.parametrize("eL,eR,uR", [(False, True, 910), (True, False, 910), (True, True, 900)])
+def test_v4_rule2_left_defines_both_on_deletion_replacement_or_overlap(eL, eR, uR):
+    # deletion at x (an edge base absent), replacement, or the right flank overlapping the left:
+    # the left placement gives the single junction, so replacement bases go to the right piece
+    sides = {(True, False): ("snap", 900, eL), (False, False): ("snap", uR, eR)}
+    assert boundary(sides, True)[:2] == ("snap_x", 901)
+    assert boundary(sides, False)[:2] == ("snap", 901)
+
+
+def test_v4_rule2_right_only():
+    sides = {(True, False): ("proj_ambiguous", -1, False), (False, False): ("snap_wide", 950, True)}
+    assert boundary(sides, True)[:2] == ("snap_wide", 950)
+    assert boundary(sides, False)[:2] == ("snap_x_wide", 950)
+
+
+def test_v4_rule3_walks_left_then_right():
+    low = {(True, False): ("proj_lowid", -1, False), (False, False): ("proj_lowid", -1, False)}
+    lab, U, calls = boundary({**low, (True, True): ("snap_walk", 870, False)}, False)
+    assert (lab, U) == ("snap_walk", 871) and (True, True, 999) in calls and (False, True, 1000) not in calls
+    lab, U, _ = boundary({**low, (True, True): ("snap_walk", 870, False)}, True)
+    assert (lab, U) == ("snap_x_walk", 871)
+    lab, U, calls = boundary({**low, (True, True): ("proj_lowid", -1, False),
+                              (False, True): ("snap_walk", 1030, False)}, False)
+    assert (lab, U) == ("snap_x_walk", 1030) and (False, True, 1000) in calls
+    lab, U, _ = boundary({**low, (True, True): ("proj_ambiguous", -1, False),
+                          (False, True): ("proj_lowid", -1, False)}, True)
+    assert (lab, U) == ("proj_ambiguous", 1000)
+
+
+def test_v4_rule4_keeps_projection_and_x0():
+    lab, U, calls = boundary({(True, False): ("proj_ambiguous", -1, False),
+                              (False, False): ("proj_lowid", -1, False)}, True)
+    # an ambiguous left side is not walked; the low-identity right side still is
+    assert (lab, U) == ("proj_ambiguous", 1000) and [(c[0], c[1]) for c in calls] == [(True, False), (False, False), (False, True)]
+    lab, U, calls = boundary({(False, False): ("snap", 1003, True)}, True, x=0, u_raw=1000)
+    assert (lab, U) == ("snap", 1003) and [c[0] for c in calls] == [False]   # no left flank at x = 0
+    lab, U, _ = boundary({}, False, x=0)
+    assert (lab, U) == ("proj_short", 1000)
+
+
+def test_v4_replacement_sequence_level():
+    rng = random.Random(3)
+    ins = "".join(rng.choice("ACGT") for _ in range(30))
+    edits = [(1990, "del", 20), (2010, "ins", ins)]
+    left, right, wl, wr = pieces(edits, 2000)
+    assert left.start == wl[0] and right.end == wr[1]
+    assert left.end <= right.start
+
+
+def test_v4_low_identity_flank_on_one_side_uses_the_other():
+    rng = random.Random(11)
+    noisy = [(k, "snp", rng.choice([c for c in "ACGT" if c != R[k]])) for k in range(2000, 2064, 3)]
+    left, right, wl, wr = pieces(noisy, 2000, d=(0, -9, 9, 0))
+    assert right.start == wr[0] and left.end == wl[1]
+    assert right.snap[0] == "snap_x" and left.snap[1] == "snap"
+    noisy = [(k, "snp", rng.choice([c for c in "ACGT" if c != R[k]])) for k in range(1936, 2000, 3)]
+    left, right, wl, wr = pieces(noisy, 2000, d=(0, -9, 9, 0))
+    assert left.end == wl[1] and right.start == wr[0]
+    assert left.snap[1] == "snap_x" and right.snap[0] == "snap"
+
+
+def test_v4_start_projects_with_both_flanks_and_end_fallback():
+    p, want, _ = run([(2970, "ins", "GGGG")], d0=4, d1=-3)
+    assert (p.start, p.end) == want and p.snap == ("snap", "snap")
+
+
+@pytest.mark.parametrize("strand", ["+", "-"])
+def test_v4_interval_inside_deletion_fails(strand):
+    fs, mp = derive(R, [(1000, "del", 300)])
+    seqs = Seqs({"B73_chr1": R, "A_chr1": fs if strand == "+" else revcomp(fs)})
+    L, j = len(fs), int(mp[1300])
+    if strand == "+":
+        raw = Projection("chr1", 1100, 1200, "A", "A_chr1", j - 30, j + 40, "+", OK)
+    else:
+        raw = Projection("chr1", 1100, 1200, "A", "A_chr1", L - j - 40, L - j + 30, "-", OK)
+    p = SnapProvider(Fixed(raw), seqs, seqs).project("chr1", 1100, 1200, "A")
+    assert p.status == "projection_failed: interval deleted in the founder (empty projection)"
+    assert p.start is None and p.snap is not None
+
+
+@pytest.mark.parametrize("strand", ["+", "-"])
+def test_v4_walk_both_sides(strand):
+    p, want, _ = run([(2800, "del", 300)], d1=7, strand=strand)
+    assert (p.start, p.end) == want and p.snap[1] == "snap_walk"
+    p, want, _ = run([(2900, "del", 300)], d1=7, strand=strand)
+    assert (p.start, p.end) == want and p.snap[1] == "snap_x_walk"
+    p, want, _ = run([(800, "del", 300)], d0=-4, strand=strand)
+    assert (p.start, p.end) == want and p.snap[0] == "snap_x_walk"
+
+
+def test_v4_walk_not_bounded_by_interval():
+    # a 100 bp interval whose end sits in a 400 bp deletion: v3 cannot walk (t + F > interval), v4 can
+    p3, want, _ = run([(1050, "del", 400)], rst=1000, ren=1100, d1=6, snap_version="v3")
+    p4, want, _ = run([(1050, "del", 400)], rst=1000, ren=1100, d1=6)
+    assert p3.snap[1] == "proj_lowid" and p3.end != want[1]
+    assert p4.end == want[1] and p4.snap[1] in ("snap_walk", "snap_x_walk", "snap_x")
+
+
+def test_v4_ambiguous_repeat_covering_both_flanks():
+    p, want, raw = run([(900, "ins", R[930:1070])], d0=2)
+    assert p.snap[0] == "proj_ambiguous" and p.start == raw.start and p.snap_shift[0] == 0
+
+
+def test_v4_short_flanks_near_reference_contig_start():
+    p, want, _ = run([], rst=5, ren=2000, d0=2)
+    assert p.start == want[0] and p.snap[0] == "snap"          # left flank [0,5) too short, right placed
+    p, want, _ = run([], rst=0, ren=2000, d0=0)
+    assert p.start == 0 and p.snap[0] == "snap"
+    seqs = Seqs({"B73_chr1": R[:20], "A_chr1": R[:20]})
+    raw = Projection("chr1", 10, 15, "A", "A_chr1", 10, 15, "+", OK)
+    p = SnapProvider(Fixed(raw), seqs, seqs).project("chr1", 10, 15, "A")
+    assert p.snap == ("proj_short", "proj_short") and (p.start, p.end) == (10, 15)
+
+
+def test_snap_version_validation():
+    with pytest.raises(ValueError):
+        SnapProvider(None, None, None, snap_version="v2")

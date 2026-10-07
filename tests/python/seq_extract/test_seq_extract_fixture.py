@@ -17,7 +17,7 @@ from python.seq_extract.assembly import AssemblySet
 from python.seq_extract.cli import main as cli_main
 from python.seq_extract.fai import build_fai
 from python.seq_extract.haplotype import BedInterval, HaplotypeBuilder, Window, group_bed
-from python.seq_extract.projection import Projection, TruthMapProvider, read_projection_table
+from python.seq_extract.projection import Projection, SpanCheckProvider, TruthMapProvider, read_projection_table
 from python.seq_extract.snap import SnapProvider
 
 REPO = Path(__file__).resolve().parents[3]
@@ -274,18 +274,20 @@ C_TABLES = Path(os.environ.get("SEQ_EXTRACT_SNAP_TABLES",
                                "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_snapcheck"))
 
 
-@pytest.mark.skipif(not (C_TABLES / "fx_nosnap.tsv").exists() or not (FULL_FIXTURE / "B73.fa").exists(),
-                    reason="C ropebwt3 --project-only tables for the full fixture not available")
-def test_snap_identical_to_c_on_full_fixture(tmp_path):
-    """Python snap over C `--no-snap --project-only` == C `--project-only`, per end (coords, labels, shifts)."""
+@pytest.mark.parametrize("version,prefix", [("v3", "fx_"), ("v4", "v4_fx_")])
+def test_snap_identical_to_c_on_full_fixture(tmp_path, version, prefix):
+    """Python snap over C `--no-snap --project-only` == C `--project-only`, per row (coords, labels, shifts).
+    v3 tables come from ropebwt3 a4df980, v4 tables from 509b2bf (raw run with --max-span-excess=0)."""
+    if not (C_TABLES / f"{prefix}nosnap.tsv").exists() or not (FULL_FIXTURE / "B73.fa").exists():
+        pytest.skip("C ropebwt3 --project-only tables for the full fixture not available")
     asm = AssemblySet.from_dir(FULL_FIXTURE, "{asm}.fa", assemblies=["B73", "Oh43", "Mo17", "Ki3", "CML247", "Tx303"],
                                fai_dir=tmp_path / "fai", build_missing=True)
-    sp = SnapProvider(None, asm, asm)
-    c = {r.qid: r for r in read_projection_table(C_TABLES / "fx_snap.tsv")}
-    raw = read_projection_table(C_TABLES / "fx_nosnap.tsv")
+    sp = SpanCheckProvider(SnapProvider(None, asm, asm, snap_version=version))
+    c = {r.qid: r for r in read_projection_table(C_TABLES / f"{prefix}snap.tsv")}
+    raw = read_projection_table(C_TABLES / f"{prefix}nosnap.tsv")
     bad = []
     for r in raw:
-        p, w = sp.snap(r), c[r.qid]
+        p, w = sp.check(sp.base.snap(r)), c[r.qid]
         if (p.status, p.contig, p.start, p.end, p.strand, p.snap, p.snap_shift) != \
                 (w.status, w.contig, w.start, w.end, w.strand, w.snap, w.snap_shift):
             bad.append((r.qid, p, w))

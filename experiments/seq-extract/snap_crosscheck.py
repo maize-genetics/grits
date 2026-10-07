@@ -18,7 +18,7 @@ from python.seq_extract.snap import SnapProvider
 def ends(pr):
     if not is_usable(pr.status):
         return None
-    return (pr.start, pr.end - 1) if pr.strand == "+" else (pr.end - 1, pr.start)
+    return (pr.start, pr.end) if pr.strand == "+" else (pr.end, pr.start)   # forward fencepost of each ref end
 
 
 def main():
@@ -32,10 +32,11 @@ def main():
     ap.add_argument("--out", help="per-end comparison TSV")
     ap.add_argument("--max-span-excess", type=int, default=0, help="apply the span check after snapping (0 = off)")
     ap.add_argument("--max-span-ratio", type=float, default=3.0)
+    ap.add_argument("--snap-version", default="v4", choices=["v3", "v4"])
     a = ap.parse_args()
 
     asm = AssemblySet.from_dir(a.fasta_dir, a.pattern, fai_dir=a.fai_dir, build_missing=True)
-    sp = SnapProvider(None, asm, asm)
+    sp = SnapProvider(None, asm, asm, snap_version=a.snap_version)
     span = SpanCheckProvider(None, a.max_span_excess, a.max_span_ratio)
     raw = read_projection_table(a.nosnap)
     csnap = {r.qid: r for r in read_projection_table(a.snap)}

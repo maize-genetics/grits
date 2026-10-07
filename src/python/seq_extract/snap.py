@@ -1,7 +1,10 @@
 """End snapping: refine projected interval ends by aligning the reference flank to the founder.
 
-A line-for-line port of ropebwt3 `extract --lift` snapping (snap.c + q_snap_end/snap_walk in
-extract.c, commit a4df980), so that results are base-identical:
+A line-for-line port of ropebwt3 `extract --lift` snapping, so that results are base-identical.
+snap_version="v4" (default) follows extract.c at 509b2bf (snap_boundary / snap_side / snap_walk): each
+end is a reference boundary x, projected through base x-1, and placed from the flanks on both sides of x,
+so pieces [a,x) and [x,b) always meet. snap_version="v3" keeps the a4df980 behaviour (each end snapped
+with its own inner flank, projected through its own base). Common to both:
 
   * affine-gap DP (match +1, mismatch -4, gap open 6 + 1 per base), global on the flank (query),
     free at both ends of the founder window (target); N (or any non-ACGT) never matches;
@@ -32,6 +35,9 @@ SEED_RATIO = 8
 
 LABEL_PROJ, LABEL_SNAP, LABEL_WIDE, LABEL_AMBIG = "proj", "snap", "snap_wide", "proj_ambiguous"
 LABEL_LOWID, LABEL_SHORT, LABEL_IDENTITY, LABEL_WALK = "proj_lowid", "proj_short", "identity", "snap_walk"
+LABEL_X_SNAP, LABEL_X_WIDE, LABEL_X_WALK = "snap_x", "snap_x_wide", "snap_x_walk"
+SNAPPED_LABELS = frozenset((LABEL_SNAP, LABEL_WIDE, LABEL_WALK, LABEL_X_SNAP, LABEL_X_WIDE, LABEL_X_WALK))
+_CROSS = {LABEL_SNAP: LABEL_X_SNAP, LABEL_WIDE: LABEL_X_WIDE}
 
 _NT6 = np.full(256, 5, np.uint8)
 for _c, _v in zip(b"ACGTacgt", (1, 2, 3, 4, 1, 2, 3, 4)):
@@ -271,7 +277,11 @@ class SnapProvider:
     """
 
     def __init__(self, base, ref, assemblies, ref_assembly: str = "B73", flank: int = 64, radius: int = 200,
-                 radius2: int = 6000, min_id: float = 0.85, margin: int = 5, opt: SnapOpt | None = None):
+                 radius2: int = 6000, min_id: float = 0.85, margin: int = 5, opt: SnapOpt | None = None,
+                 snap_version: str = "v4"):
+        if snap_version not in ("v3", "v4"):
+            raise ValueError("snap_version must be 'v3' or 'v4'")
+        self.snap_version = snap_version
         o = opt or SnapOpt()
         self.opt = replace(o, min_id=min_id, margin=margin)
         if flank < self.opt.min_aligned or radius < 0 or radius2 < 0:
@@ -379,6 +389,9 @@ class SnapProvider:
         return label, 0, cp
 
     def snap(self, pr: Projection) -> Projection:
+        return self._snap_v4(pr) if self.snap_version == "v4" else self._snap_v3(pr)
+
+    def _snap_v3(self, pr: Projection) -> Projection:
         chrom = bare_chrom(pr.ref_chrom, self.ref_assembly)
         if pr.assembly == self.ref_assembly:
             return replace(pr, snap=(LABEL_IDENTITY, LABEL_IDENTITY), snap_shift=(0, 0))
@@ -407,6 +420,152 @@ class SnapProvider:
         elif pr.status == OK_CLAMPED and labels[clamped_end] not in (LABEL_SNAP, LABEL_WIDE, LABEL_WALK):
             status = OK_CLAMPED
         return replace(pr, start=st, end=en, status=status, **extra)
+
+
+    # v4: one shared computation per reference boundary ------------------------------------------
+    def _walk4(self, x, left, sign, contig, L, ref_contig, Lr, p):
+        F, r1, r2, o = self.F, self.r1, self.r2, self.opt
+        tmax, t = 0, F
+        while t <= r2 and (x - t - F >= 0 if left else x + t + F <= Lr):
+            tmax, t = t, t << 1
+        if tmax == 0:
+            return ST_LOWID, -1
+        ra, rb = (x - tmax - F, x) if left else (x, x + tmax + F)
+        rs = self._ref(ref_contig, ra, rb)
+        status, y, t = ST_LOWID, -1, F
+        while t <= tmax:
+            a = x - t - F if left else x + t
+            qf = rs[a - ra:a - ra + F]
+            if not left:
+                status, res, wlo = self._window(contig, L, sign, p - r2, p + t + F + r2, qf, o)
+            else:
+                status, res, wlo = self._window(contig, L, sign, p - t - F - r2, p + r2 + 1, qf, o)
+            if status == ST_OK:
+                y = wlo + (res.t_last if left else res.t_first)
+                break
+            if status == ST_AMBIG:
+                break
+            t <<= 1
+        if y < 0:
+            return status, -1
+        so = replace(o, min_frac=0.0, min_aligned=F // 2, clip5=o.gap_open + o.gap_ext)
+        a = x - t - F if left else x
+        n = t + F
+        qs = rs[a - ra:a - ra + n]
+        if left:
+            qs = qs[::-1]
+        if not left:
+            wlo2, whi2 = y - t - r1, y + F + r1
+        else:
+            wlo2, whi2 = y - F - r1, y + t + r1 + 1
+        status, res, wlo = self._window(contig, L, sign, wlo2, whi2, np.ascontiguousarray(qs), so, left)
+        if status == ST_OK:
+            return status, (wlo + res.t_first if not left else wlo + res.t_last)
+        return status, -1
+
+    def _side(self, x, left, sign, contig, L, ref_contig, Lr, p, walk):
+        """snap_side: returns (label, u, edge)."""
+        F, o = self.F, self.opt
+        a = max(x - F, 0) if left else x
+        b = x if left else min(x + F, Lr)
+        nq = b - a
+        if nq < o.min_aligned:
+            return LABEL_SHORT, -1, False
+        p = min(max(p, 0), L - 1)
+        if walk:
+            lab, u = LABEL_LOWID, -1
+            if self.r2 > 0:
+                st, u = self._walk4(x, left, sign, contig, L, ref_contig, Lr, p)
+                if st == ST_OK:
+                    lab = LABEL_WALK
+                elif st == ST_AMBIG:
+                    lab = LABEL_AMBIG
+            return lab, u, False
+        fl = self._ref(ref_contig, a, b)
+        lab = LABEL_SHORT
+        for k, rad in enumerate((self.r1, self.r2)):
+            if k == 1 and self.r2 <= self.r1:
+                break
+            st, res, wlo = self._window(contig, L, sign, p - rad - F, p + rad + F + 1, fl, o)
+            if st == ST_OK:
+                u = wlo + (res.t_last if left else res.t_first)
+                edge = res.q_last == nq - 1 if left else res.q_first == 0
+                return (LABEL_SNAP if k == 0 else LABEL_WIDE), u, edge
+            lab = {ST_AMBIG: LABEL_AMBIG, ST_LOWID: LABEL_LOWID}.get(st, LABEL_SHORT)
+            if st != ST_LOWID:
+                break
+        return lab, -1, False
+
+    def snap_boundary(self, x: int, is_start: bool, sign: int, contig: str, L: int, ref_contig: str, Lr: int,
+                      u_raw: int):
+        """Oriented founder fencepost of reference boundary x. Returns (label, U)."""
+        def cross(lab):
+            return _CROSS.get(lab, LABEL_X_WALK)
+        U, uL, uR = u_raw, -1, -1
+        labL = labR = LABEL_SHORT
+        eL = eR = False
+        if x > 0:
+            labL, uL, eL = self._side(x, True, sign, contig, L, ref_contig, Lr, u_raw - 1, False)
+        if is_start or uL < 0:
+            labR, uR, eR = self._side(x, False, sign, contig, L, ref_contig, Lr, u_raw, False)
+        if uL >= 0:
+            if is_start and uR >= 0 and eL and eR and uR >= uL + 1:
+                U, lab = uR, labR
+            else:
+                U, lab = uL + 1, (cross(labL) if is_start else labL)
+        elif uR >= 0:
+            U, lab = uR, (labR if is_start else cross(labR))
+        else:
+            lab = labR if labL == LABEL_SHORT else labL
+            if labL == LABEL_LOWID:
+                labL, uL, eL = self._side(x, True, sign, contig, L, ref_contig, Lr, u_raw - 1, True)
+                if uL >= 0:
+                    U, lab = uL + 1, (cross(labL) if is_start else labL)
+            if uL < 0 and labR == LABEL_LOWID:
+                labR, uR, eR = self._side(x, False, sign, contig, L, ref_contig, Lr, u_raw, True)
+                if uR >= 0:
+                    U, lab = uR, (labR if is_start else cross(labR))
+            if uL < 0 and uR < 0:
+                lab = labR if labL == LABEL_SHORT else labL
+        return lab, U
+
+    def _snap_v4(self, pr: Projection) -> Projection:
+        chrom = bare_chrom(pr.ref_chrom, self.ref_assembly)
+        if pr.assembly == self.ref_assembly:
+            return replace(pr, snap=(LABEL_IDENTITY, LABEL_IDENTITY), snap_shift=(0, 0))
+        if not is_usable(pr.status):
+            return pr
+        contig, L = pr.contig, self.assemblies.length(pr.contig)
+        ref_contig = f"{self.ref_assembly}_{chrom}"
+        Lr = self.ref.length(ref_contig)
+        sign = 1 if pr.strand == "+" else -1
+        # unsnapped projection = the raw fenceposts (C --no-snap: st = U0, en = U1 on '+'; L-U1, L-U0 on '-')
+        uraw = [pr.start, pr.end] if sign > 0 else [L - pr.end, L - pr.start]
+        maybe_clamped = [False, False]
+        if pr.status == OK_CLAMPED:      # a clamped raw fencepost sits on 0 or L; its true value is lost
+            maybe_clamped = [uraw[0] in (0, L), uraw[1] in (0, L)]
+        x = (pr.ref_start, pr.ref_end)
+        labels, U, shifts = [None, None], [0, 0], [0, 0]
+        for i in (0, 1):
+            labels[i], U[i] = self.snap_boundary(x[i], i == 0, sign, contig, L, ref_contig, Lr, uraw[i])
+            shifts[i] = U[i] - uraw[i] if sign > 0 else uraw[i] - U[i]
+        st, en = (U[0], U[1]) if sign > 0 else (L - U[1], L - U[0])
+        extra = dict(snap=tuple(labels), snap_shift=tuple(shifts))
+
+        def fail(msg):
+            return replace(pr, contig=None, start=None, end=None, status=f"projection_failed: {msg}", **extra)
+        if en == st:
+            return fail("interval deleted in the founder (empty projection)")
+        if en < st:
+            return fail("projected end precedes projected start")
+        clamped = any(maybe_clamped[i] and labels[i] not in SNAPPED_LABELS for i in (0, 1))
+        if st < 0:
+            st, clamped = 0, True
+        if st >= L:
+            return fail("projected start is past the contig end")
+        if en > L:
+            en, clamped = L, True
+        return replace(pr, start=st, end=en, status=OK_CLAMPED if clamped else OK, **extra)
 
     def project(self, ref_chrom, ref_start, ref_end, assembly) -> Projection:
         return self.snap(self.base.project(ref_chrom, ref_start, ref_end, assembly))
