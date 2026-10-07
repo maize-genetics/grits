@@ -11,7 +11,7 @@ import collections
 import time
 
 from python.seq_extract.assembly import AssemblySet
-from python.seq_extract.projection import SpanCheckProvider, is_usable, read_projection_table
+from python.seq_extract.projection import SpanCheckProvider, is_usable, read_projection_table, write_projection_table
 from python.seq_extract.snap import SnapProvider
 
 
@@ -32,7 +32,8 @@ def main():
     ap.add_argument("--out", help="per-end comparison TSV")
     ap.add_argument("--max-span-excess", type=int, default=0, help="apply the span check after snapping (0 = off)")
     ap.add_argument("--max-span-ratio", type=float, default=3.0)
-    ap.add_argument("--snap-version", default="v4", choices=["v3", "v4"])
+    ap.add_argument("--write-py", help="write the Python-snapped table here")
+    ap.add_argument("--snap-version", default="v5", choices=["v3", "v4", "v5"])
     a = ap.parse_args()
 
     asm = AssemblySet.from_dir(a.fasta_dir, a.pattern, fai_dir=a.fai_dir, build_missing=True)
@@ -59,6 +60,8 @@ def main():
     print(f"python snap: {n_ends} ends in {t_tot:.2f}s = {1e3 * t_tot / max(n_ends, 1):.2f} ms/end "
           f"(non-identity rows with a usable raw projection)")
 
+    if a.write_py:
+        write_projection_table(a.write_py, [mine[r.qid] for r in raw])
     cnt = collections.Counter()
     labels_c, labels_p = collections.Counter(), collections.Counter()
     out = open(a.out, "w") if a.out else None
@@ -69,14 +72,15 @@ def main():
         if not is_usable(r.status):
             cnt["raw_failed_rows"] += 1
             cnt["raw_failed_rows_c_snap_" + ("usable" if is_usable(c.status) else "failed")] += 1
-            continue
+            if r.raw_start is None or r.raw_end is None:
+                continue
         cnt["rows"] += 1
         same_status = (c.status == p.status) or (c.status.split(":")[0] == p.status.split(":")[0]
                                                   and c.status == p.status)
         cnt["status_match" if same_status else "status_mismatch"] += 1
         if not same_status:
             print(f"STATUS {r.qid}: C={c.status!r} py={p.status!r}")
-        ce, pe, re_ = ends(c), ends(p), ends(r)
+        ce, pe, re_ = ends(c), ends(p), (ends(r) or (None, None))
         for i in (0, 1):
             cl, pl = (c.snap or ("?", "?"))[i], (p.snap or ("?", "?"))[i]
             cs, ps = (c.snap_shift or (None, None))[i], (p.snap_shift or (None, None))[i]
@@ -101,7 +105,7 @@ def main():
     for r in raw:
         c, p = csnap[r.qid], mine[r.qid]
         key = lambda x: (x.status, x.contig, x.start, x.end, x.strand if x.ok else None, x.snap, x.snap_shift)
-        if not is_usable(r.status):   # no raw coordinates: only the status is comparable
+        if not is_usable(r.status) and (r.raw_start is None or r.raw_end is None):   # nothing to snap
             if c.status == p.status:
                 rf_same += 1
             else:

@@ -8,8 +8,9 @@ reference-assembly prefix stripped.
 
 Projection table TSV (shared with `ropebwt3 extract --project-only`), header required:
     qid  ref_contig  ref_start  ref_end  assembly  contig  start  end  strand  status
-optionally followed by `method  snap  snap_shift` (ropebwt3 a4df980+: start/end projector, start,end snap
-labels, start,end shifts in bp); further columns are ignored.
+optionally followed by `method  snap  snap_shift  raw_start  raw_end` (ropebwt3: start/end projector,
+start,end snap labels, start,end shifts in bp; v5+: each end's unsnapped projection CONTIG:POS:STRAND, POS a
+forward fencepost, or '.'); further columns are ignored.
 status "ok" means [start, end) on `contig`/`strand` is the projection. "ok_clamped" (ropebwt3: the projected
 end ran past the contig end and was clamped to it) is usable as well, but flagged (Projection.clamped):
 the interval is real founder sequence, it just stops at the contig end, so the stitched haplotype may lack
@@ -29,7 +30,7 @@ import numpy as np
 OK = "ok"
 OK_CLAMPED = "ok_clamped"
 USABLE_STATUSES = frozenset((OK, OK_CLAMPED))
-EXTRA_COLUMNS = ["method", "snap", "snap_shift"]
+EXTRA_COLUMNS = ["method", "snap", "snap_shift", "raw_start", "raw_end"]
 TABLE_COLUMNS = ["qid", "ref_contig", "ref_start", "ref_end", "assembly", "contig", "start", "end", "strand",
                  "status"]
 QUERY_COLUMNS = TABLE_COLUMNS[:5]
@@ -50,6 +51,8 @@ class Projection:
     method: str | None = None
     snap: tuple[str, str] | None = None
     snap_shift: tuple[int, int] | None = None
+    raw_start: tuple[str, int, str] | None = None   # (contig, forward fencepost, strand) of ref_start, unsnapped
+    raw_end: tuple[str, int, str] | None = None
 
     @property
     def ok(self) -> bool:
@@ -196,6 +199,19 @@ def _pair(x, conv):
     return conv(p[0]), conv(p[1])
 
 
+def _raw(x):
+    if x in (None, "", "."):
+        return None
+    contig, pos, strand = x.rsplit(":", 2)
+    if strand not in ("+", "-"):
+        raise ValueError(f"bad raw projection {x!r}")
+    return contig, int(pos), strand
+
+
+def _fmt_raw(r):
+    return "." if r is None else f"{r[0]}:{r[1]}:{r[2]}"
+
+
 def read_projection_table(path) -> list[Projection]:
     rows = []
     with open(path, newline="") as f:
@@ -219,7 +235,7 @@ def read_projection_table(path) -> list[Projection]:
                 pr = Projection(rc, int(rs), int(re_), asm, None if contig in (".", "") else contig,
                                 _int_or_none(s), _int_or_none(e), strand if strand in ("+", "-") else "+",
                                 status, qid, None if col("method") in (None, "", ".") else col("method"), _pair(col("snap"), str),
-                                _pair(col("snap_shift"), int))
+                                _pair(col("snap_shift"), int), _raw(col("raw_start")), _raw(col("raw_end")))
             except ValueError as ex:
                 raise ValueError(f"{path}: line {ln}: {ex}") from None
             if pr.ok:
@@ -240,7 +256,8 @@ def write_projection_table(path, rows: Iterable[Projection], ref_assembly: str =
                 r.ref_end, r.assembly, r.contig or ".", "." if r.start is None else r.start,
                 "." if r.end is None else r.end, r.strand if r.ok else ".", r.status, r.method or ".",
                 ",".join(r.snap) if r.snap else ".",
-                ",".join(map(str, r.snap_shift)) if r.snap_shift else "."))) + "\n")
+                ",".join(map(str, r.snap_shift)) if r.snap_shift else ".", _fmt_raw(r.raw_start),
+                _fmt_raw(r.raw_end)))) + "\n")
 
 
 def write_projection_queries(path, queries: Iterable[ProjectionQuery], ref_assembly: str = "B73"):

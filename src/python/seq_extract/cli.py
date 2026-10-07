@@ -236,8 +236,8 @@ def build_parser():
     p.add_argument("--snap-radius2", type=int, default=6000, help="0 = no wide retry / walk")
     p.add_argument("--snap-min-id", type=float, default=0.85)
     p.add_argument("--snap-margin", type=int, default=5)
-    p.add_argument("--snap-version", choices=["v4", "v3"], default="v4",
-                   help="v4 = ropebwt3 509b2bf shared boundary computation; v3 = a4df980 per-end snap")
+    p.add_argument("--snap-version", choices=["v5", "v4", "v3"], default="v5",
+                   help="v5 = ropebwt3 877bace (joint two-flank step, raw columns); v4 = 509b2bf; v3 = a4df980")
     p.add_argument("--max-span-excess", type=int, default=50000,
                    help="fail a projection > this many bp longer than its reference interval ... [50000; 0 = off]")
     p.add_argument("--max-span-ratio", type=float, default=3.0,

@@ -1,7 +1,10 @@
 """End snapping: refine projected interval ends by aligning the reference flank to the founder.
 
 A line-for-line port of ropebwt3 `extract --lift` snapping, so that results are base-identical.
-snap_version="v4" (default) follows extract.c at 509b2bf (snap_boundary / snap_side / snap_walk): each
+snap_version="v5" (default) follows ropebwt3 877bace: v4 plus a step 0 that aligns both flanks of x as one
+query [x-F, x+F) (snap_joint) and settles deletions at x from it; it also reads the raw per-end
+projections (raw_start / raw_end table columns), so rows whose raw projection failed are still snapped.
+snap_version="v4" follows extract.c at 509b2bf (snap_boundary / snap_side / snap_walk): each
 end is a reference boundary x, projected through base x-1, and placed from the flanks on both sides of x,
 so pieces [a,x) and [x,b) always meet. snap_version="v3" keeps the a4df980 behaviour (each end snapped
 with its own inner flank, projected through its own base). Common to both:
@@ -69,6 +72,7 @@ class SnapOpt:
     excl: int = 8
     clip5: int = -1
     no_seed: bool = False
+    split: int = -1
 
 
 @dataclass
@@ -80,6 +84,10 @@ class SnapRes:
     t_first: int = -1
     q_last: int = -1
     t_last: int = -1
+    t_left: int = -1
+    t_right: int = -1
+    q_left: int = -1
+    q_right: int = -1
     n_aligned: int = 0
     n_match: int = 0
     n_core: int = 0
@@ -156,6 +164,11 @@ def _dp(q: np.ndarray, t: np.ndarray, o: SnapOpt) -> SnapRes:
         b = int(dirm[i, j])
         if state == 0:
             src = b & 3
+            if src == 0 and o.split >= 0:
+                if i - 1 >= o.split:
+                    r.t_right, r.q_right = j - 1, i - 1
+                elif r.t_left < 0:
+                    r.t_left, r.q_left = j - 1, i - 1
             if src == 0:
                 col.append("=" if (q[i - 1] == t[j - 1] and 1 <= q[i - 1] <= 4) else "X")
                 if not last_set:
@@ -254,7 +267,7 @@ def snap_align(q: np.ndarray, t: np.ndarray, o: SnapOpt = SnapOpt()) -> SnapRes:
         parts.append(t[s0:e0])
         c += e0 - s0
     r = _dp(q, np.concatenate(parts), o)
-    for name, off in (("t_first", 0), ("t_last", 0), ("t_end", 1)):
+    for name, off in (("t_first", 0), ("t_last", 0), ("t_end", 1), ("t_left", 0), ("t_right", 0)):
         x = getattr(r, name)
         if x < 0:
             continue
@@ -278,9 +291,9 @@ class SnapProvider:
 
     def __init__(self, base, ref, assemblies, ref_assembly: str = "B73", flank: int = 64, radius: int = 200,
                  radius2: int = 6000, min_id: float = 0.85, margin: int = 5, opt: SnapOpt | None = None,
-                 snap_version: str = "v4"):
-        if snap_version not in ("v3", "v4"):
-            raise ValueError("snap_version must be 'v3' or 'v4'")
+                 snap_version: str = "v5"):
+        if snap_version not in ("v3", "v4", "v5"):
+            raise ValueError("snap_version must be 'v3', 'v4' or 'v5'")
         self.snap_version = snap_version
         o = opt or SnapOpt()
         self.opt = replace(o, min_id=min_id, margin=margin)
@@ -389,7 +402,7 @@ class SnapProvider:
         return label, 0, cp
 
     def snap(self, pr: Projection) -> Projection:
-        return self._snap_v4(pr) if self.snap_version == "v4" else self._snap_v3(pr)
+        return self._snap_v3(pr) if self.snap_version == "v3" else self._snap_v4(pr)
 
     def _snap_v3(self, pr: Projection) -> Projection:
         chrom = bare_chrom(pr.ref_chrom, self.ref_assembly)
@@ -496,11 +509,45 @@ class SnapProvider:
                 break
         return lab, -1, False
 
+    def _joint(self, x, sign, contig, L, ref_contig, Lr, p):
+        """snap_joint: returns (ok, tl, tr, both, label)."""
+        F, o = self.F, self.opt
+        a, b = max(x - F, 0), min(x + F, Lr)
+        nq = b - a
+        if nq < o.min_aligned:
+            return False, -1, -1, False, LABEL_SHORT
+        fl = self._ref(ref_contig, a, b)
+        so = replace(o, split=x - a)
+        p = min(max(p, 0), L - 1)
+        lab = LABEL_SHORT
+        for k, rad in enumerate((self.r1, self.r2)):
+            if k == 1 and self.r2 <= self.r1:
+                break
+            st, res, wlo = self._window(contig, L, sign, p - rad - F, p + rad + F + 1, fl, so)
+            if st == ST_OK and (res.t_left >= 0 or res.t_right >= 0):
+                tl = wlo + res.t_left if res.t_left >= 0 else -1
+                tr = wlo + res.t_right if res.t_right >= 0 else -1
+                both = res.q_left == so.split - 1 and res.q_right == so.split
+                return True, tl, tr, both, (LABEL_SNAP if k == 0 else LABEL_WIDE)
+            lab = {ST_AMBIG: LABEL_AMBIG, ST_LOWID: LABEL_LOWID}.get(st, LABEL_SHORT)
+            if st != ST_LOWID:
+                break
+        return False, -1, -1, False, lab
+
     def snap_boundary(self, x: int, is_start: bool, sign: int, contig: str, L: int, ref_contig: str, Lr: int,
-                      u_raw: int):
+                      u_raw: int, joint: bool | None = None):
         """Oriented founder fencepost of reference boundary x. Returns (label, U)."""
         def cross(lab):
             return _CROSS.get(lab, LABEL_X_WALK)
+        if joint is None:
+            joint = self.snap_version == "v5"
+        if joint:
+            ok, tl, tr, both, jl = self._joint(x, sign, contig, L, ref_contig, Lr, u_raw)
+            if ok and not both:
+                U = tl + 1 if tl >= 0 else tr
+                if (is_start and tl >= 0) or (not is_start and tl < 0):
+                    return cross(jl), U
+                return jl, U
         U, uL, uR = u_raw, -1, -1
         labL = labR = LABEL_SHORT
         eL = eR = False
@@ -533,17 +580,27 @@ class SnapProvider:
         chrom = bare_chrom(pr.ref_chrom, self.ref_assembly)
         if pr.assembly == self.ref_assembly:
             return replace(pr, snap=(LABEL_IDENTITY, LABEL_IDENTITY), snap_shift=(0, 0))
-        if not is_usable(pr.status):
-            return pr
-        contig, L = pr.contig, self.assemblies.length(pr.contig)
         ref_contig = f"{self.ref_assembly}_{chrom}"
-        Lr = self.ref.length(ref_contig)
-        sign = 1 if pr.strand == "+" else -1
-        # unsnapped projection = the raw fenceposts (C --no-snap: st = U0, en = U1 on '+'; L-U1, L-U0 on '-')
-        uraw = [pr.start, pr.end] if sign > 0 else [L - pr.end, L - pr.start]
         maybe_clamped = [False, False]
-        if pr.status == OK_CLAMPED:      # a clamped raw fencepost sits on 0 or L; its true value is lost
-            maybe_clamped = [uraw[0] in (0, L), uraw[1] in (0, L)]
+        rs, re_ = pr.raw_start, pr.raw_end
+        if self.snap_version == "v5" and rs is not None and re_ is not None:
+            # per-end raw fenceposts (ropebwt3 v5 raw_start/raw_end): exact, unclamped, also on failed rows
+            if rs[0] != re_[0] or rs[2] != re_[2]:
+                return pr                 # C fails these before snapping (different contigs / orientations)
+            contig, sign = rs[0], 1 if rs[2] == "+" else -1
+            L = self.assemblies.length(contig)
+            uraw = [rs[1], re_[1]] if sign > 0 else [L - rs[1], L - re_[1]]
+            pr = replace(pr, contig=contig, strand=rs[2])
+        else:
+            if not is_usable(pr.status):
+                return pr
+            contig, L = pr.contig, self.assemblies.length(pr.contig)
+            sign = 1 if pr.strand == "+" else -1
+            # unsnapped projection = the raw fenceposts (C --no-snap: st = U0, en = U1 on '+'; L-U1, L-U0 on '-')
+            uraw = [pr.start, pr.end] if sign > 0 else [L - pr.end, L - pr.start]
+            if pr.status == OK_CLAMPED:      # a clamped raw fencepost sits on 0 or L; its true value is lost
+                maybe_clamped = [uraw[0] in (0, L), uraw[1] in (0, L)]
+        Lr = self.ref.length(ref_contig)
         x = (pr.ref_start, pr.ref_end)
         labels, U, shifts = [None, None], [0, 0], [0, 0]
         for i in (0, 1):

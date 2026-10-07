@@ -130,7 +130,7 @@ def test_table_provider_roundtrip(tmp_path):
             Projection("chr2", 0, 10, "Mo17", None, None, None, "+", "deleted", "c")]
     p = tmp_path / "t.tsv"
     write_projection_table(p, rows)
-    assert p.read_text().startswith(HEADER.rstrip("\n") + "\tmethod\tsnap\tsnap_shift\n")
+    assert p.read_text().startswith(HEADER.rstrip("\n") + "\tmethod\tsnap\tsnap_shift\traw_start\traw_end\n")
     assert "B73_chr1" in p.read_text()
     back = read_projection_table(p)
     assert back == [Projection("B73_chr1", 0, 10, "Oh43", "Oh43_chr1", 5, 16, "+", "ok", "a"),
@@ -214,3 +214,18 @@ def test_table_ok_clamped_requires_coordinates(tmp_path):
     p.write_text(HEADER + "q\tchr1\t0\t5\tA\t.\t.\t.\t.\tok_clamped\n")
     with pytest.raises(ValueError, match="missing"):
         read_projection_table(p)
+
+
+def test_table_raw_columns(tmp_path):
+    p = tmp_path / "t.tsv"
+    p.write_text(HEADER.rstrip("\n") + "\tmethod\tsnap\tsnap_shift\traw_start\traw_end\n"
+                 "p0\tB73_chr1\t0\t50\tOh43\tOh43_chr1\t3\t60\t+\tok\tlocal,local\tproj,proj\t0,0\t"
+                 "Oh43_chr1:3:+\tOh43_chr1:60:+\n"
+                 "p1\tB73_chr1\t50\t90\tOh43\t.\t.\t.\t.\tprojection_failed: x\tlocal,none\tproj,proj\t0,0\t"
+                 "Oh43_scaf:1:2:-5:-\t.\n")
+    rows = read_projection_table(p)
+    assert rows[0].raw_start == ("Oh43_chr1", 3, "+") and rows[0].raw_end == ("Oh43_chr1", 60, "+")
+    assert rows[1].raw_start == ("Oh43_scaf:1:2", -5, "-") and rows[1].raw_end is None
+    out = tmp_path / "o.tsv"
+    write_projection_table(out, rows)
+    assert read_projection_table(out) == rows

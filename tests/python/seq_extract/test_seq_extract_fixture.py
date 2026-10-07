@@ -274,10 +274,11 @@ C_TABLES = Path(os.environ.get("SEQ_EXTRACT_SNAP_TABLES",
                                "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_snapcheck"))
 
 
-@pytest.mark.parametrize("version,prefix", [("v3", "fx_"), ("v4", "v4_fx_")])
+@pytest.mark.parametrize("version,prefix", [("v3", "fx_"), ("v4", "v4_fx_"), ("v5", "v5_fx_"), ("v5", "v5_allb_")])
 def test_snap_identical_to_c_on_full_fixture(tmp_path, version, prefix):
     """Python snap over C `--no-snap --project-only` == C `--project-only`, per row (coords, labels, shifts).
-    v3 tables come from ropebwt3 a4df980, v4 tables from 509b2bf (raw run with --max-span-excess=0)."""
+    v3 tables come from ropebwt3 a4df980, v4 from 509b2bf, v5 from 877bace (raw runs with --max-span-excess=0;
+    v5_allb = boundaries inside every >= 2 bp deletion and at every insertion of the fixture, 3 kb pieces)."""
     if not (C_TABLES / f"{prefix}nosnap.tsv").exists() or not (FULL_FIXTURE / "B73.fa").exists():
         pytest.skip("C ropebwt3 --project-only tables for the full fixture not available")
     asm = AssemblySet.from_dir(FULL_FIXTURE, "{asm}.fa", assemblies=["B73", "Oh43", "Mo17", "Ki3", "CML247", "Tx303"],
@@ -291,4 +292,4 @@ def test_snap_identical_to_c_on_full_fixture(tmp_path, version, prefix):
         if (p.status, p.contig, p.start, p.end, p.strand, p.snap, p.snap_shift) != \
                 (w.status, w.contig, w.start, w.end, w.strand, w.snap, w.snap_shift):
             bad.append((r.qid, p, w))
-    assert len(raw) == 500 and bad == []
+    assert len(raw) >= 500 and bad == []

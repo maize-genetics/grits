@@ -22,7 +22,7 @@ def ref_dp(q, t, o):
     NEG = -(1 << 29)
     n, m = len(q), len(t)
     res = dict(score=INT32_MIN, second=INT32_MIN, t_end=-1, q_first=-1, t_first=-1, q_last=-1, t_last=-1,
-               n_aligned=0, n_match=0, identity=0.0)
+               t_left=-1, t_right=-1, q_left=-1, q_right=-1, n_aligned=0, n_match=0, identity=0.0)
     need = max(int(o.min_frac * n), o.min_aligned)
     if n <= 0 or m <= 0 or n < o.min_aligned or m < need:
         return res, ST_SHORT
@@ -70,6 +70,11 @@ def ref_dp(q, t, o):
         b = d[i][j]
         if state == 0:
             src = b & 3
+            if src == 0 and o.split >= 0:
+                if i - 1 >= o.split:
+                    res["t_right"], res["q_right"] = j - 1, i - 1
+                elif res["t_left"] < 0:
+                    res["t_left"], res["q_left"] = j - 1, i - 1
             if src == 0:
                 col.append("=" if (q[i - 1] == t[j - 1] and 1 <= q[i - 1] <= 4) else "X")
                 if not last:
@@ -107,18 +112,20 @@ def ref_dp(q, t, o):
     return res, st
 
 
-FIELDS = ["score", "second", "t_end", "q_first", "t_first", "q_last", "t_last", "n_aligned", "n_match", "identity"]
+FIELDS = ["score", "second", "t_end", "q_first", "t_first", "q_last", "t_last", "t_left", "t_right", "q_left",
+          "q_right", "n_aligned", "n_match", "identity"]
 
 
 def rand6(rng, n, alphabet=(1, 2, 3, 4)):
     return np.array([rng.choice(alphabet) for _ in range(n)], np.uint8)
 
 
+@pytest.mark.parametrize("split", [-1, 0, 5])
 @pytest.mark.parametrize("clip5", [-1, 7])
 @pytest.mark.parametrize("seed", range(6))
-def test_vectorised_dp_equals_scalar_port(seed, clip5):
+def test_vectorised_dp_equals_scalar_port(seed, clip5, split):
     rng = random.Random(seed)
-    o = SnapOpt(clip5=clip5, min_aligned=4)
+    o = SnapOpt(clip5=clip5, min_aligned=4, split=split)
     for _ in range(25):
         alpha = rng.choice([(1, 2), (1, 2, 3, 4), (1, 2, 3, 4, 5)])
         n, m = rng.randint(4, 14), rng.randint(4, 30)
@@ -307,6 +314,8 @@ def test_deleted_end_base_walks_over():
     p, want, _ = run([(2995, "del", 10)], d1=3)
     assert (p.start, p.end) == want and p.snap[1] == "snap"
     p, want, _ = run([(997, "del", 10)], d0=-2)
+    assert (p.start, p.end) == want and p.snap[0] == "snap_x"      # v5 joint step: a deletion at x
+    p, want, _ = run([(997, "del", 10)], d0=-2, snap_version="v4")
     assert (p.start, p.end) == want and p.snap[0] == "snap"
 
 
@@ -434,6 +443,7 @@ def test_snap_through_builder_with_table(tmp_path):
 # --------------------------------------------------------------------------- v4: shared boundary computation
 
 def pieces(edits, m, a=1000, b=3000, strand="+", d=(3, -4, 5, -6), **kw):
+    kw.setdefault("snap_version", "v4")
     """Project [a,m) and [m,b) separately (raw ends offset by d) and return both plus the truth fenceposts."""
     left, wl, _ = run(edits, a, m, d[0], d[1], strand, **kw)
     right, wr, _ = run(edits, m, b, d[2], d[3], strand, **kw)
@@ -472,17 +482,22 @@ def test_v4_insertion_at_boundary_in_neither_piece(strand):
 class StubSides(SnapProvider):
     """snap_boundary with scripted flank placements: sides[(left, walk)] = (label, u, edge)."""
 
-    def __init__(self, sides):
-        super().__init__(None, None, None)
+    def __init__(self, sides, joint=None, version="v4"):
+        super().__init__(None, None, None, snap_version=version)
+        self.joint_res = joint
         self.sides, self.calls = sides, []
 
     def _side(self, x, left, sign, contig, L, ref_contig, Lr, p, walk):
         self.calls.append((left, walk, p))
         return self.sides.get((left, walk), ("proj_short", -1, False))
 
+    def _joint(self, x, sign, contig, L, ref_contig, Lr, p):
+        self.calls.append(("joint", p))
+        return self.joint_res or (False, -1, -1, False, "proj_lowid")
 
-def boundary(sides, is_start, x=500, u_raw=1000):
-    sp = StubSides(sides)
+
+def boundary(sides, is_start, x=500, u_raw=1000, joint=None, version="v4"):
+    sp = StubSides(sides, joint, version)
     lab, U = sp.snap_boundary(x, is_start, 1, "A_chr1", 5000, "B73_chr1", 5000, u_raw)
     return lab, U, sp.calls
 
@@ -612,3 +627,96 @@ def test_v4_short_flanks_near_reference_contig_start():
 def test_snap_version_validation():
     with pytest.raises(ValueError):
         SnapProvider(None, None, None, snap_version="v2")
+
+
+
+# --------------------------------------------------------------------------- v5: joint two-flank step
+
+V1 = {(True, False): ("snap", 900, True), (False, False): ("snap_wide", 910, True)}
+
+
+def test_v5_joint_deletion_at_x_sets_both():
+    j = (True, 899, 905, False, "snap")                      # x-1 or x absent: junction after tl
+    assert boundary(V1, True, joint=j, version="v5")[:2] == ("snap_x", 900)
+    assert boundary(V1, False, joint=j, version="v5")[:2] == ("snap", 900)
+    lab, U, calls = boundary(V1, True, joint=(True, 899, 905, False, "snap_wide"), version="v5")
+    assert (lab, U) == ("snap_x_wide", 900) and calls == [("joint", 1000)]
+    j = (True, -1, 905, False, "snap_wide")                  # no present base before x in the query
+    assert boundary(V1, True, joint=j, version="v5")[:2] == ("snap_wide", 905)
+    assert boundary(V1, False, joint=j, version="v5")[:2] == ("snap_x_wide", 905)
+
+
+def test_v5_joint_falls_through_to_v4():
+    for j in [(True, 899, 900, True, "snap"), (False, -1, -1, False, "proj_ambiguous")]:
+        for is_start in (True, False):
+            v5 = boundary(V1, is_start, joint=j, version="v5")
+            v4 = boundary(V1, is_start)
+            assert v5[:2] == v4[:2] and v5[2][0] == ("joint", 1000) and v5[2][1:] == v4[2]
+
+
+def test_split_reports_both_sides():
+    rng = random.Random(7)
+    q = rand6(rng, 40)
+    t = np.concatenate([rand6(rng, 100), q[:20], q[25:], rand6(rng, 100)])   # q[20:25] deleted
+    r = _dp(q, t, SnapOpt(split=22))
+    assert (r.q_left, r.t_left, r.q_right, r.t_right) == (19, 119, 25, 120)
+    r = _dp(q, t, SnapOpt(split=10))
+    assert (r.q_left, r.t_left, r.q_right, r.t_right) == (9, 109, 10, 110)
+    r = snap_align(q, np.concatenate([rand6(rng, 2000), t, rand6(rng, 2000)]), SnapOpt(split=22))
+    assert (r.q_left, r.t_left, r.q_right, r.t_right) == (19, 2119, 25, 2120)
+
+
+@pytest.mark.parametrize("strand", ["+", "-"])
+def test_v5_deletion_boundary_exact_or_equivalent(strand):
+    rng = random.Random(1 if strand == "+" else 2)
+    n_exact = 0
+    for _ in range(25):
+        ln = rng.randint(2, 60)
+        s = 2000 - rng.randint(1, ln - 1)
+        left, right, wl, wr = pieces([(s, "del", ln)], 2000, strand=strand, snap_version="v5")
+        j = junction(left, right, strand)
+        assert j[0] == j[1]
+        off = (left.end - wl[1]) if strand == "+" else (wl[0] - left.start)
+        n_exact += off == 0
+        d0, d1 = s, s + ln
+        assert off == 0 or (off > 0 and R[d0:d0 + off] == R[d1:d1 + off]) or \
+            (off < 0 and R[d0 + off:d0] == R[d1 + off:d1])
+    assert n_exact >= 15
+
+
+@pytest.mark.parametrize("strand", ["+", "-"])
+def test_v5_insertion_at_boundary_still_exact(strand):
+    ins = "ACGTTTGCA"
+    left, right, wl, wr = pieces([(2000, "ins", ins)], 2000, strand=strand, snap_version="v5")
+    assert (left.start, left.end) == wl and (right.start, right.end) == wr
+
+
+def test_v5_rescues_row_failed_before_snapping_via_raw_columns():
+    fs, mp = derive(R, [(2000, "del", 300)])
+    seqs = Seqs({"B73_chr1": R, "A_chr1": fs})
+    ts, te = truth(mp, 1000, 3000)
+    raw = Projection("chr1", 1000, 3000, "A", status="projection_failed: projected end precedes projected start",
+                     raw_start=("A_chr1", ts + 3, "+"), raw_end=("A_chr1", ts - 40, "+"))
+    p = SnapProvider(Fixed(raw), seqs, seqs).project("chr1", 1000, 3000, "A")
+    assert p.ok and (p.contig, p.start, p.end, p.strand) == ("A_chr1", ts, te, "+")
+    assert p.snap_shift == (-3, te - (ts - 40))
+    assert SnapProvider(Fixed(raw), seqs, seqs, snap_version="v4").project("chr1", 1000, 3000, "A") == raw
+    bad = replace_raw(raw, raw_end=("A_chr2", 10, "+"))
+    assert SnapProvider(Fixed(bad), seqs, seqs).project("chr1", 1000, 3000, "A") == bad
+    bad = replace_raw(raw, raw_end=None)
+    assert SnapProvider(Fixed(bad), seqs, seqs).project("chr1", 1000, 3000, "A") == bad
+
+
+def test_v5_raw_columns_unclamped_minus_strand():
+    fs, mp = derive(R, [])
+    L = len(fs)
+    seqs = Seqs({"B73_chr1": R, "A_chr1": revcomp(fs)})
+    raw = Projection("chr1", 5800, 6000, "A", "A_chr1", 0, 200, "-", "ok_clamped",
+                     raw_start=("A_chr1", L - 5800 + 2, "-"), raw_end=("A_chr1", -3, "-"))
+    p = SnapProvider(Fixed(raw), seqs, seqs).project("chr1", 5800, 6000, "A")
+    assert (p.start, p.end, p.status) == (0, 200, "ok") and p.snap_shift == (-2, 3)
+
+
+def replace_raw(pr, **kw):
+    from dataclasses import replace
+    return replace(pr, **kw)
