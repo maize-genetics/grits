@@ -11,7 +11,7 @@ import collections
 import time
 
 from python.seq_extract.assembly import AssemblySet
-from python.seq_extract.projection import is_usable, read_projection_table
+from python.seq_extract.projection import SpanCheckProvider, is_usable, read_projection_table
 from python.seq_extract.snap import SnapProvider
 
 
@@ -30,10 +30,13 @@ def main():
     ap.add_argument("--fai-dir", required=True)
     ap.add_argument("--truth")
     ap.add_argument("--out", help="per-end comparison TSV")
+    ap.add_argument("--max-span-excess", type=int, default=0, help="apply the span check after snapping (0 = off)")
+    ap.add_argument("--max-span-ratio", type=float, default=3.0)
     a = ap.parse_args()
 
     asm = AssemblySet.from_dir(a.fasta_dir, a.pattern, fai_dir=a.fai_dir, build_missing=True)
     sp = SnapProvider(None, asm, asm)
+    span = SpanCheckProvider(None, a.max_span_excess, a.max_span_ratio)
     raw = read_projection_table(a.nosnap)
     csnap = {r.qid: r for r in read_projection_table(a.snap)}
     truth = {}
@@ -47,7 +50,7 @@ def main():
     mine, n_ends, t_tot = {}, 0, 0.0
     for r in raw:
         t0 = time.perf_counter()
-        mine[r.qid] = sp.snap(r)
+        mine[r.qid] = span.check(sp.snap(r))
         dt = time.perf_counter() - t0
         if is_usable(r.status) and r.assembly != "B73":
             n_ends += 2
@@ -93,6 +96,24 @@ def main():
                       f"C={cc} {cl} {cs} | py={pc} {pl} {ps}")
     if out:
         out.close()
+    rows_same = rows_diff = rf_same = rf_diff = 0
+    for r in raw:
+        c, p = csnap[r.qid], mine[r.qid]
+        key = lambda x: (x.status, x.contig, x.start, x.end, x.strand if x.ok else None, x.snap, x.snap_shift)
+        if not is_usable(r.status):   # no raw coordinates: only the status is comparable
+            if c.status == p.status:
+                rf_same += 1
+            else:
+                rf_diff += 1
+                print(f"RAWFAIL {r.qid}: raw={r.status!r} C={key(c)}")
+            continue
+        if key(c) == key(p):
+            rows_same += 1
+        else:
+            rows_diff += 1
+            print(f"ROW {r.qid}: raw={r.status!r} C={key(c)} py={key(p)}")
+    print(f"whole rows with a usable raw projection (status, coords, labels, shifts): identical {rows_same}, "
+          f"different {rows_diff}; raw-failed rows: same status {rf_same}, different {rf_diff}")
     print("counts:", dict(cnt))
     print("C labels:", dict(labels_c))
     print("py labels:", dict(labels_p))

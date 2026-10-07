@@ -11,7 +11,7 @@ from pathlib import Path
 from .assembly import AssemblySet, fai_path_for
 from .fai import FastaFile, FastaIndexError, RegionError, index_fasta
 from .haplotype import METADATA_COLUMNS, HaplotypeBuilder, metadata_row, read_bed_dir, read_windows
-from .projection import TableProvider, TruthMapProvider, identity_projections, write_projection_queries
+from .projection import SpanCheckProvider, TableProvider, TruthMapProvider, identity_projections, write_projection_queries
 from .snap import SnapProvider
 
 PLACEHOLDER_TAG = "PLACEHOLDER_IDENTITY_PROJECTION_NOT_MEANINGFUL"
@@ -159,6 +159,7 @@ def cmd_haplotypes(a):
             ref = AssemblySet({a.ref_assembly: a.ref_fasta}, fai_dir=a.fai_dir, build_missing=a.build_fai)
         builder.provider = SnapProvider(builder.provider, ref, asm, a.ref_assembly, a.snap_flank, a.snap_radius,
                                         a.snap_radius2, a.snap_min_id, a.snap_margin)
+    builder.provider = SpanCheckProvider(builder.provider, a.max_span_excess, a.max_span_ratio)
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     tag = f" {PLACEHOLDER_TAG}" if placeholder else ""
@@ -235,6 +236,10 @@ def build_parser():
     p.add_argument("--snap-radius2", type=int, default=6000, help="0 = no wide retry / walk")
     p.add_argument("--snap-min-id", type=float, default=0.85)
     p.add_argument("--snap-margin", type=int, default=5)
+    p.add_argument("--max-span-excess", type=int, default=50000,
+                   help="fail a projection > this many bp longer than its reference interval ... [50000; 0 = off]")
+    p.add_argument("--max-span-ratio", type=float, default=3.0,
+                   help="... and more than this many times as long (both must hold) [3.0; 0 = off]")
     p.add_argument("--emit-queries", help="write the projection queries this run needs and exit")
     p.add_argument("--out-dir", help="output directory")
     p.add_argument("--prefix", default="", help="output file prefix")

@@ -20,7 +20,7 @@ A projection *query* TSV (what a projecting tool needs) is the first five column
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Protocol
 
@@ -144,6 +144,43 @@ class TableProvider:
         if r is None:
             return Projection(chrom, int(ref_start), int(ref_end), assembly, status="not_in_table")
         return r
+
+
+DEFAULT_MAX_SPAN_EXCESS = 50000
+DEFAULT_MAX_SPAN_RATIO = 3.0
+
+
+def span_implausible(ref_len: int, prj_len: int, max_excess: int = DEFAULT_MAX_SPAN_EXCESS,
+                     max_ratio: float = DEFAULT_MAX_SPAN_RATIO) -> bool:
+    """ropebwt3 extract's projected-length sanity rule: implausible when the projection is BOTH more than
+    max_excess bp longer than the reference interval AND more than max_ratio times as long. Either
+    parameter 0 turns the check off."""
+    if not max_excess or not max_ratio:
+        return False
+    return prj_len - ref_len > max_excess and prj_len > max_ratio * ref_len
+
+
+class SpanCheckProvider:
+    """Wrap any provider (incl. SnapProvider / TableProvider) and fail usable projections (ok and
+    ok_clamped) whose span is implausibly long, with the same status text as ropebwt3 extract."""
+
+    def __init__(self, base, max_excess: int = DEFAULT_MAX_SPAN_EXCESS,
+                 max_ratio: float = DEFAULT_MAX_SPAN_RATIO):
+        if max_excess < 0 or max_ratio < 0:
+            raise ValueError("max_excess and max_ratio must be >= 0 (0 = off)")
+        self.base, self.max_excess, self.max_ratio = base, max_excess, max_ratio
+
+    def check(self, pr: Projection) -> Projection:
+        if not pr.ok:
+            return pr
+        ref_len, prj_len = pr.ref_end - pr.ref_start, pr.end - pr.start
+        if not span_implausible(ref_len, prj_len, self.max_excess, self.max_ratio):
+            return pr
+        return replace(pr, contig=None, start=None, end=None,
+                       status=f"projection_failed: projected span implausibly long ({prj_len} bp for {ref_len} bp)")
+
+    def project(self, ref_chrom, ref_start, ref_end, assembly) -> Projection:
+        return self.check(self.base.project(ref_chrom, ref_start, ref_end, assembly))
 
 
 def _int_or_none(x):
