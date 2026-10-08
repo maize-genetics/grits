@@ -711,6 +711,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         la = torch.log(a / a[:, :Kf].sum(1, keepdim=True))                     # [B,K]
         la0 = torch.cat([la, torch.zeros_like(la[:, :1])], 1)                   # index K = none
         aw = self.aff_w * torch.ones(la.shape[0], device=la.device)             # [B]
+        if knock.get("affw") is not None:               # decode-time scale of the founder prior
+            aw = aw * float(knock["affw"])
         if getattr(self, "extra_heads", False):
             ood_score = torch.sigmoid(self._heads["ood_logit"].float()).mean(1)  # [B] window score
             if knock.get("ood0"):
@@ -735,16 +737,39 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             emis_p = emis_p.masked_fill((self.pi == Kf) | (self.pj == Kf), -1e4)
         if knock.get("homo"):                         # router says not hybrid: homozygous pairs only
             emis_p = emis_p.masked_fill(self.homo_mask == 0, -1e4)
+        if knock.get("xomult") is not None:             # decode-time switch-rate multiplier
+            lam = lam * float(knock["xomult"])
+        if knock.get("homo") and knock.get("xomulthomo") is not None:   # only on homozygous-routed samples
+            lam = lam * float(knock["xomulthomo"])
+        row_bp = getattr(self, "_row_bp", None)         # [B,T] bp position of each row (decode only)
+        if (knock.get("xoplace") == "dist" or knock.get("xodist") is not None) and row_bp is None:
+            raise ValueError("xoplace=dist / xodist need row bp positions (route=True / row_bin)")
+        if row_bp is not None:
+            dbp = (row_bp[:, 1:] - row_bp[:, :-1]).float().clamp_min(0.0)    # [B,T-1]
         if self.xo_placement:
             w = torch.sigmoid(-c_head.float()[:, 1:])
             w = w / w.sum(1, keepdim=True).clamp_min(1e-12)
+        elif knock.get("xoplace") == "dist":
+            # the window's expected crossover count, placed in proportion to the bp gap
+            w = (dbp + 1.0) / (dbp + 1.0).sum(1, keepdim=True)
         else:
             w = torch.full_like(c_head.float()[:, 1:], 1.0 / (T - 1))
-        p = (lam.unsqueeze(1) * w).clamp(1e-12, 1 - 1e-4)
+        if knock.get("xodist") is not None:
+            # distance hazard, ignoring the xo head: P(switch) = mult * (1 - exp(-d/L)) per gap
+            L = float(knock["xodist"])
+            p = float(knock.get("xomult") or 1.0) * -torch.expm1(-(dbp + 1.0) / L)
+            p = p.clamp(1e-12, 1 - 1e-4)
+        else:
+            p = (lam.unsqueeze(1) * w).clamp(1e-12, 1 - 1e-4)
         p = torch.cat([p[:, :1], p], 1)                                      # c[:,0] unused
         # stay log(1-p) / change log(p/2) + log(a_x/sum a); minus log(1-p) on every
         # transition at t (path-invariant): stay 0, change -(-logit p + log 2)
         c = -torch.log(p) + torch.log1p(-p) + self.c_offset
+        if knock.get("homo") and knock.get("homo1"):
+            # homozygous-only decode: (i,i)->(j,j) has nsw = 2 and enters 2 founders, i.e. one
+            # haplotype change is charged as two crossovers; charge it once
+            c = c / 2.0
+            self._trans_prior = self._trans_prior / 2.0
         return emis_p, g, c
 
     def crf_decode(self, emis_p, c, stay_bonus=None, marginal=False):
@@ -1046,7 +1071,7 @@ def route_real_sample(M, row_bin, informative_max=12):
 def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=256,
                              homo_scale=None, switch_scale=None, route=False,
                              row_bin=None, decode="viterbi", aff_region=0, het_scale=None, het_region=5,
-                             knockout=None):
+                             knockout=None, capture=None):
     """THE single real-data inference recipe for GRITSCRFDiploidIndel --
     every eval script (real-data unit tests, depth sweeps, per-checkpoint
     comparisons) should call this instead of re-deriving the ext_emb /
@@ -1172,6 +1197,15 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
             model._knock["homo"] = not r["hybrid"]
             print(f"  homoroute: hybrid={r['hybrid']} -> "
                   f"{'homozygous pairs only' if model._knock['homo'] else 'all pairs'}", flush=True)
+        elif ko.split("=")[0] in ("xomult", "xodist", "affw", "xomulthomo"):
+            # decode-time switch knobs: xomult=s (switch rate x s), xodist=L (bp hazard
+            # 1-exp(-d/L) per row gap; with xomult as its amplitude), affw=x (founder prior x x)
+            k_, v_ = ko.split("=")
+            model._knock[k_] = float(v_)
+        elif ko == "xoplace_dist":
+            model._knock["xoplace"] = "dist"
+        elif ko == "homo1":
+            model._knock["homo1"] = True
         elif ko == "xoconst":
             xs = []
             with torch.no_grad():
@@ -1193,9 +1227,20 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
             ab = (aff_win[s:s + batch_size].to(device) if aff_win is not None else
                   None if aff_pred is None else aff_pred.unsqueeze(0).expand(xb.shape[0], -1))
             hp = None if het_win is None else het_win[s:s + batch_size].to(device)
+            # row bp positions for the distance-aware decode knobs (xoplace_dist / xodist)
+            model._row_bp = (None if row_bin is None else
+                             torch.tensor(np.asarray(row_bin)[s:s + batch_size] & ((1 << 40) - 1),
+                                          device=device))
             emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs, count=cb, aff_pred=ab, het_pred=hp)
+            model._row_bp = None
             if aff_pred is not None:        # heads model: its own calibrated switch cost
                 pred = model.crf_decode(emis_p, c)
+                if capture is not None:     # diagnostics: the CRF inputs actually decoded
+                    capture.setdefault("emis", []).append(emis_p.half().cpu())
+                    capture.setdefault("c", []).append(c.float().cpu())
+                    capture.setdefault("trans_prior", []).append(model._trans_prior.float().cpu())
+                    capture.setdefault("init_prior", []).append(model._init_prior.float().cpu())
+                    capture.setdefault("pred", []).append(pred.cpu())
             else:
                 dec = _dcrf_marginal if decode == "marginal" else _dcrf_viterbi
                 pred = dec(emis_p, c * switch_scale, model.nsw_pair,

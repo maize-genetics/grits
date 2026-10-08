@@ -82,6 +82,7 @@ def main():
                          "(e.g. scratch/lift_s200_local20k for the -s 200 + adaptive alignment)")
     ap.add_argument("--route", action="store_true",
                     help="pick homo_scale and switch_scale per sample with route_real_sample")
+    ap.add_argument("--only", nargs="+", default=None, help="restrict to these individuals")
     args = ap.parse_args()
 
     import torch
@@ -99,7 +100,7 @@ def main():
         res_dir.mkdir(parents=True, exist_ok=True)
         for r in rows:
             ds, ind = r["dataset_id"], r["individual"]
-            if ds not in SCOPES[scope]:
+            if ds not in SCOPES[scope] or (args.only and ind not in args.only):
                 continue
             t0 = time.time()
             try:
