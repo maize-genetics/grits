@@ -24,6 +24,7 @@ evals() {   # GPU CKPT TAG -- one process per scope (scoring is CPU-bound, ~28 s
     done
     wait; log "$t eval done"
   done
+  bash $WT/experiments/simval-corpus/scripts/report_card.sh $3 $3 ${3}_1x > $J/report_card_$3.log 2>&1 && log "$3 report card done" || log "$3 report card FAILED"
   cd $WT
 }
 run() {     # GPU NAME EXTRA...
