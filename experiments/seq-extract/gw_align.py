@@ -35,11 +35,13 @@ MMI = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/gene_window_e
 IDX_LINES = ["B73", "B97", "CML103", "Il14H", "Oh43"]
 OUT_LINES = ["A188", "CML459", "EP1", "Ia453", "Tx303"]
 ALL_LINES = IDX_LINES + OUT_LINES
+EVENT_COLS = ["ins_events", "del_events", "unaligned_segments", "event_errors"]
 CS_OP = re.compile(r"(:\d+|\*[a-z]{2}|[+\-][a-z]+|~[a-z]{2}\d+[a-z]{2})")
 SCORE_COLS = ["seq_hash", "line", "qlen", "query_N", "status", "contig", "tstart", "tend", "strand", "mapq",
               "n_blocks", "aligned_q", "matches", "mismatches", "ins", "dels", "unaligned", "truth_N", "errors", "rescued",
               "truth_uncalled", "n_noncollinear"] + [f"t{K}_{x}" for K in (50, 20)
-                                   for x in ("anchored", "matches", "errors", "trimmed_bp", "called")]
+                                   for x in ("anchored", "matches", "errors", "trimmed_bp", "called")] + \
+             EVENT_COLS + [f"t{K}_{x}" for K in (50, 20) for x in EVENT_COLS]
 
 
 def split_pair(ind):
@@ -137,16 +139,33 @@ def score_query(qlen, nprefix, blocks, expect=None):
     consecutive exactly matching bases (cs ':' ops, clipped to the claimed query range) in query order;
     errors are counted only inside [L, R) of the query (deletions strictly inside; gaps between blocks
     if both flanking block ends are inside), the non-N query bases outside are t<K>_trimmed_bp.
-    No such run: t<K>_anchored = 0 (unanchored). Internal switch junctions are never trimmed."""
+    No such run: t<K>_anchored = 0 (unanchored). Internal switch junctions are never trimmed.
+
+    Event counts (full and t<K>_): ins_events = cs insertion ops with >= 1 non-N inserted base;
+    del_events = cs deletion ops with >= 1 counted deleted base (an N-for-gap pair that cancels a deletion
+    entirely removes it) plus each inter-block target gap; unaligned_segments = maximal runs of non-N
+    query bases claimed by no block; event_errors = mismatches + ins_events + del_events +
+    unaligned_segments (a 45 bp deletion counts 1, not 45)."""
     r = dict(rescued=0, truth_uncalled=0, n_noncollinear=0, status="unaligned", contig=".", tstart=".", tend=".", strand=".",
              mapq=".", n_blocks=0, aligned_q=0, matches=0, mismatches=0, ins=0, dels=0, unaligned=0, truth_N=0)
     called_all = int(qlen - nprefix[qlen])
+    isN = np.diff(nprefix) > 0
+
+    def runs_called(a, b):
+        """Maximal runs of non-N bases in query [a, b)."""
+        if b <= a:
+            return 0
+        x = ~isN[a:b]
+        return int(x[0]) + int((x[1:] & ~x[:-1]).sum())
     for K in TRIM_KS:
         r.update({f"t{K}_anchored": 0, f"t{K}_matches": 0, f"t{K}_errors": 0, f"t{K}_trimmed_bp": called_all,
                   f"t{K}_called": 0})
+        r.update({f"t{K}_{x}": 0 for x in EVENT_COLS})
     prim = [b for b in blocks if b["tp"] == "P"]
     if not prim:
         r["unaligned"] = called_all
+        segs = runs_called(0, qlen)
+        r.update(ins_events=0, del_events=0, unaligned_segments=segs, event_errors=segs)
         return r
     p = max(prim, key=lambda b: b["AS"])
     if expect is not None and norm_chrom(p["tname"]) != expect:
@@ -200,17 +219,23 @@ def score_query(qlen, nprefix, blocks, expect=None):
             elif c == "+":
                 s = op[1:]
                 nn = 0
+                first = None
                 for k, ch in enumerate(s):
                     qi = q - 1 - k if rev else q + k
                     if inside(parts, qi):
                         if ch != "n":
                             ev.append(("I", qi, 1))
+                            first = qi if first is None else first
                         else:
                             nn += 1
+                if first is not None:
+                    ev.append(("IE", first, 1))
                 q2 = q - len(s) if rev else q + len(s)
                 comp = min(nn, prev_del)
                 if comp:
                     ev.append(("D", q, -comp))
+                    if comp == prev_del:
+                        ev.append(("DE", q, -1))
                 q = q2
                 prev_n, prev_del = nn - comp, 0
             elif c == "-":
@@ -220,6 +245,7 @@ def score_query(qlen, nprefix, blocks, expect=None):
                 comp = min(d, prev_n)
                 if d - comp:
                     ev.append(("D", q, d - comp))
+                    ev.append(("DE", q, 1))
                 prev_n, prev_del = prev_n - comp, d - comp
     chosen.sort(key=lambda x: x[0]["qs"])
     gaps = []
@@ -233,7 +259,7 @@ def score_query(qlen, nprefix, blocks, expect=None):
                 gaps.append((a["qe"], b["qs"], tgap - qgap))
 
     def tally(L, R):
-        m = x = i = d = 0
+        m = x = i = d = ie = de = 0
         for k, a0, n in ev:
             if k == "M":
                 m += max(0, min(n, R) - max(a0, L))
@@ -241,9 +267,22 @@ def score_query(qlen, nprefix, blocks, expect=None):
                 x += L <= a0 < R
             elif k == "I":
                 i += L <= a0 < R
+            elif k == "IE":
+                ie += L <= a0 < R
+            elif k == "DE":
+                de += n if L < a0 < R else 0
             else:
                 d += n if L < a0 < R else 0
         d += sum(n for a0, b0, n in gaps if a0 >= L and b0 <= R)
+        de += sum(1 for a0, b0, n in gaps if a0 >= L and b0 <= R)
+        segs, pos = 0, L                          # unclaimed stretches of [L, R), split at N runs
+        for xx, y in sorted(cl.iv):
+            if y <= L or xx >= R:
+                continue
+            segs += runs_called(pos, max(pos, xx))
+            pos = max(pos, min(y, R))
+        segs += runs_called(pos, R)
+        tally.events = (ie, de, segs, x + ie + de + segs)
         clm = sum(max(0, min(y, R) - max(xx, L)) for xx, y in cl.iv)
         clm_n = sum(int(nprefix[min(y, R)] - nprefix[max(xx, L)]) for xx, y in cl.iv if min(y, R) > max(xx, L))
         span_called = (R - L) - int(nprefix[R] - nprefix[L])
@@ -252,6 +291,7 @@ def score_query(qlen, nprefix, blocks, expect=None):
 
     m, x, i, d, un, _ = tally(0, qlen)
     r.update(matches=m, mismatches=x, ins=i, dels=d, unaligned=un, aligned_q=cl.total(), n_blocks=len(chosen))
+    r.update(zip(EVENT_COLS, tally.events))
     for K in TRIM_KS:
         runs = [(a0, n) for k, a0, n in ev if k == "M" and n - a0 >= K]
         if not runs:
@@ -260,6 +300,7 @@ def score_query(qlen, nprefix, blocks, expect=None):
         m, x, i, d, un, sc = tally(L, R)
         r.update({f"t{K}_anchored": 1, f"t{K}_matches": m, f"t{K}_errors": x + i + d + un,
                   f"t{K}_trimmed_bp": called_all - sc, f"t{K}_called": sc})
+        r.update({f"t{K}_{c}": v for c, v in zip(EVENT_COLS, tally.events)})
     return r
 
 
@@ -283,6 +324,67 @@ def nprefix_of(seq):
     out = np.zeros(len(seq) + 1, dtype=np.int64)
     np.cumsum(np.frombuffer(seq.upper().encode(), dtype=np.uint8) == ord("N"), out=out[1:])
     return out
+
+
+def all_n_row(h, line, qlen, n_n):
+    """Score row of a query that is entirely N (never aligned)."""
+    return dict(zip(SCORE_COLS, [h, line, qlen, n_n, "all_N", ".", ".", ".", ".", "."] + [0] * (len(SCORE_COLS) - 10)))
+
+
+def align_line(line, seqs, expect, out, sfx="", threads=3, preset="asm20", rescore_only=False, keep_query=False):
+    """Align the sequences `seqs` ({seq_hash: seq}, none all-N) to `line` with minimap2 and score each one
+    (score_query, then the off-chromosome rescue pass). expect: {seq_hash: window chromosome}.
+    Writes q_<line><sfx>.fa (deleted unless keep_query), <line><sfx>.paf and <line><sfx>.rescue.paf into
+    `out`. Returns ({seq_hash: score row dict}, info dict)."""
+    out = Path(out)
+    t0 = time.time()
+    hs = sorted(seqs)
+    qfa, paf = out / f"q_{line}{sfx}.fa", out / f"{line}{sfx}.paf"
+    if not rescore_only:
+        with open(qfa, "w") as f:
+            for h in hs:
+                f.write(f">{h}\n{seqs[h]}\n")
+        with open(paf, "w") as fo, open(out / f"{line}{sfx}.mm2.log", "w") as fe:
+            rc = subprocess.run([MM2, "-x", preset, "-c", "--cs", "--secondary=no", "-t", str(threads),
+                                 MMI.format(line=line), str(qfa)], stdout=fo, stderr=fe).returncode
+        if rc:
+            raise RuntimeError(f"minimap2 failed for {line}")
+    t1 = time.time()
+    by = parse_paf(paf)
+    rows = {}
+    for h in hs:
+        sq = seqs[h]
+        rows[h] = score_query(len(sq), nprefix_of(sq), by.get(h, []), expect.get(h))
+    off = sorted(h for h, r in rows.items() if r["status"] == "aligned" and r["contig"] != expect.get(h))
+    n_res = 0
+    if off:
+        rfa, rpaf = out / f"rescue_q_{line}{sfx}.fa", out / f"{line}{sfx}.rescue.paf"
+    if off and not (rescore_only and rpaf.exists()):
+        with open(rfa, "w") as f:
+            for h in off:
+                f.write(f">{h}\n{seqs[h]}\n")
+        with open(rpaf, "w") as fo, open(out / f"{line}{sfx}.rescue.mm2.log", "w") as fe:
+            rc = subprocess.run([MM2, "-x", preset, "-c", "--cs", "-N", "20", "-t", str(threads),
+                                 MMI.format(line=line), str(rfa)], stdout=fo, stderr=fe).returncode
+        if rc:
+            raise RuntimeError(f"minimap2 rescue failed for {line}")
+        rfa.unlink()
+    if off:
+        rby = parse_paf(rpaf)
+        for h in off:
+            sq = seqs[h]
+            r = score_query(len(sq), nprefix_of(sq), rby.get(h, []), expect.get(h))
+            if r["rescued"]:
+                rows[h] = r
+                n_res += 1
+    for h in hs:
+        r = rows[h]
+        r.update(seq_hash=h, line=line, qlen=len(seqs[h]), query_N=int(seqs[h].upper().count("N")))
+        r["errors"] = r["mismatches"] + r["ins"] + r["dels"] + r["unaligned"]
+    if not rescore_only and not keep_query:
+        qfa.unlink()
+    return rows, dict(n=len(hs), mm2_s=round(t1 - t0, 1), score_s=round(time.time() - t1, 1), off=len(off),
+                      rescued=n_res)
 
 
 def main():
@@ -321,66 +423,28 @@ def main():
                     for line in ALL_LINES:
                         need[line].add(r["seq_hash"])
     for line in a.lines:
-        t0 = time.time()
         hs = {h for h in need[line] if qinfo[h][0] > qinfo[h][1]}
         empty = need[line] - hs
         seqs = {}
         for fa in sorted(st.glob("seqs*.fa")):
             seqs.update(read_fasta_subset(fa, hs - set(seqs)))
         sfx = "" if a.set == "all" else f".{a.set}"
-        qfa, paf = out / f"q_{line}{sfx}.fa", out / f"{line}{sfx}.paf"
-        if not a.rescore_only:
-            with open(qfa, "w") as f:
-                for h in sorted(hs):
-                    f.write(f">{h}\n{seqs[h]}\n")
-            with open(paf, "w") as fo, open(out / f"{line}{sfx}.mm2.log", "w") as fe:
-                rc = subprocess.run([MM2, "-x", a.preset, "-c", "--cs", "--secondary=no", "-t", str(a.threads),
-                                     MMI.format(line=line), str(qfa)], stdout=fo, stderr=fe).returncode
-            if rc:
-                sys.exit(f"minimap2 failed for {line}")
-        t1 = time.time()
-        by = parse_paf(paf)
-        rows = {}
-        for h in sorted(hs):
-            sq = seqs[h]
-            rows[h] = score_query(len(sq), nprefix_of(sq), by.get(h, []), expect.get(h))
-        off = sorted(h for h, r in rows.items() if r["status"] == "aligned" and r["contig"] != expect.get(h))
-        n_res = 0
-        if off:
-            rfa, rpaf = out / f"rescue_q_{line}{sfx}.fa", out / f"{line}{sfx}.rescue.paf"
-        if off and not (a.rescore_only and rpaf.exists()):
-            with open(rfa, "w") as f:
-                for h in off:
-                    f.write(f">{h}\n{seqs[h]}\n")
-            with open(rpaf, "w") as fo, open(out / f"{line}{sfx}.rescue.mm2.log", "w") as fe:
-                rc = subprocess.run([MM2, "-x", a.preset, "-c", "--cs", "-N", "20", "-t", str(a.threads),
-                                     MMI.format(line=line), str(rfa)], stdout=fo, stderr=fe).returncode
-            if rc:
-                sys.exit(f"minimap2 rescue failed for {line}")
-            rfa.unlink()
-        if off:
-            rby = parse_paf(rpaf)
-            for h in off:
-                sq = seqs[h]
-                r = score_query(len(sq), nprefix_of(sq), rby.get(h, []), expect.get(h))
-                if r["rescued"]:
-                    rows[h] = r
-                    n_res += 1
+        try:
+            rows, info = align_line(line, seqs, expect, out, sfx, a.threads, a.preset, a.rescore_only)
+        except RuntimeError as ex:
+            sys.exit(str(ex))
         with open(out / f"scores_{line}{sfx}.tsv", "w") as fo:
             fo.write("\t".join(SCORE_COLS) + "\n")
             for h in sorted(hs):
                 r = rows[h]
-                r.update(seq_hash=h, line=line, qlen=len(seqs[h]), query_N=qinfo[h][1])
-                r["errors"] = r["mismatches"] + r["ins"] + r["dels"] + r["unaligned"]
+                r["query_N"] = qinfo[h][1]
                 fo.write("\t".join(str(r[c]) for c in SCORE_COLS) + "\n")
             for h in sorted(empty):
-                fo.write("\t".join(map(str, [h, line, qinfo[h][0], qinfo[h][1], "all_N", ".", ".", ".", ".", ".",
-                                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] + [0] * 10)) + "\n")
-        print(f"{line}: {len(hs)} queries ({len(empty)} all-N), minimap2 {t1 - t0:.0f}s, "
-              f"score+rescue {time.time() - t1:.0f}s; off-chromosome primaries {len(off)}, rescued {n_res}",
-              file=sys.stderr, flush=True)
-        if not a.rescore_only:
-            qfa.unlink()
+                r = all_n_row(h, line, *qinfo[h])
+                fo.write("\t".join(str(r[c]) for c in SCORE_COLS) + "\n")
+        print(f"{line}: {len(hs)} queries ({len(empty)} all-N), minimap2 {info['mm2_s']:.0f}s, "
+              f"score+rescue {info['score_s']:.0f}s; off-chromosome primaries {info['off']}, rescued "
+              f"{info['rescued']}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ Truth per (sample, window, haplotype):
              mosaic breakpoint are excluded
 Panel ceiling per (window, truth line): the founder (of 25) whose whole-window sequence has the fewest
 errors against that line, among founders whose primary hit is on the window's chromosome.
+Event ceiling (ceil_ev_*): the same choice by event errors (gw_align EVENT_COLS: an indel or unaligned
+run counts once); ceil_event_errors / ceil_t<K>_event_errors are the bp-best founder's event errors.
 
 A haplotype window is
   all_N       sequence entirely N (uncalled / projection failed): not scored, counted as uncalled
@@ -23,7 +25,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gw_align import ALL_LINES, norm_chrom, split_pair  # noqa: E402
+from gw_align import ALL_LINES, EVENT_COLS, norm_chrom, split_pair  # noqa: E402
 
 CLASSES = ["IDX-INBRED", "IDX-HYB", "IDX-RIL2", "MIX-HYB", "MIX-RIL2", "OUT-INBRED", "OUT-HYB", "OUT-RIL2"]
 READS = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/read_datasets"
@@ -31,7 +33,8 @@ SNPRC = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/results/eval_suite/
 TRIM_KS = (50, 20)
 TCOLS = ("anchored", "matches", "errors", "trimmed_bp", "called")
 INT = ["qlen", "query_N", "n_blocks", "aligned_q", "matches", "mismatches", "ins", "dels", "unaligned", "truth_N",
-       "errors"] + [f"t{K}_{x}" for K in TRIM_KS for x in TCOLS]
+       "errors"] + [f"t{K}_{x}" for K in TRIM_KS for x in TCOLS] + EVENT_COLS + \
+    [f"t{K}_{x}" for K in TRIM_KS for x in EVENT_COLS]
 
 
 def load_scores(align_dir):
@@ -73,25 +76,19 @@ def in_regions(reg, contig, ts, te):
     return ov >= 0.5 * (te - ts)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--windows", required=True)
-    ap.add_argument("--stitch", required=True)
-    ap.add_argument("--align", required=True)
-    ap.add_argument("--ril-truth", required=True)
-    ap.add_argument("--out", required=True)
-    a = ap.parse_args()
-    out = Path(a.out)
+def score(windows, panel_tsv, model_haps_tsv, sc, ril_truth, out):
+    """Write ceiling.tsv, per_hapwin.tsv and ril_regions_check.tsv into `out` from the window table, the
+    panel stitch table, the model haplotype table and the score lookup sc {(seq_hash, line): row}."""
+    out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    wins = {r["wid"]: r for r in csv.DictReader(open(a.windows), delimiter="\t")}
-    sc = load_scores(a.align)
-    ril = {(r["class"], r["sample"], r["wid"]): r["truth"] for r in csv.DictReader(open(a.ril_truth), delimiter="\t")}
+    wins = {r["wid"]: r for r in csv.DictReader(open(windows), delimiter="\t")}
+    ril = {(r["class"], r["sample"], r["wid"]): r["truth"] for r in csv.DictReader(open(ril_truth), delimiter="\t")}
 
     # ---- panel ceiling
     panel = defaultdict(dict)
-    for r in csv.DictReader(open(Path(a.stitch) / "panel.tsv"), delimiter="\t"):
+    for r in csv.DictReader(open(panel_tsv), delimiter="\t"):
         panel[r["wid"]][r["founder"]] = r
-    ceil, tceil = {}, {}
+    ceil, tceil, ceil_ev = {}, {}, {}
     with open(out / "ceiling.tsv", "w") as fo:
         fo.write("wid\tline\tbest_founder\terrors\tcalled\tmatches\tn_ok_founders\tn_scored_founders\t"
                  "self_in_panel_errors\n")
@@ -99,6 +96,7 @@ def main():
             for line in ALL_LINES:
                 best = None
                 nsc = 0
+                evb = None
                 for f, pr in panel[wid].items():
                     if pr["status"] != "ok":
                         continue
@@ -106,6 +104,9 @@ def main():
                     if state(s, w["chrom"]) != "scored":
                         continue
                     nsc += 1
+                    ek = (s["event_errors"], s["query_N"], -s["matches"])
+                    if evb is None or ek < evb[0]:
+                        evb = (ek, f, s)
                     key = (s["errors"], s["query_N"], -s["matches"])
                     if best is None or key < best[0]:
                         best = (key, f, s)
@@ -129,6 +130,7 @@ def main():
                     selfe = s["errors"] if s and state(s, w["chrom"]) == "scored" else state(s, w["chrom"])
                 if best:
                     ceil[(wid, line)] = (best[1], best[2])
+                    ceil_ev[(wid, line)] = (evb[1], evb[2])
                     s = best[2]
                     fo.write(f"{wid}\t{line}\t{best[1]}\t{s['errors']}\t{s['qlen'] - s['query_N']}\t{s['matches']}\t"
                              f"{nok}\t{nsc}\t{selfe}\n")
@@ -137,13 +139,15 @@ def main():
 
     # ---- model haplotypes
     haps = defaultdict(dict)
-    for r in csv.DictReader(open(Path(a.stitch) / "model_haps.tsv"), delimiter="\t"):
+    for r in csv.DictReader(open(model_haps_tsv), delimiter="\t"):
         haps[(r["depth"], r["class"], r["sample"], r["kind"], r["wid"])][int(r["hap"])] = r
 
     cols = ["depth", "class", "sample", "wid", "chrom", "hap", "truth", "model_founders", "n_switches", "gap_bases",
             "failed_bases", "state", "qlen", "query_N", "asm_N", "n_blocks", "aligned_q", "matches", "mismatches",
             "ins", "dels", "unaligned", "errors", "contig", "mapq", "ceil_founder", "ceil_state", "ceil_errors",
-            "ceil_called", "ceil_matches", "founder_eq_ceil"] + \
+            "ceil_called", "ceil_matches", "founder_eq_ceil"] + EVENT_COLS + \
+        ["ceil_event_errors", "ceil_ev_founder", "ceil_ev_errors", "ceil_ev_called"] + \
+        [f"t{K}_event_errors" for K in TRIM_KS] + [f"ceil_t{K}_event_errors" for K in TRIM_KS] + \
         [f"t{K}_{x}" for K in TRIM_KS for x in TCOLS] + \
         [f"ceil_t{K}_{x}" for K in TRIM_KS for x in ("founder", "matches", "errors", "trimmed_bp", "called")]
     rows = []
@@ -212,6 +216,13 @@ def main():
             row["ceil_called"] = (cs_["qlen"] - cs_["query_N"]) if cs_ else ""
             row["ceil_matches"] = cs_["matches"] if cs_ else ""
             row["founder_eq_ceil"] = (founders == row["ceil_founder"]) if row["n_switches"] == 0 else ""
+            for x in EVENT_COLS:
+                row[x] = s[x] if s else 0
+            row["ceil_event_errors"] = cs_["event_errors"] if cs_ else ""     # event errors of the bp-best founder
+            ce = ceil_ev.get((wid, line))                                    # the event-best founder
+            row["ceil_ev_founder"] = ce[0] if ce else "."
+            row["ceil_ev_errors"] = ce[1]["event_errors"] if ce else ""
+            row["ceil_ev_called"] = (ce[1]["qlen"] - ce[1]["query_N"]) if ce else ""
             for K in TRIM_KS:
                 for x in TCOLS:
                     row[f"t{K}_{x}"] = s[f"t{K}_{x}"] if s else 0
@@ -219,6 +230,8 @@ def main():
                 row[f"ceil_t{K}_founder"] = tc[0] if tc else "."
                 for x in ("matches", "errors", "trimmed_bp", "called"):
                     row[f"ceil_t{K}_{x}"] = tc[1][f"t{K}_{x}"] if tc else ""
+                row[f"t{K}_event_errors"] = s[f"t{K}_event_errors"] if s else 0
+                row[f"ceil_t{K}_event_errors"] = tc[1][f"t{K}_event_errors"] if tc else ""
             rows.append(row)
     with open(out / "per_hapwin.tsv", "w") as fo:
         fo.write("\t".join(cols) + "\n")
@@ -230,6 +243,19 @@ def main():
             for k, v in sorted(d.items()):
                 fo.write(f"{cls}\t{k}\t{v}\n")
     print("wrote", len(rows), "haplotype-window rows", file=sys.stderr)
+    return len(rows)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--windows", required=True)
+    ap.add_argument("--stitch", required=True)
+    ap.add_argument("--align", required=True)
+    ap.add_argument("--ril-truth", required=True)
+    ap.add_argument("--out", required=True)
+    a = ap.parse_args()
+    score(a.windows, Path(a.stitch) / "panel.tsv", Path(a.stitch) / "model_haps.tsv", load_scores(a.align),
+          a.ril_truth, a.out)
 
 
 if __name__ == "__main__":

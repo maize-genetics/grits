@@ -161,8 +161,8 @@ def main():
                 r["errors"] = r["mismatches"] + r["ins"] + r["dels"] + r["unaligned"]
                 fo.write("\t".join(str(r[c]) for c in G.SCORE_COLS) + "\n")
             for h in sorted(empty):
-                fo.write("\t".join(map(str, [h, line, qinfo[h][0], qinfo[h][1], "all_N", ".", ".", ".", ".", ".",
-                                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] + [0] * 10)) + "\n")
+                r = G.all_n_row(h, line, *qinfo[h])
+                fo.write("\t".join(str(r[c]) for c in G.SCORE_COLS) + "\n")
         print(f"{line}{sfx}: {len(hs)} queries, sw {t_main:.0f}s, split rounds added {n_split} blocks, rejected {n_noncol} non-collinear "
               f"({t1 - t0 - t_main:.0f}s), score {time.time() - t1:.0f}s", file=sys.stderr, flush=True)
 

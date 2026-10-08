@@ -397,7 +397,7 @@ def main():
                 r = rows[h]
                 r.update(seq_hash=h, line=line, qlen=len(seqs[h]), query_N=qinfo[h][1])
                 r["errors"] = r["mismatches"] + r["ins"] + r["dels"] + r["unaligned"] + r["structural"]
-                fo.write("\t".join(str(r[c]) for c in cols) + "\n")
+                fo.write("\t".join(str(r.get(c, ".")) for c in cols) + "\n")
             for h in sorted(empty):
                 fo.write("\t".join(map(str, [h, line, qinfo[h][0], qinfo[h][1], "all_N", ".", ".", ".", ".", "."]
                                        + [0] * (len(cols) - 10))) + "\n")
