@@ -9,8 +9,11 @@ Scope numbers (IDX / MIX / OUT) per depth:
   snprc  mean of the class SNP+RC error rates (every class has 5 samples)
   cov    mean % genome inside BED intervals
   gwx    gene-window error / panel-ceiling error, pooled over the scope's haplotype windows; per event
-         (event_x_ceiling) or per bp (err_x_ceiling), switched on the page. Gene-window rates are shown as
-         % (err_pct_capped or event_err_pct); the per-kb columns stay in the JSON but are not displayed.
+         (event_x_ceiling, the default and primary measure) or per bp (err_x_ceiling), switched on the page.
+         Gene-window rates are shown as % (err_pct_capped or event_err_pct); the per-kb columns stay in the
+         JSON but are not displayed.
+  r2c    % of the way from the random-founder baseline to the panel ceiling (r2c_event_pct / r2c_bp_pct):
+         0 = random founder per window, 100 = best panel founder per window.
   swr    switch ratio = sum(predicted founder-pair changes) / sum(reference-path changes)
 The status rules and the verdict rules are documented on the page (Rules) and in the template's JS.
 """
@@ -40,7 +43,8 @@ GW = ["err_per_kb", "err_per_kb_capped", "ceil_err_per_kb", "err_x_ceiling", "pc
       "pick_rank_median", "wrongpick_rank_median", "wrongpick_excess_bp_median", "n_ranked_median", "excess_share",
       "wrongpick_err_share", "err_pct", "err_pct_capped", "ceil_err_pct_capped", "t50_err_pct_capped",
       "t50_ceil_err_pct_capped", "event_err_pct", "ceil_event_err_pct", "t50_event_err_pct", "t50_ceil_event_err_pct",
-      "event_x_ceiling", "err_capped_x_ceiling", "pct_exact_event", "indel_bp_per_event"]
+      "event_x_ceiling", "err_capped_x_ceiling", "pct_exact_event", "indel_bp_per_event", "rand_event_err_pct",
+      "rand_err_pct_capped", "r2c_event_pct", "r2c_bp_pct", "pct_truth_unextractable"]
 
 
 def clean(v):
@@ -99,7 +103,10 @@ def gw_seconds(path):
     return clean(t.iloc[0]) if len(t) else None
 
 
-def build(reg, baseline, dest):
+DEFAULT_BASELINE = "v6cfullfe_homo_gapfill"      # also the default of eval_suite.py dashboard / report_card.sh
+
+
+def build(reg, baseline=DEFAULT_BASELINE, dest=OUT / "dashboard.html"):
     models = []
     for m, info in reg.items():
         f = OUT / m / "class_summary.tsv"

@@ -33,6 +33,8 @@ _reference/genewindow/, see eval_genewindow.py).
 Usage:
   eval_suite.py run --model NAME --tags 0.1=TAG 1.0=TAG [--sections core genewindow] [--workers 4]
   eval_suite.py run --model NAME --sections genewindow      # tags taken from the registry
+  eval_suite.py genewindow-rescore [--models A B]           # re-score cached gene-window haplotypes
+                                                            # (after a gw_score / summary rule change)
   eval_suite.py summary            # class tables for every registered model
   eval_suite.py dashboard          # results/eval_suite/dashboard.html (primary view) + report.html
 """
@@ -439,13 +441,17 @@ def main():
     sub.add_parser("summary")
     sd = sub.add_parser("genewindow-seed", help="create the gene-window cache from a finished gw run dir")
     sd.add_argument("--from", dest="src", default=None)
+    gr = sub.add_parser("genewindow-rescore", help="re-score every registered model's cached gene-window "
+                        "haplotypes with the current gw_score rules (no projection / alignment)")
+    gr.add_argument("--models", nargs="+", default=None, help="default: every registered model with a genewindow dir")
     db = sub.add_parser("dashboard", help="write dashboard.html (and the detailed report.html)")
-    db.add_argument("--baseline", default="v6cfullfe_homo")
+    db.add_argument("--baseline", default=None,
+                    help="default: eval_suite_dashboard.DEFAULT_BASELINE (v6cfullfe_homo_gapfill)")
     db.add_argument("--out", default=str(OUT / "dashboard.html"))
     db.add_argument("--no-report", action="store_true", help="skip rebuilding report.html")
     a = ap.parse_args()
     {"run": cmd_run, "reference": cmd_reference, "summary": cmd_summary, "genewindow-seed": cmd_seed,
-     "dashboard": cmd_dashboard}[a.cmd](a)
+     "genewindow-rescore": cmd_gw_rescore, "dashboard": cmd_dashboard}[a.cmd](a)
 
 
 def cmd_seed(a):
@@ -453,9 +459,18 @@ def cmd_seed(a):
     eval_genewindow.seed(a.src or eval_genewindow.SEED)
 
 
+def cmd_gw_rescore(a):
+    import eval_genewindow
+    models = a.models or [m for m in registry() if (OUT / m / "genewindow" / "model_haps.tsv").exists()]
+    for m in models:
+        g = eval_genewindow.rescore_model(m)
+        cols = ["depth", "level", "group"] + eval_genewindow.HEADLINE[:11]
+        print(f"\n== {m}\n" + g[g.level == "scope"][cols].round(4).to_string(index=False))
+
+
 def cmd_dashboard(a):
     import eval_suite_dashboard
-    print(eval_suite_dashboard.build(registry(), a.baseline, Path(a.out)))
+    print(eval_suite_dashboard.build(registry(), a.baseline or eval_suite_dashboard.DEFAULT_BASELINE, Path(a.out)))
     if not a.no_report:
         import eval_suite_report
         eval_suite_report.main()

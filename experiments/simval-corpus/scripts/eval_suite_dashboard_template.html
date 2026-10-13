@@ -8,7 +8,7 @@
   --same:#5b6773; --same-bg:#e7ebef; --same-line:#9aa6b1;
   --warn:#8a5a00; --warn-bg:#f8ebc8; --warn-line:#d39b1c;
   --bad:#a32a2a; --bad-bg:#f6dcdc; --bad-line:#d05555;
-  --bar-base:#8c99a6; --bar-ceil:#b9c3cc;
+  --bar-base:#8c99a6; --bar-ceil:#b9c3cc; --bar-rand:#c9a46a;
   --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
@@ -22,7 +22,7 @@
     --same:#a7b2bd; --same-bg:#212a32; --same-line:#5d6974;
     --warn:#f0c264; --warn-bg:#352a12; --warn-line:#b98a26;
     --bad:#f19494; --bad-bg:#3a1c1c; --bad-line:#c25555;
-    --bar-base:#6c7986; --bar-ceil:#3f4b56;
+    --bar-base:#6c7986; --bar-ceil:#3f4b56; --bar-rand:#8a6c3c;
   }
 }
 :root[data-theme="dark"]{
@@ -34,7 +34,7 @@
   --same:#a7b2bd; --same-bg:#212a32; --same-line:#5d6974;
   --warn:#f0c264; --warn-bg:#352a12; --warn-line:#b98a26;
   --bad:#f19494; --bad-bg:#3a1c1c; --bad-line:#c25555;
-  --bar-base:#6c7986; --bar-ceil:#3f4b56;
+  --bar-base:#6c7986; --bar-ceil:#3f4b56; --bar-rand:#8a6c3c;
 }
 *{box-sizing:border-box}
 body{background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.45}
@@ -110,6 +110,7 @@ h3{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;c
 .bar.c .fl{background:repeating-linear-gradient(135deg,var(--bar-ceil) 0 3px,transparent 3px 5px);border:1px solid var(--bar-base)}
 .bar .v{text-align:right;color:var(--ink)}
 .bar.c .v{color:var(--ink-3)}
+.bar.r .fl{background:var(--bar-rand)} .bar.r .v{color:var(--ink-3)}
 details.grp{background:var(--panel);border:1px solid var(--line);border-radius:4px}
 details.grp>summary{cursor:pointer;padding:8px 12px;font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2);list-style:none;display:flex;justify-content:space-between;gap:10px}
 details.grp>summary::-webkit-details-marker{display:none}
@@ -163,6 +164,7 @@ table.det{border-collapse:collapse;width:100%;min-width:820px;font-size:12px}
     <span class="k"><span class="sw" style="background:var(--bad-line)"></span>worse</span>
     <span class="k"><span class="sw" style="background:var(--warn-line)"></span>coverage &lt; 95% (abstains)</span>
     <span class="k"><abbr title="Best possible single-panel-founder choice per gene window (gene-window) or best panel path (SNP+RC). 1× = as good as any panel founder.">ceiling</abbr></span>
+    <span class="k"><abbr title="Gene-window: 0 = random founder per window, 100 = best panel founder per window.">random→ceiling %</abbr></span>
     <span class="k"><abbr title="Model founder-pair changes ÷ reference-path changes. ~1 is ideal; ≪1 = under-switching.">switch ratio</abbr></span>
   </div>
 
@@ -175,18 +177,18 @@ table.det{border-collapse:collapse;width:100%;min-width:820px;font-size:12px}
     <div class="rules">
       <ul>
         <li><b>SNP+RC error</b>, <b>GW×ceil</b>, gene-window error %: better / worse when the change vs baseline is ≥ 5% relative and ≥ 0.01 pp (SNP+RC), ≥ 0.05× (GW×ceil) or ≥ 0.005 pp (gene-window %); otherwise similar.</li>
-        <li><b>Gene-window error %</b>: errors ÷ called truth bases in gene ±5 kb windows. <i>Per event</i>: mismatches + indel events + unaligned runs (one 45 bp deletion = 1). <i>Per bp</i>: every mismatched, inserted, deleted and unaligned base, capped at the window's called bases. Ceiling = best single panel founder per window under the same counting.</li>
+        <li><b>R→C</b> (random → ceiling %): 100 × (random − model) ÷ (random − ceiling) on gene-window error; 0 = random founder per window, 100 = best panel founder per window. Random = exact expectation over the panel founders scorable in each window. Better / worse at ≥ 1 point change.</li>
+        <li><b>Gene-window error %</b>: errors ÷ called truth bases in gene ±5 kb windows. <i>Per event</i>: mismatches + indel events + unaligned runs (one 45 bp deletion = 1). <i>Per bp</i>: every mismatched, inserted, deleted and unaligned base, capped at the window's called bases. Ceiling = best single panel founder per window under the same counting. Per event is the primary measure (per bp charges every base of an indel). Haplotype windows whose in-panel truth founder's own panel sequence failed extraction are excluded from model, ceiling and random (“truth unextractable”, shown in the Gene window table).</li>
         <li><b>Coverage</b>: amber below 95% genome; better / worse at ≥ 1 pp change. An error win in a scope below 95% coverage turns amber, never green.</li>
         <li><b>Switch ratio</b>: closer to 1 is better; status from the change in |ln ratio| (≥ 0.10).</li>
         <li><b>Verdict</b>: per scope from SNP+RC; a class inside a non-worse scope is a regression at ≥ 10% relative and ≥ 0.02 pp worse. With “both” depths a scope counts only if it moves the same way at both depths, otherwise “mixed”. Green: wins and no losses; red: losses and no wins; amber: mixed or abstaining.</li>
-        <li>Scope values: mean of class SNP+RC and coverage; gene-window err/kb pooled over the scope's windows; switch ratio = Σ model changes ÷ Σ reference changes. “both” averages the two depths.</li>
+        <li>Scope values: mean of class SNP+RC and coverage; gene-window error pooled over the scope's windows; switch ratio = Σ model changes ÷ Σ reference changes. “both” averages the two depths.</li>
       </ul>
     </div>
   </details>
 
   <div class="foot">
     <span id="footGen"></span>
-    <a href="report.html">Detailed report (all sections, all classes)</a>
     <span>Corpus: simulated validation, 8 classes × 5 samples</span>
   </div>
 </div>
@@ -200,13 +202,13 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":
 const SCOPES = DATA.scopes, CLASSES = DATA.classes;
 const M = Object.fromEntries(DATA.models.map(m => [m.name, m]));
 let state = {depth: "0.1", base: DATA.baseline, sel: null, indel: "event"};
-try { const s = JSON.parse(localStorage.getItem("grits-board") || "{}"); if (s.depth) state.depth = s.depth; if (s.base && M[s.base]) state.base = s.base; if (s.indel) state.indel = s.indel; } catch (e) {}
-const save = () => { try { localStorage.setItem("grits-board", JSON.stringify({depth: state.depth, base: state.base, indel: state.indel})); } catch (e) {} };
+try { const s = JSON.parse(localStorage.getItem("grits-board-v2") || "{}"); if (s.depth) state.depth = s.depth; if (s.base && M[s.base]) state.base = s.base; if (s.indel) state.indel = s.indel; } catch (e) {}
+const save = () => { try { localStorage.setItem("grits-board-v2", JSON.stringify({depth: state.depth, base: state.base, indel: state.indel})); } catch (e) {} };
 const EV = () => state.indel === "event";
 /* gene-window field names for the current indel counting */
-const GWF = () => EV() ? {pct: "event_err_pct", ceil: "ceil_event_err_pct", x: "event_x_ceiling", t50: "t50_event_err_pct", t50c: "t50_ceil_event_err_pct", exact: "pct_exact_event"}
-                       : {pct: "err_pct_capped", ceil: "ceil_err_pct_capped", x: "err_x_ceiling", t50: "t50_err_pct_capped", t50c: "t50_ceil_err_pct_capped", exact: "pct_exact"};
-const GW_TIP = "Gene-window error %: errors (mismatch + indel + unaligned bp) ÷ truth bases in gene ±5 kb windows";
+const GWF = () => EV() ? {pct: "event_err_pct", ceil: "ceil_event_err_pct", rand: "rand_event_err_pct", r2c: "r2c_event_pct", x: "event_x_ceiling", t50: "t50_event_err_pct", t50c: "t50_ceil_event_err_pct", exact: "pct_exact_event"}
+                       : {pct: "err_pct_capped", ceil: "ceil_err_pct_capped", rand: "rand_err_pct_capped", r2c: "r2c_bp_pct", x: "err_x_ceiling", t50: "t50_err_pct_capped", t50c: "t50_ceil_err_pct_capped", exact: "pct_exact"};
+const GW_TIP = "Gene-window error %: errors (mismatches + indels + unaligned sequence, counted per event or per bp as set by Indels) ÷ truth bases in gene ±5 kb windows";
 const depths = () => state.depth === "both" ? ["0.1", "1"] : [state.depth];
 
 /* value lookup: src core|gw, group = class or scope; averaged over the selected depths */
@@ -225,6 +227,7 @@ function cmp(kind, v, b) {
   if (kind === "gwp") { const dv = v - b; if (Math.abs(dv) < 0.005 || (b > 0 && Math.abs(dv) / b < 0.05)) return "similar"; return dv < 0 ? "better" : "worse"; }
   if (kind === "gwx") { const dv = v - b; if (Math.abs(dv) < 0.05 || (b > 0 && Math.abs(dv) / b < 0.05)) return "similar"; return dv < 0 ? "better" : "worse"; }
   if (kind === "cov") { const dv = v - b; if (Math.abs(dv) < 0.01) return "similar"; return dv > 0 ? "better" : "worse"; }
+  if (kind === "r2c") { const dv = v - b; if (Math.abs(dv) < 1) return "similar"; return dv > 0 ? "better" : "worse"; }
   if (kind === "swr") { if (v <= 0 || b <= 0) return null; const dv = Math.abs(Math.log(v)) - Math.abs(Math.log(b)); if (Math.abs(dv) < 0.10) return "similar"; return dv < 0 ? "better" : "worse"; }
   return null;
 }
@@ -236,6 +239,7 @@ function arrow(v, b, kind) {
   const up = v > b, a = v === b ? "=" : (up ? "▲" : "▼");
   if (kind === "cov") return `${a}${Math.abs(100 * (v - b)).toFixed(1)}pp`;
   if (kind === "swr") return `${a}${Math.abs(v - b).toFixed(2)}`;
+  if (kind === "r2c") return `${a}${Math.abs(v - b).toFixed(1)}`;
   if (b === 0) return a;
   return `${a}${Math.abs(100 * (v - b) / b).toFixed(0)}%`;
 }
@@ -244,6 +248,7 @@ const COLS = [
   {key: "snprc", label: "SNP+RC", tip: "SNP+RefCall genotype error (lead metric). Lower is better.", kind: "err", src: "core", f: "snprc_err", fmt: fmtErr},
   {key: "cov", label: "Cov", tip: "% of genome inside called BED intervals. Below 95% = abstaining.", kind: "cov", src: "core", f: "genome_covered", fmt: v => v == null ? "–" : pct(v, 1) + "%"},
   {key: "gwx", label: "GW×ceil", tip: "Gene-window error (minimap2 vs truth assembly, gene ±5 kb) as a multiple of the panel ceiling (best single founder per window); per event or per bp as set by Indels. 1× = at ceiling.", kind: "gwx", src: "gw", f: () => GWF().x, fmt: fmtX},
+  {key: "r2c", label: "R→C", tip: "Random → ceiling %, gene-window error (per event or per bp as set by Indels): 0 = random founder per window, 100 = best panel founder per window", kind: "r2c", src: "gw", f: () => GWF().r2c, fmt: v => v == null ? "–" : v.toFixed(1)},
   {key: "swr", label: "Switch", tip: "Switch ratio: model founder-pair changes ÷ reference-path changes (summed over the scope). ~1 ideal; ≪1 under-switching. In panel (IDX) the reference only switches in RIL2 (~28 changes), so IDX ≫1 means spurious switches.", kind: "swr", src: "core", f: "swr", fmt: v => v == null ? "–" : v.toFixed(2)},
 ];
 
@@ -255,7 +260,7 @@ function cellState(m, col, grp) {
   const cov = scopeCov(m, grp);
   let st = m.name === state.base ? null : cmp(col.kind, v, get(base, col.src, grp, f));
   if (col.kind === "cov" && v != null && v < COV_WARN) st = "warn";
-  else if ((col.kind === "err" || col.kind === "gwx" || col.kind === "gwp") && st === "better" && cov != null && cov < COV_WARN) st = "warn";
+  else if ((col.kind === "err" || col.kind === "gwx" || col.kind === "gwp" || col.kind === "r2c") && st === "better" && cov != null && cov < COV_WARN) st = "warn";
   return {v, st, b: get(base, col.src, grp, f)};
 }
 
@@ -323,16 +328,17 @@ function renderBoard() {
   t.querySelectorAll(".mbtn").forEach(b => b.addEventListener("click", () => { state.sel = b.dataset.m; render(); $("#drill").scrollIntoView({block: "start", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"}); }));
 }
 
-function mini(cls, m, base, src, key, ceilKey, fmt, kind) {
+function mini(cls, m, base, src, key, ceilKey, fmt, kind, randKey) {
   const v = get(m, src, cls, key), b = m.name === state.base ? null : get(base, src, cls, key);
   const c = ceilKey ? get(m, src, cls, ceilKey) ?? get(base, src, cls, ceilKey) : null;
-  const mx = Math.max(v || 0, b || 0, c || 0) || 1;
+  const r = randKey ? get(m, src, cls, randKey) ?? get(base, src, cls, randKey) : null;
+  const mx = Math.max(v || 0, b || 0, c || 0, r || 0) || 1;
   const st = b == null ? null : cmp(kind, v, b);
   const cov = get(m, "core", cls, "genome_covered");
   const st2 = st === "better" && cov != null && cov < COV_WARN ? "warn" : st;
   const row = (k, lab, x) => x == null ? "" : `<div class="bar ${k}"><span>${lab}</span><span class="tr"><span class="fl" style="width:${(100 * x / mx).toFixed(1)}%"></span></span><span class="v">${fmt(x)}</span></div>`;
   return `<div class="mini ${st2 ? "s-" + st2 : ""}"><div class="cls"><span>${cls}</span><span class="st ${st2 || ""}">${st2 ? (st2 === "warn" ? "abstains" : st2) + " " + arrow(v, b, kind) : ""}</span></div>` +
-    (v == null ? `<div class="empty">not run</div>` : row("m", "mod", v) + row("b", "base", b) + row("c", "ceil", c)) + `</div>`;
+    (v == null ? `<div class="empty">not run</div>` : row("m", "mod", v) + row("b", "base", b) + row("c", "ceil", c) + row("r", "rand", r)) + `</div>`;
 }
 
 const fpct = (dp) => v => v == null ? "–" : pct(v, dp);
@@ -344,10 +350,12 @@ const GROUPS = [
     ["excess_over_ceiling", "Excess over panel ceiling, pp", "core", -1, fpct(3)], ["ceiling_snprc_err", "Panel ceiling %", "core", null, fpct(3)]]},
   {id: "gw", title: "Gene window", hint: "minimap2 vs truth assembly, 1000 genes ±5 kb", rows: () => [
     [GWF().pct, `Gene-window error % (${EV() ? "per event" : "per bp, capped"})`, "gw", -1, fnum(3)],
-    [GWF().ceil, "Ceiling error %", "gw", null, fnum(3)], [GWF().x, "× ceiling", "gw", -1, fnum(2)],
+    [GWF().ceil, "Ceiling error %", "gw", null, fnum(3)], [GWF().rand, "Random-founder error %", "gw", null, fnum(3)],
+    [GWF().r2c, "Random → ceiling % (0 = random, 100 = ceiling)", "gw", 1, fnum(1)], [GWF().x, "× ceiling", "gw", -1, fnum(2)],
     [GWF().t50, "Error %, ends trimmed (t50)", "gw", -1, fnum(3)], [GWF().t50c, "Ceiling error %, t50", "gw", null, fnum(3)],
     [GWF().exact, "Windows exact %", "gw", 1, fnum(1)],
     ["indel_bp_per_event", "Indel bp per indel event", "gw", null, fnum(1)],
+    ["pct_truth_unextractable", "Truth unextractable (excluded) % of hap-windows", "gw", null, fnum(2)],
     ["pct_uncalled_bp", "Uncalled bases %", "gw", -1, fnum(1)],
     ["sf_better_pct", "Single-founder windows with a better founder %", "gw", -1, fnum(1)],
     ["pick_rank_median", "Picked founder, median rank (1 = best)", "gw", -1, fnum(1)],
@@ -410,8 +418,8 @@ function renderDrill() {
   h += `<div><h3>SNP+RC error by class <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink-3)">· model / baseline (${esc(state.base)}) / <abbr title="Best panel-founder path (in-panel: true path, 0%).">ceiling</abbr> · each class on its own scale</span></h3><div class="multiples">` +
        CLASSES.map(c => mini(c, m, base, "core", "snprc_err", "ceiling_snprc_err", fmtErr, "err")).join("") + `</div></div>`;
   const hasGw = depths().every(d => m.gw && m.gw[d]);
-  h += `<div><h3><abbr title="${esc(GW_TIP)}">Gene-window error %</abbr> by class <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink-3)">· ${EV() ? "indels per event" : "indels per bp, capped"} · <abbr title="Best single panel founder per window and truth line.">ceiling</abbr> = best single founder per window</span></h3>` +
-       (hasGw ? `<div class="multiples">${CLASSES.map(c => mini(c, m, base, "gw", GWF().pct, GWF().ceil, v => v == null ? "–" : (v < 0.1 ? v.toFixed(4) : v < 1 ? v.toFixed(3) : v.toFixed(2)) + "%", "gwp")).join("")}</div>`
+  h += `<div><h3><abbr title="${esc(GW_TIP)}">Gene-window error %</abbr> by class <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink-3)">· ${EV() ? "indels per event" : "indels per bp, capped"} · model / baseline (${esc(state.base)}) / <abbr title="Best single panel founder per window and truth line.">ceiling</abbr> = best single founder per window / <abbr title="Exact expectation of a random scorable panel founder per window and truth line.">random</abbr> founder</span></h3>` +
+       (hasGw ? `<div class="multiples">${CLASSES.map(c => mini(c, m, base, "gw", GWF().pct, GWF().ceil, v => v == null ? "–" : (v < 0.1 ? v.toFixed(4) : v < 1 ? v.toFixed(3) : v.toFixed(2)) + "%", "gwp", GWF().rand)).join("")}</div>`
               : `<div class="empty">Gene-window eval not run for this model at this depth (eval_suite.py run --model ${esc(m.name)} --sections genewindow).</div>`) + `</div>`;
   h += `<div style="display:grid;gap:6px">` + GROUPS.map(g => `<details class="grp" data-g="${g.id}"${openGroups.has(g.id) ? " open" : ""}><summary>${g.title}<span class="hint">${g.hint}${m.name !== state.base ? " · small = baseline" : ""}</span></summary>${detailTable(g, m, base)}${g.id === "cost" && m.gw_seconds ? `<div class="rules">Gene-window eval: ${Math.round(m.gw_seconds)} s for all samples (cached panel ceiling).</div>` : ""}</details>`).join("") + `</div>`;
   el.innerHTML = h;

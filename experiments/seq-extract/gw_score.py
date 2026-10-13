@@ -9,10 +9,20 @@ Panel ceiling per (window, truth line): the founder (of 25) whose whole-window s
 errors against that line, among founders whose primary hit is on the window's chromosome.
 Event ceiling (ceil_ev_*): the same choice by event errors (gw_align EVENT_COLS: an indel or unaligned
 run counts once); ceil_event_errors / ceil_t<K>_event_errors are the bp-best founder's event errors.
+Random founder (rand_*): the exact expectation over the same scorable founders (status ok, primary hit on the
+window's chromosome) of min(errors, called), min(event_errors, called) and called; rand_n = their number.
+
+In-panel extraction rule: when the truth line is itself a panel founder whose own whole-window panel sequence
+failed extraction (panel status != ok, or no row) or whose alignment to itself is not scored on the window's
+chromosome, the panel cannot represent the truth there, so the haplotype window is "truth_unextractable":
+excluded from the model, the ceiling and the random baseline, and counted separately. Out-of-panel truth
+lines are never affected.
 
 A haplotype window is
   all_N       sequence entirely N (uncalled / projection failed): not scored, counted as uncalled
   mislocated  primary hit not on the window's chromosome: not scored, counted
+  truth_unextractable  in-panel truth line whose own panel sequence is unusable (rule above): not scored,
+              counted (overrides the other states)
   scored      otherwise (an unaligned sequence counts all its non-N bases as unaligned errors)
 errors = mismatches + inserted + deleted + unaligned (bases); N never counts as an error.
 
@@ -62,6 +72,35 @@ def state(s, chrom):
     return "scored"
 
 
+def truth_unextractable(panel_w, line, chrom, sc, panel_founders):
+    """True when `line` is a panel founder and its own panel sequence for this window (panel_w: {founder: panel
+    row}) failed extraction or does not score against `line` itself on `chrom`."""
+    if line not in panel_founders:
+        return False
+    pr = panel_w.get(line)
+    if pr is None or pr["status"] != "ok":
+        return True
+    return state(sc.get((pr["seq_hash"], line)), chrom) != "scored"
+
+
+def random_founder(panel_w, line, chrom, sc):
+    """Exact expectation of a uniformly random scorable panel founder for (window, truth line): returns
+    (n_founders, mean capped bp errors, mean capped event errors, mean called bases); n = 0 -> zeros."""
+    n = e = ev = c = 0
+    for pr in panel_w.values():
+        if pr["status"] != "ok":
+            continue
+        s = sc.get((pr["seq_hash"], line))
+        if state(s, chrom) != "scored":
+            continue
+        called = s["qlen"] - s["query_N"]
+        n += 1
+        e += min(s["errors"], called)
+        ev += min(s["event_errors"], called)
+        c += called
+    return (n, e / n, ev / n, c / n) if n else (0, 0.0, 0.0, 0.0)
+
+
 def regions(path):
     by = defaultdict(list)
     for line in open(path):
@@ -88,12 +127,20 @@ def score(windows, panel_tsv, model_haps_tsv, sc, ril_truth, out):
     panel = defaultdict(dict)
     for r in csv.DictReader(open(panel_tsv), delimiter="\t"):
         panel[r["wid"]][r["founder"]] = r
-    ceil, tceil, ceil_ev = {}, {}, {}
+    panel_founders = {f for pw in panel.values() for f in pw}
+    ceil, tceil, ceil_ev, rand, unext = {}, {}, {}, {}, set()
     with open(out / "ceiling.tsv", "w") as fo:
         fo.write("wid\tline\tbest_founder\terrors\tcalled\tmatches\tn_ok_founders\tn_scored_founders\t"
-                 "self_in_panel_errors\n")
+                 "self_in_panel_errors\ttruth_unextractable\trand_n\trand_err_capped\trand_event_errors\t"
+                 "rand_called\n")
         for wid, w in wins.items():
             for line in ALL_LINES:
+                ux = truth_unextractable(panel[wid], line, w["chrom"], sc, panel_founders)
+                if ux:
+                    unext.add((wid, line))
+                rnd = random_founder(panel[wid], line, w["chrom"], sc)
+                rand[(wid, line)] = rnd
+                rtxt = f"{int(ux)}\t{rnd[0]}\t{rnd[1]:.6g}\t{rnd[2]:.6g}\t{rnd[3]:.6g}"
                 best = None
                 nsc = 0
                 evb = None
@@ -133,9 +180,9 @@ def score(windows, panel_tsv, model_haps_tsv, sc, ril_truth, out):
                     ceil_ev[(wid, line)] = (evb[1], evb[2])
                     s = best[2]
                     fo.write(f"{wid}\t{line}\t{best[1]}\t{s['errors']}\t{s['qlen'] - s['query_N']}\t{s['matches']}\t"
-                             f"{nok}\t{nsc}\t{selfe}\n")
+                             f"{nok}\t{nsc}\t{selfe}\t{rtxt}\n")
                 else:
-                    fo.write(f"{wid}\t{line}\t.\t.\t.\t.\t{nok}\t{nsc}\t{selfe}\n")
+                    fo.write(f"{wid}\t{line}\t.\t.\t.\t.\t{nok}\t{nsc}\t{selfe}\t{rtxt}\n")
 
     # ---- model haplotypes
     haps = defaultdict(dict)
@@ -149,7 +196,8 @@ def score(windows, panel_tsv, model_haps_tsv, sc, ril_truth, out):
         ["ceil_event_errors", "ceil_ev_founder", "ceil_ev_errors", "ceil_ev_called"] + \
         [f"t{K}_event_errors" for K in TRIM_KS] + [f"ceil_t{K}_event_errors" for K in TRIM_KS] + \
         [f"t{K}_{x}" for K in TRIM_KS for x in TCOLS] + \
-        [f"ceil_t{K}_{x}" for K in TRIM_KS for x in ("founder", "matches", "errors", "trimmed_bp", "called")]
+        [f"ceil_t{K}_{x}" for K in TRIM_KS for x in ("founder", "matches", "errors", "trimmed_bp", "called")] + \
+        ["rand_n", "rand_err_capped", "rand_event_errors", "rand_called"]
     rows = []
     rilchk = defaultdict(lambda: defaultdict(int))
     first_depth = sorted({k[0] for k in haps})[0]
@@ -197,7 +245,7 @@ def score(windows, panel_tsv, model_haps_tsv, sc, ril_truth, out):
             r = hh[h]
             line = assign[h]
             s = sc.get((r["seq_hash"], line))
-            st = state(s, chrom)
+            st = "truth_unextractable" if (wid, line) in unext else state(s, chrom)
             c = ceil.get((wid, line))
             cs_ = c[1] if c else None
             founders = r["founders"]
@@ -232,6 +280,10 @@ def score(windows, panel_tsv, model_haps_tsv, sc, ril_truth, out):
                     row[f"ceil_t{K}_{x}"] = tc[1][f"t{K}_{x}"] if tc else ""
                 row[f"t{K}_event_errors"] = s[f"t{K}_event_errors"] if s else 0
                 row[f"ceil_t{K}_event_errors"] = tc[1][f"t{K}_event_errors"] if tc else ""
+            rn = rand[(wid, line)]
+            row["rand_n"] = rn[0]
+            for k, v in zip(("rand_err_capped", "rand_event_errors", "rand_called"), rn[1:]):
+                row[k] = f"{v:.6g}" if rn[0] else ""
             rows.append(row)
     with open(out / "per_hapwin.tsv", "w") as fo:
         fo.write("\t".join(cols) + "\n")

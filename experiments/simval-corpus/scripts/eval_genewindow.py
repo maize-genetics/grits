@@ -33,6 +33,18 @@ Error rates (summary.tsv; per-kb columns are kept but not displayed):
                      and for the anchor-trimmed (t50) variant
   err_x_ceiling      err_per_kb / ceil_err_per_kb (uncapped, bp); event_x_ceiling = event_err_pct /
                      ceil_event_err_pct
+  rand_event_err_pct / rand_err_pct_capped
+                     random-founder baseline: per (window, truth line) the exact expectation over the
+                     scorable panel founders (gw_score.random_founder), pooled as sum(mean errors) /
+                     sum(mean called) over the scored haplotype windows
+  r2c_event_pct / r2c_bp_pct
+                     % of the way from random to ceiling = 100 * (random - model) / (random - ceiling);
+                     0 = random founder per window, 100 = best panel founder per window
+  pct_truth_unextractable
+                     % of haplotype windows whose in-panel truth founder's own panel sequence failed
+                     extraction / scoring (gw_score in-panel extraction rule); excluded from model, ceiling
+                     and random alike
+Per event is the primary gene-window measure (per bp penalises every base of an indel).
 
 Founder-choice decomposition (single-founder scored windows = haplotype windows with one founder and no
 switch): pick_rank = 1 + number of panel founders whose own whole-window sequence has strictly fewer
@@ -366,6 +378,28 @@ def run_model(model, tags, classes=CLASSES, threads=8, jobs=2, out_root=None):
     return summ
 
 
+def rescore_model(model, out_root=None):
+    """Re-run gw_score + founder choice + summaries for a model from its cached model_haps.tsv and the shared
+    score cache (no projection, stitching or alignment). Use after a gw_score / summary rule change."""
+    out = Path(out_root or WORK / "results/eval_suite") / model / "genewindow"
+    t0 = time.time()
+    with open(GWC / "lock", "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        sc = load_score_cache()
+        for r in csv.DictReader(open(out / "model_haps.tsv"), delimiter="\t"):
+            h, qlen, nN = r["seq_hash"], int(r["seq_len"]), int(r["n_N"])
+            for ln in gw_align.truth_lines(r["kind"], r["sample"]):
+                if (h, ln) not in sc:
+                    if qlen > nN:
+                        raise RuntimeError(f"{model}: ({h}, {ln}) not in the score cache; run the full eval")
+                    sc[(h, ln)] = gw_align.all_n_row(h, ln, qlen, nN)
+        gw_score.score(GWC / "windows.tsv", GWC / "panel.tsv", out / "model_haps.tsv", sc, GWC / "ril_truth.tsv", out)
+        hw = founder_choice(out / "per_hapwin.tsv", sc)
+    summ = write_summaries(out, hw)
+    log(f"{model}: rescored in {time.time() - t0:.0f}s")
+    return summ
+
+
 def write_summaries(out, hw=None):
     """summary.tsv and per_sample.tsv of a model's genewindow dir (from per_hapwin.tsv if hw is None)."""
     import pandas as pd
@@ -459,7 +493,20 @@ def _rates(d):
         "t50_ceil_event_err_pct": p(np.minimum(at.ceil_t50_event_errors.astype(float), atc), atc),
         "pct_exact_event": 100 * float((sc.event_errors == 0).mean()) if len(sc) else np.nan,
         "indel_bp_per_event": float((sc.ins.sum() + sc.dels.sum()) / max(1, sc.ins_events.sum() + sc.del_events.sum())),
+        "pct_truth_unextractable": 100 * float((d.state == "truth_unextractable").mean()) if len(d) else np.nan,
     }
+    if "rand_n" in sc.columns:
+        rr = sc[sc.rand_n > 0]
+        rc = rr.rand_called.astype(float)
+        o["rand_err_pct_capped"] = p(rr.rand_err_capped.astype(float), rc)
+        o["rand_event_err_pct"] = p(rr.rand_event_errors.astype(float), rc)
+    else:
+        o["rand_err_pct_capped"] = o["rand_event_err_pct"] = np.nan
+
+    def r2c(model, ceil, rand):
+        return 100 * (rand - model) / (rand - ceil) if rand - ceil > 0 else np.nan
+    o["r2c_event_pct"] = r2c(o["event_err_pct"], o["ceil_event_err_pct"], o["rand_event_err_pct"])
+    o["r2c_bp_pct"] = r2c(o["err_pct_capped"], o["ceil_err_pct_capped"], o["rand_err_pct_capped"])
     o["event_x_ceiling"] = o["event_err_pct"] / o["ceil_event_err_pct"] if o["ceil_event_err_pct"] else np.nan
     o["err_capped_x_ceiling"] = o["err_pct_capped"] / o["ceil_err_pct_capped"] if o["ceil_err_pct_capped"] else np.nan
     return pd.Series(o)
@@ -483,6 +530,7 @@ def summarize(d):
     return s.sort_values(["depth", "level", "group"], key=lambda c: c.map(order) if c.name == "group" else c)
 
 
-HEADLINE = ["event_err_pct", "ceil_event_err_pct", "event_x_ceiling", "err_pct_capped", "ceil_err_pct_capped",
-            "err_x_ceiling", "pct_exact", "t50_event_err_pct", "t50_err_pct_capped", "pct_uncalled_bp", "sf_better_pct", "pick_rank_median", "wrongpick_rank_median", "excess_share",
+HEADLINE = ["event_err_pct", "ceil_event_err_pct", "rand_event_err_pct", "r2c_event_pct", "event_x_ceiling",
+            "err_pct_capped", "ceil_err_pct_capped", "rand_err_pct_capped", "r2c_bp_pct", "err_x_ceiling",
+            "pct_truth_unextractable", "pct_exact", "t50_event_err_pct", "t50_err_pct_capped", "pct_uncalled_bp", "sf_better_pct", "pick_rank_median", "wrongpick_rank_median", "excess_share",
             "wrongpick_err_share"]
