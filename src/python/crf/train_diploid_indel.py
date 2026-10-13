@@ -1047,7 +1047,7 @@ def route_real_sample(M, row_bin, informative_max=12):
 def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=256,
                              homo_scale=None, switch_scale=None, route=False,
                              row_bin=None, decode="viterbi", aff_region=0, het_scale=None, het_region=5,
-                             knockout=None):
+                             knockout=None, own=None):
     """THE single real-data inference recipe for GRITSCRFDiploidIndel --
     every eval script (real-data unit tests, depth sweeps, per-checkpoint
     comparisons) should call this instead of re-deriving the ext_emb /
@@ -1085,7 +1085,9 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
     measures. decode="wholechrom" (supervised-heads models; needs row_bin) scores the windows with the
     encoder as usual, then decodes each contig with ONE Viterbi over its windows laid end to end (per-row
     emission and switch cost, each window's own affinity prior), so a founder change at a window boundary
-    pays the switch cost instead of being a free restart.
+    pays the switch cost instead of being a free restart. own [N,T] bool (wholechrom only, optional): the
+    rows each window reports, for an end-aligned last window that overlaps the previous one; rows a window
+    does not own are left out of the chromosome path (their returned calls are meaningless).
 
     Returns (pred_lo, pred_hi): [N,T] int arrays, the low/high founder
     index of the predicted pair at every real site."""
@@ -1221,13 +1223,13 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
         T = data.shape[1]
         contig = np.asarray(row_bin)[:, 0] >> 40
         pred = _viterbi_wholechrom(model, torch.cat(wc_E), torch.cat(wc_C), torch.cat(wc_V), torch.cat(wc_I),
-                                   contig, device)
+                                   contig, device, own=own)
         return model.pi[pred].cpu().numpy().reshape(N, T), model.pj[pred].cpu().numpy().reshape(N, T)
     return np.concatenate(preds_lo), np.concatenate(preds_hi)
 
 
 @torch.no_grad()
-def _viterbi_wholechrom(model, E, C, V, I, contig, device, chunk=4096):
+def _viterbi_wholechrom(model, E, C, V, I, contig, device, chunk=4096, own=None):
     """One Viterbi per contig over its windows laid end to end, contigs as a padded batch.
     E [N,T,P] pair emissions, C [N,T] switch costs (C[:,0] = the cost into a window's first row),
     V [N,K+1] per-window affinity vectors (prior = V[newf1] + V[newf2]), I [N,P] initial priors,
@@ -1236,15 +1238,17 @@ def _viterbi_wholechrom(model, E, C, V, I, contig, device, chunk=4096):
     order = np.unique(contig, return_index=True)[1]
     ids = contig[np.sort(order)]
     wins = [np.nonzero(contig == c)[0] for c in ids]
-    L = max(len(w) for w in wins) * T
+    own = np.ones((N, T), bool) if own is None else np.asarray(own, bool)
+    seqs = [(np.repeat(w, own[w].sum(1)), np.concatenate([np.nonzero(own[x])[0] for x in w])) for w in wins]
+    L = max(len(sw) for sw, _ in seqs)
     nc = len(wins)
     rowwin = np.zeros((nc, L), np.int64)
     rowpos = np.zeros((nc, L), np.int64)
     valid = np.zeros((nc, L), bool)
-    for ci, w in enumerate(wins):
-        m = len(w) * T
-        rowwin[ci, :m] = np.repeat(w, T)
-        rowpos[ci, :m] = np.tile(np.arange(T), len(w))
+    for ci, (sw, sp) in enumerate(seqs):
+        m = len(sw)
+        rowwin[ci, :m] = sw
+        rowpos[ci, :m] = sp
         valid[ci, :m] = True
     nsw = model.nsw_pair.float()
     sb = model.stay_bonus.float()
@@ -1276,10 +1280,9 @@ def _viterbi_wholechrom(model, E, C, V, I, contig, device, chunk=4096):
         cur = bp[t].long().gather(1, cur.unsqueeze(1)).squeeze(1)
         path[:, t - 1] = cur
     path = path.cpu().numpy()
-    out = np.empty(N * T, np.int64)
-    for ci, w in enumerate(wins):
-        m = len(w) * T
-        out[(np.repeat(w, T) * T + np.tile(np.arange(T), len(w)))] = path[ci, :m]
+    out = np.zeros(N * T, np.int64)
+    for ci, (sw, sp) in enumerate(seqs):
+        out[sw * T + sp] = path[ci, :len(sw)]
     return torch.tensor(out)
 
 
