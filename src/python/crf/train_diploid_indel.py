@@ -717,6 +717,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                 ood_score = torch.zeros_like(ood_score)
             aw = aw * (1.0 - self.aff_ood_s * ood_score).clamp(0.0, 1.0)
         self._trans_prior = aw.view(-1, 1, 1) * (la0[:, self.newf1] + la0[:, self.newf2])   # [B,P,P]
+        self._trans_vec = aw.view(-1, 1) * la0      # [B,K+1]: _trans_prior = v[newf1] + v[newf2]
         self._init_prior = aw.view(-1, 1) * (la[:, self.pi] + la[:, self.pj])  # [B,P]
         # switch probability per transition t-1 -> t (t >= 1) from the window crossover count
         lam = self.xo_scale * self._heads["xo_lam"].float()                  # [B]
@@ -1081,7 +1082,10 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
     switch_scale arguments still override it. decode="marginal" takes the
     per-site posterior argmax (_dcrf_marginal) instead of the Viterbi path --
     it maximizes expected per-site accuracy, the quantity the genotype score
-    measures.
+    measures. decode="wholechrom" (supervised-heads models; needs row_bin) scores the windows with the
+    encoder as usual, then decodes each contig with ONE Viterbi over its windows laid end to end (per-row
+    emission and switch cost, each window's own affinity prior), so a founder change at a window boundary
+    pays the switch cost instead of being a free restart.
 
     Returns (pred_lo, pred_hi): [N,T] int arrays, the low/high founder
     index of the predicted pair at every real site."""
@@ -1183,6 +1187,13 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
         else:
             raise ValueError(f"unknown knockout {ko!r}")
 
+    wholechrom = decode == "wholechrom"
+    if wholechrom:
+        if aff_pred is None or row_bin is None:
+            raise ValueError('decode="wholechrom" needs a supervised-heads model and row_bin')
+        if het_win is not None:
+            raise ValueError('decode="wholechrom" does not support het_scale (per-segment het prior)')
+        wc_E, wc_C, wc_V, wc_I = [], [], [], []
     preds_lo, preds_hi = [], []
     with torch.no_grad():
         for s in range(0, N, batch_size):
@@ -1194,6 +1205,10 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
                   None if aff_pred is None else aff_pred.unsqueeze(0).expand(xb.shape[0], -1))
             hp = None if het_win is None else het_win[s:s + batch_size].to(device)
             emis_p, _g, c = model(xb, ext_emb=eb, homo_scale=hs, count=cb, aff_pred=ab, het_pred=hp)
+            if wholechrom:
+                wc_E.append(emis_p.float().cpu()); wc_C.append(c.float().cpu())
+                wc_V.append(model._trans_vec.float().cpu()); wc_I.append(model._init_prior.float().cpu())
+                continue
             if aff_pred is not None:        # heads model: its own calibrated switch cost
                 pred = model.crf_decode(emis_p, c)
             else:
@@ -1202,7 +1217,70 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
                            model.stay_bonus * switch_scale)
             preds_lo.append(model.pi[pred].cpu().numpy())
             preds_hi.append(model.pj[pred].cpu().numpy())
+    if wholechrom:
+        T = data.shape[1]
+        contig = np.asarray(row_bin)[:, 0] >> 40
+        pred = _viterbi_wholechrom(model, torch.cat(wc_E), torch.cat(wc_C), torch.cat(wc_V), torch.cat(wc_I),
+                                   contig, device)
+        return model.pi[pred].cpu().numpy().reshape(N, T), model.pj[pred].cpu().numpy().reshape(N, T)
     return np.concatenate(preds_lo), np.concatenate(preds_hi)
+
+
+@torch.no_grad()
+def _viterbi_wholechrom(model, E, C, V, I, contig, device, chunk=4096):
+    """One Viterbi per contig over its windows laid end to end, contigs as a padded batch.
+    E [N,T,P] pair emissions, C [N,T] switch costs (C[:,0] = the cost into a window's first row),
+    V [N,K+1] per-window affinity vectors (prior = V[newf1] + V[newf2]), I [N,P] initial priors,
+    contig [N] contig id per window (windows of a contig are consecutive). Returns [N*T] pair indices."""
+    N, T, P = E.shape
+    order = np.unique(contig, return_index=True)[1]
+    ids = contig[np.sort(order)]
+    wins = [np.nonzero(contig == c)[0] for c in ids]
+    L = max(len(w) for w in wins) * T
+    nc = len(wins)
+    rowwin = np.zeros((nc, L), np.int64)
+    rowpos = np.zeros((nc, L), np.int64)
+    valid = np.zeros((nc, L), bool)
+    for ci, w in enumerate(wins):
+        m = len(w) * T
+        rowwin[ci, :m] = np.repeat(w, T)
+        rowpos[ci, :m] = np.tile(np.arange(T), len(w))
+        valid[ci, :m] = True
+    nsw = model.nsw_pair.float()
+    sb = model.stay_bonus.float()
+    nf1, nf2 = model.newf1, model.newf2
+    Vd = V.to(device)
+    valid_t = torch.tensor(valid, device=device)
+    bp = torch.zeros(L, nc, P, dtype=torch.int16, device=device)
+    ident = torch.arange(P, device=device).expand(nc, P)
+    w0 = torch.tensor(rowwin[:, 0])
+    delta = E[w0, 0].to(device) + I[w0].to(device)
+    for c0 in range(1, L, chunk):
+        c1 = min(L, c0 + chunk)
+        rw = torch.tensor(rowwin[:, c0:c1]); rp = torch.tensor(rowpos[:, c0:c1])
+        Eb = E[rw, rp].to(device)                      # [nc, n, P]
+        Cb = C[rw, rp].to(device)                      # [nc, n]
+        rwd = rw.to(device)
+        for j in range(c1 - c0):
+            t = c0 + j
+            v = Vd[rwd[:, j]]                          # [nc, K+1]
+            tr = _prior_trans(Cb[:, j], nsw, sb, v[:, nf1] + v[:, nf2])
+            best, idx = (delta.unsqueeze(2) + tr).max(dim=1)
+            ok = valid_t[:, t].unsqueeze(1)
+            delta = torch.where(ok, Eb[:, j] + best, delta)
+            bp[t] = torch.where(ok, idx, ident).to(torch.int16)
+    cur = delta.argmax(dim=1)
+    path = torch.empty(nc, L, dtype=torch.long, device=device)
+    path[:, L - 1] = cur
+    for t in range(L - 1, 0, -1):
+        cur = bp[t].long().gather(1, cur.unsqueeze(1)).squeeze(1)
+        path[:, t - 1] = cur
+    path = path.cpu().numpy()
+    out = np.empty(N * T, np.int64)
+    for ci, w in enumerate(wins):
+        m = len(w) * T
+        out[(np.repeat(w, T) * T + np.tile(np.arange(T), len(w)))] = path[ci, :m]
+    return torch.tensor(out)
 
 
 @torch.no_grad()

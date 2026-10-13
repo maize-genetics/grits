@@ -61,7 +61,8 @@ def main():
     ap.add_argument("--switch-scale", type=float, default=None,
                     help="scale the decoder's transition score (diagnostic; unset = 1.0, "
                          "or the router's choice with --route)")
-    ap.add_argument("--decode", choices=["viterbi", "marginal"], default="viterbi")
+    ap.add_argument("--decode", choices=["viterbi", "marginal", "wholechrom"], default="viterbi",
+                    help="wholechrom: one Viterbi per contig over all its windows (supervised-heads models, needs --route)")
     ap.add_argument("--het-scale", choices=["global", "chrom", "region"], default=None,
                     help="supervised-heads models: once-per-segment het prior from the pooled het head "
                          "(sample / chromosome / +-het-region windows); default: no het prior change")
