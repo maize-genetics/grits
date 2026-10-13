@@ -359,7 +359,7 @@ def load_contig_layout(bins_path, window_size=WINDOW_SIZE, bin_size=256):
 
 
 def write_imputed_bed(sample, pi_arr, pj_arr, dropped_idx, gamete_names, bins_path, bed_dir,
-                       bin_size=256):
+                       bin_size=256, fill_switch_gaps=True):
     """Bridge from windowed model output back to founder-path BEDs, using
     load_contig_layout for positions instead of re-parsing the PS4G file (we
     already have everything from bins.tsv).
@@ -374,7 +374,11 @@ def write_imputed_bed(sample, pi_arr, pj_arr, dropped_idx, gamete_names, bins_pa
     per-contig split to correctly parse sample name vs. contig; confirmed
     against real production output (smm477/phg-maize/bed-files/.../
     B97_chr1_imputed.bed, one file per chromosome). A single combined file
-    would silently mis-parse."""
+    would silently mis-parse.
+
+    fill_switch_gaps (default True): at a founder switch the stretch between the last row of
+    one call and the first row of the next is split at its midpoint instead of being left
+    uncalled; stretches left by skipped null-state rows stay uncalled."""
     from src.python.bed_io.bed import output_collapse_bed
 
     T = pi_arr.shape[1]
@@ -409,7 +413,7 @@ def write_imputed_bed(sample, pi_arr, pj_arr, dropped_idx, gamete_names, bins_pa
         n_gamete = len(gamete_names)
         rows = []
         n_skipped = 0
-        for pos, p1, p2 in zip(positions, pi_c, pj_c):
+        for row, (pos, p1, p2) in enumerate(zip(positions, pi_c, pj_c)):
             p1, p2 = int(p1), int(p2)
             src1 = p1 + 1 if dropped_idx is not None and p1 >= dropped_idx else p1
             src2 = p2 + 1 if dropped_idx is not None and p2 >= dropped_idx else p2
@@ -419,14 +423,14 @@ def write_imputed_bed(sample, pi_arr, pj_arr, dropped_idx, gamete_names, bins_pa
             rows.append({
                 "chrom": contig, "start": int(pos), "end": int(pos) + 1,
                 "parent1": gamete_names[src1],
-                "parent2": gamete_names[src2],
+                "parent2": gamete_names[src2], "row": row,
             })
         if not rows:
             # whole contig decoded to the null state: no BED, so the scorer leaves it uncompared
             print(f"  {contig}: all {n_skipped:,} sites null-state, no BED written")
             continue
         out_bed = bed_dir / f"{sample}_{contig}_imputed.bed"
-        output_collapse_bed(pd.DataFrame(rows), str(out_bed))
+        output_collapse_bed(pd.DataFrame(rows), str(out_bed), fill_switch_gaps=fill_switch_gaps)
         written.append(out_bed)
         if n_skipped:
             print(f"  {contig}: wrote {len(rows):,} sites -> {out_bed} "
