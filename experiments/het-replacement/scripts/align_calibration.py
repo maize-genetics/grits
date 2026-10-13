@@ -40,9 +40,12 @@ ap.add_argument("--datasets", nargs="*", default=None)
 ap.add_argument("--lift-preset", choices=sorted(PRESETS), default="s200local")
 ap.add_argument("--workers", type=int, default=3)
 ap.add_argument("--gpu", default="0")
+ap.add_argument("--threads", default="16")
+ap.add_argument("--individuals", nargs="*", default=None)
 args = ap.parse_args()
 rows = [r for r in csv.DictReader(open(MANIFESTS[args.corpus]), delimiter="\t")
-        if r["coverage"] in args.coverages and (not args.datasets or r["dataset_id"] in args.datasets)]
+        if r["coverage"] in args.coverages and (not args.datasets or r["dataset_id"] in args.datasets)
+        and (not args.individuals or f"{r['dataset_id']}:{r['individual']}" in args.individuals)]
 if args.corpus == "calibration":
     assert not any(set(r["individual"].split("x")) & EVAL_LINES for r in rows), "evaluation line in calibration manifest"
 pre = PRESETS[args.lift_preset]
@@ -56,7 +59,7 @@ def run(r):
     os.makedirs(d, exist_ok=True)
     cmd = [PY, f"{S}/simval_eval_indel.py", "--stage", "align", "--sample", r["individual"],
            "--r1", r["r1_path"], "--r2", r["r2_path"], "--truth-h1", r["truth_h1"], "--truth-h2", r["truth_h2"],
-           "--outdir", d, "--out-json", f"{d}/result.json", "--threads", "16", "--no-cleanup",
+           "--outdir", d, "--out-json", f"{d}/result.json", "--threads", args.threads, "--no-cleanup",
            "--dataset-id", r["dataset_id"], "--coverage", r["coverage"], "--dataset-class", r["class"],
            "--kind", r["kind"], "--ckpt", CK]
     if pre["bin"]:
