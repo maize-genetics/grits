@@ -358,6 +358,18 @@ def load_contig_layout(bins_path, window_size=WINDOW_SIZE, bin_size=256):
     return layout
 
 
+def _worktree_output_collapse_bed():
+    """output_collapse_bed from this worktree's src/python/bed_io/bed.py. CRF_REPO_ROOT (another
+    checkout) sits first on sys.path, so a plain import would load its older bed.py, which lacks
+    fill_switch_gaps."""
+    import importlib.util
+    path = Path(__file__).resolve().parents[3] / "src" / "python" / "bed_io" / "bed.py"
+    spec = importlib.util.spec_from_file_location("_worktree_bed", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.output_collapse_bed
+
+
 def write_imputed_bed(sample, pi_arr, pj_arr, dropped_idx, gamete_names, bins_path, bed_dir,
                        bin_size=256, fill_switch_gaps=True):
     """Bridge from windowed model output back to founder-path BEDs, using
@@ -379,7 +391,7 @@ def write_imputed_bed(sample, pi_arr, pj_arr, dropped_idx, gamete_names, bins_pa
     fill_switch_gaps (default True): at a founder switch the stretch between the last row of
     one call and the first row of the next is split at its midpoint instead of being left
     uncalled; stretches left by skipped null-state rows stay uncalled."""
-    from src.python.bed_io.bed import output_collapse_bed
+    output_collapse_bed = _worktree_output_collapse_bed()
 
     T = pi_arr.shape[1]
     pi_flat = pi_arr.reshape(-1)
