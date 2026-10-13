@@ -440,7 +440,7 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                  learned_het=False, founder_affinity=False, fast_cells=False,
                  tie_aware_loss=False, pair_emission="sum", emission="learned",
                  supervised_heads="off", xo_placement=False, het_prior="row", no_distance=False,
-                 aff_source="head", gate_target="prov", extra_heads=False):
+                 aff_source="head", gate_target="prov", extra_heads=False, no_null=False, freeze_emission=False):
         super().__init__()
         self.save_hyperparameters()
         self.tie_aware_loss = tie_aware_loss
@@ -575,6 +575,8 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
                 # changes) the same as a higher switch cost, so fitting both is degenerate
                 keep = {"tern_loglik", "tern_dist_loglik", "het_w", "aff_w", "log_xo_scale",
                         "dos_w", "ood_w", "aff_ood_s"}
+                if freeze_emission:     # keep the warm-start checkpoint's read log-likelihoods
+                    keep -= {"tern_loglik", "tern_dist_loglik"}
                 for n_, q in self.named_parameters():
                     q.requires_grad_(n_ in keep)
         self._heads = None
@@ -729,6 +731,10 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
             dos_obs = deleted[..., self.pi] + deleted[..., self.pj]             # [B,T,P] 0..2
             logp = F.log_softmax(self._heads["dos_logit"].float(), -1)          # [B,T,3]
             emis_p = emis_p + self.dos_w * g.float().unsqueeze(-1) * logp.gather(2, dos_obs)
+        if knock.get("nonull") or self.hparams.get("no_null", False):   # forbid the null founder
+            emis_p = emis_p.masked_fill((self.pi == Kf) | (self.pj == Kf), -1e4)
+        if knock.get("homo"):                         # router says not hybrid: homozygous pairs only
+            emis_p = emis_p.masked_fill(self.homo_mask == 0, -1e4)
         if self.xo_placement:
             w = torch.sigmoid(-c_head.float()[:, 1:])
             w = w / w.sum(1, keepdim=True).clamp_min(1e-12)
@@ -990,11 +996,13 @@ class GRITSCRFDiploidIndel(pl.LightningModule):
         return {"optimizer": opt, "lr_scheduler": sched, "monitor": "val/loss"}
 
 
-# Sample router thresholds -- midpoints of the gaps seen on the 30 real 0.1x
-# IDX/OUT simval samples (2026-09-24): same-bin disjoint fraction homozygous
-# <= 0.272 vs hybrid >= 0.370; p90 IDX homozygous >= 0.723, IDX hybrid <= 0.323,
-# every OUT sample 0.43-0.64. Validate on MIX / other depths before trusting.
-ROUTE_DISJ_HYBRID = 0.32
+# Sample router thresholds. ROUTE_DISJ_HYBRID: midpoint of the gap on the CALIBRATION corpus
+# (simulated_calibration, 40 samples, all 8 classes, 0.1x; 2026-10-05): non-hybrid <= 0.237,
+# hybrid >= 0.340. Checked on the evaluation corpus without retuning: non-hybrid <= 0.248, hybrid
+# >= 0.378 at 0.1x and 1x, 80/80 correct (experiments/simval-corpus/scripts/router_check.py).
+# Was 0.32, set on 30 evaluation samples. The p90 thresholds (2026-09-24, evaluation IDX/OUT 0.1x):
+# IDX homozygous >= 0.723, IDX hybrid <= 0.323, every OUT sample 0.43-0.64.
+ROUTE_DISJ_HYBRID = 0.29
 ROUTE_P90_INPANEL_HOMO = 0.68
 ROUTE_P90_INPANEL_HYB = 0.375
 ROUTE_OUT_SWITCH_SCALE = 0.03
@@ -1145,7 +1153,7 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
         print(f"  het prior per segment from {het_scale} het rate: mean {float(het_win.mean()):.3f} "
               f"(window het fraction mean {float(hw.mean()):.3f})", flush=True)
 
-    # decode-time knockouts (diagnostics): gate1 / gatemean / xoconst / ood0 (dosage: set dos_w = 0)
+    # decode-time knockouts (diagnostics): gate1 / gatemean / xoconst / ood0 / nonull / homoroute (dosage: set dos_w = 0)
     # several may be combined with commas, e.g. "xoconst,ood0"
     model._knock = {}
     for ko in ([] if knockout is None else knockout.split(",")):
@@ -1155,6 +1163,15 @@ def infer_real_founder_pairs(model, data, num_parents, device=None, batch_size=2
             model._knock["gate"] = "mean"
         elif ko == "ood0":
             model._knock["ood0"] = True
+        elif ko == "nonull":
+            model._knock["nonull"] = True
+        elif ko == "homoroute":
+            # the router's inbred/hybrid call, which the supervised-heads CRF otherwise ignores
+            if not route:
+                raise ValueError("knockout homoroute needs route=True")
+            model._knock["homo"] = not r["hybrid"]
+            print(f"  homoroute: hybrid={r['hybrid']} -> "
+                  f"{'homozygous pairs only' if model._knock['homo'] else 'all pairs'}", flush=True)
         elif ko == "xoconst":
             xs = []
             with torch.no_grad():
@@ -1561,6 +1578,12 @@ def parse_args():
                         "(warm start from the stage-1 ckpt, --aff-pred for the pooled affinity)")
     p.add_argument("--no-founder-prior", action="store_true",
                    help="--supervised-heads stage2: freeze the CRF founder (affinity) prior weight at 0")
+    p.add_argument("--freeze-emission", action="store_true",
+                   help="--supervised-heads stage2: do not fit the read log-likelihood table; keep the "
+                        "warm-start checkpoint's values and fit only the switch / prior / dosage / ood weights")
+    p.add_argument("--no-null", action="store_true",
+                   help="drop the null founder from the CRF in training and decoding (every row gets a "
+                        "panel pair); for data with no null labels, e.g. heldout_closest_relabel.py output")
     p.add_argument("--extra-heads", action="store_true",
                    help="--supervised-heads: add the deletion-dosage and out-of-panel heads (targets: "
                         "--prov-deletion-bits provenance and <data>.ood.npy from heldout_augment_v2.py)")
@@ -1668,7 +1691,8 @@ def main():
         pair_emission=args.pair_emission, emission=args.emission,
         supervised_heads=args.supervised_heads, xo_placement=args.xo_placement,
         het_prior=args.het_prior, no_distance=args.no_distance, aff_source=args.aff_source,
-        gate_target=args.gate_target, extra_heads=args.extra_heads)
+        gate_target=args.gate_target, extra_heads=args.extra_heads, no_null=args.no_null,
+        freeze_emission=args.freeze_emission)
 
     if args.warm_start_ckpt:
         # Weight-only load (strict=False): the source checkpoint may predate
