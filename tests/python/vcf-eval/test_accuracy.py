@@ -1,6 +1,22 @@
 import pytest
 import io
+import random
+from collections import Counter
 from src.python.vcf_eval.accuracy import *
+
+
+def _allele_multiset_score_counter_reference(truth_alleles, imputed_alleles, phase_sensitive=False):
+    """Old Counter-based implementation, kept here only as a reference oracle
+    for equivalence-testing the current list-based allele_multiset_score."""
+    if not truth_alleles:
+        return 0.0
+    if phase_sensitive:
+        matches = sum(1 for t, i in zip(truth_alleles, imputed_alleles) if t == i)
+        return matches / float(len(truth_alleles))
+    t = Counter(truth_alleles)
+    i = Counter(imputed_alleles)
+    inter = sum((t & i).values())
+    return inter / float(len(truth_alleles))
 
 
 @pytest.fixture
@@ -163,6 +179,46 @@ def test_allele_multiset_score():
     # Intersection: 1 A (min(2,1)), 2 B's (min(2,2)), 1 C (min(1,2)) = 4 total
     expected = 4.0 / 5.0  # 4 matches out of 5 truth alleles
     assert allele_multiset_score(truth, imputed) == expected
+
+def test_allele_multiset_score_matches_counter_reference_fuzz():
+    """The list-based allele_multiset_score must produce byte-identical
+    results to the old Counter-based implementation across randomized
+    inputs -- covers ploidy/alphabet/duplicate combinations the hand-picked
+    cases above don't enumerate."""
+    random.seed(1234)
+    alphabets = [
+        ["A", "T", "C", "G"],
+        ["A", "T"],
+        ["A", "T", "C", "G", "ATG", "DEL", "N"],
+    ]
+    for _ in range(5000):
+        alphabet = random.choice(alphabets)
+        truth_len = random.randint(0, 8)
+        imputed_len = random.randint(0, 8)
+        truth_alleles = tuple(random.choices(alphabet, k=truth_len))
+        imputed_alleles = tuple(random.choices(alphabet, k=imputed_len))
+        for phase_sensitive in (False, True):
+            got = allele_multiset_score(truth_alleles, imputed_alleles, phase_sensitive)
+            want = _allele_multiset_score_counter_reference(truth_alleles, imputed_alleles, phase_sensitive)
+            assert got == want, (truth_alleles, imputed_alleles, phase_sensitive, got, want)
+
+def test_allele_multiset_score_matches_counter_reference_high_ploidy():
+    """Same equivalence check but skewed toward larger multisets (polyploid
+    edge cases) and heavy duplication, where the O(n^2) list-remove approach
+    is most likely to diverge from Counter's O(n) hashing if the logic were
+    wrong (e.g. removing the same element twice, or picking the wrong count
+    on ties)."""
+    random.seed(5678)
+    for _ in range(2000):
+        n = random.randint(0, 12)
+        m = random.randint(0, 12)
+        # Small alphabet forces lots of duplicate/tie scenarios.
+        alphabet = ["A", "T"]
+        truth_alleles = tuple(random.choices(alphabet, k=n))
+        imputed_alleles = tuple(random.choices(alphabet, k=m))
+        got = allele_multiset_score(truth_alleles, imputed_alleles, phase_sensitive=False)
+        want = _allele_multiset_score_counter_reference(truth_alleles, imputed_alleles, phase_sensitive=False)
+        assert got == want, (truth_alleles, imputed_alleles, got, want)
 
 def test_iter_records():
     pass
