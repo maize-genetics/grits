@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: new-server-setup
+expected_outcome: |
+  A concrete ordered setup plan: build ropebwt3-phg (grits-pipeline), rename contigs to <Founder>_chrN, build the FM-index (+ssa, len.gz) in panel order, build the lift with -k 50 -s 200 and B73 as reference, obtain the promoted checkpoint (it cannot be rebuilt from the FASTAs), set up the python env, and verify with a setup check; it warns that the panel must be exactly these 25 founders for the checkpoint.
