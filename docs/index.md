@@ -94,6 +94,13 @@ Comprehensive guide for the desktop application including:
 - Data visualization features
 - Platform-specific troubleshooting
 
+### [Session Handoff](./HANDOFF.md)
+Current project status and research history — start here for "what's
+being worked on and why." Research/evaluation work lives under
+[`experiments/`](../experiments/) as self-contained directories, each
+with its own `README.md` (setup, exact commands, results); the most
+recent `HANDOFF.md` entry links directly to the relevant ones.
+
 ## Architecture Overview
 
 ### CLI Application

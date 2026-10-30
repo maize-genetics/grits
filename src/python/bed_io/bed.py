@@ -74,10 +74,14 @@ def output_bed_file(output_bed, chroms, final_predictions, index_array, position
         output_collapse_bed(bed_df, output_bed)
 
 
-def output_collapse_bed(bed_df, output_bed):
+def output_collapse_bed(bed_df, output_bed, fill_switch_gaps=False):
     '''
     bed_df: pandas dataframe containing non-collapsed bed file data
     output_bed: name of the desired output bed of imputed path
+    fill_switch_gaps: split the uncalled stretch between the last row of one run and the first
+        row of the next run (a founder switch) at its midpoint, so a switch does not leave a gap.
+        With a "row" column (original row index), only gaps between consecutive rows are filled;
+        gaps from skipped rows (e.g. null-state calls) stay uncalled.
     '''
     # Define group boundaries where parent1, parent2, or chrom changes
     group_change = (
@@ -86,15 +90,32 @@ def output_collapse_bed(bed_df, output_bed):
             (bed_df["chrom"] != bed_df["chrom"].shift())
     )
     group_id = group_change.cumsum()
-    # Collapse into ranges
-    ranges_df = bed_df.groupby(group_id).agg({
-        "chrom": "first",
-        "start": ["min", "max"],
-        "parent1": "first",
-        "parent2": "first"
-    }).reset_index(drop=True)
-    # Clean up MultiIndex columns
-    ranges_df.columns = ["chrom", "start", "end", "parent1", "parent2"]
+    # Collapse into ranges. NOTE: "end" must come from the "end" column's own
+    # max, not "start"'s max -- aggregating "start" with both min/max (as a
+    # prior version of this function did) gives [min(start), max(start)],
+    # which for a group of exactly one row degenerates to start==end (an
+    # invalid, zero-width interval that crashes downstream BED->VCF
+    # conversion), and for multi-row groups silently under-reports the true
+    # end by exactly one base (the last row's own 1bp span was never
+    # included).
+    agg = {"chrom": "first", "start": "min", "end": "max", "parent1": "first", "parent2": "first"}
+    has_row = "row" in bed_df.columns
+    if has_row:
+        agg["row"] = ["min", "max"]
+    ranges_df = bed_df.groupby(group_id).agg(agg).reset_index(drop=True)
+    if has_row:
+        ranges_df.columns = ["chrom", "start", "end", "parent1", "parent2", "row_first", "row_last"]
+    if fill_switch_gaps and len(ranges_df) > 1:
+        start, end = ranges_df["start"].to_numpy().copy(), ranges_df["end"].to_numpy().copy()
+        same = (ranges_df["chrom"].to_numpy()[1:] == ranges_df["chrom"].to_numpy()[:-1]) & (start[1:] > end[:-1])
+        if has_row:
+            same &= ranges_df["row_first"].to_numpy()[1:] == ranges_df["row_last"].to_numpy()[:-1] + 1
+        idx = np.nonzero(same)[0]
+        mid = (end[idx] + start[idx + 1]) // 2
+        end[idx], start[idx + 1] = mid, mid
+        ranges_df["start"], ranges_df["end"] = start, end
+    # Clean up column order/names
+    ranges_df = ranges_df[["chrom", "start", "end", "parent1", "parent2"]]
     # Save to BED file
     ranges_df.to_csv(output_bed, sep="\t", index=False)
 

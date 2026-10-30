@@ -165,9 +165,36 @@ class BedToVcf : CliktCommand(help = "Convert a set of imputed BED files to a si
         val pos = Position(vc.contig, vc.start)
         val genotypeList = buildNewGenotypes(rangeMaps, pos, gameteToAlleleMap)
 
+        // AC/AN computed from the ORIGINAL reference panel's own genotypes
+        // (the 25 founders) at this site -- NOT the newly-built imputed
+        // sample's genotype -- so downstream frequency-binned diagnostics
+        // (compare_gvcf_truth.py / vcf_eval/accuracy.py's
+        // update_frequency_bins(), which reads AC/AN straight from this
+        // INFO field) can bin by how common/rare this allele actually is
+        // across the reference panel. `referencePanelVcf` (merge-gvcfs
+        // output) never annotates AC/AN itself, and VariantContextBuilder(vc)
+        // only copies attributes that already exist on vc, so this was
+        // always "." -- silently zeroing out every AF-binned accuracy/R2
+        // table this pipeline has ever produced (both in-panel and
+        // held-out reports).
+        var an = 0
+        var ac = 0
+        for (genotype in vc.genotypes) {
+            for (allele in genotype.alleles) {
+                if (allele.isCalled) {
+                    an++
+                    if (allele.isNonReference) {
+                        ac++
+                    }
+                }
+            }
+        }
+
         //Build a new variant context with the new genotype
         val newVc = VariantContextBuilder(vc)
             .genotypes(genotypeList)
+            .attribute("AC", ac)
+            .attribute("AN", an)
             .make()
         return newVc
     }
