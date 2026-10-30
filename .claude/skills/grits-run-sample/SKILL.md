@@ -20,9 +20,11 @@ and in-panel samples at 0.1x and 1x), so results are comparable with the publish
 ## Before you start: what to ask and check
 
 1. **Run `scripts/check_setup.sh`** (add `--vcf` if they want a VCF). It checks every resource listed in
-   `scripts/grits.env` (index, lift, checkpoint, ropebwt3 build, Python env, GPU). The defaults are the
-   lab's Cornell server paths. Anywhere else, or if a line says FAIL, read `references/inputs.md`: it says
-   what each resource is and how to build or obtain it. Point the scripts at other paths by exporting the
+   `scripts/grits.env` (index, lift, checkpoint, ropebwt3 build, Python env, GPU). First export three
+   variables: `GRITS_WORKDIR` (the GRITS working directory holding the checkpoint and lift),
+   `GRITS_REFMAP_ROOT` (the directory holding `rope_bwt_index_v2/`) and `GRITS_PYTHON_ENV` (a Python
+   environment with torch). The other paths default to locations under these. If a line says FAIL, read
+   `references/inputs.md`: it says what each resource is and how to build or obtain it. Point the scripts at other paths by exporting the
    variables or with `GRITS_ENV=/path/to/copy.env`.
 2. **Find out about the sample**, because it decides how much to trust the result:
    - **Species and panel.** Maize only, and the model works with exactly this 25-founder panel. Other

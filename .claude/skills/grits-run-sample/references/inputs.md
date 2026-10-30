@@ -1,7 +1,10 @@
 # Resources the pipeline needs
 
 Every path lives in `scripts/grits.env` and can be overridden by environment variable. The defaults
-point at the lab's Cornell server. On another machine you need all of the "required" items. The model
+are locations under three variables you set: `GRITS_WORKDIR`, `GRITS_REFMAP_ROOT` and
+`GRITS_PYTHON_ENV` (or `GRITS_PY`). On the lab's Cornell server these are the lab's working directory,
+the ropebwt index directory and its pixi environment; ask the lab for the exact values. On another
+machine you need all of the "required" items. The model
 is tied to one specific 25-founder panel, so the index, lift and checkpoint must all come from that panel.
 
 ## Required
