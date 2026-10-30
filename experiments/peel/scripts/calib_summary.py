@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 """Peel calibration table: per hybrid class mean SNP+RC / all-sites error (%), n rows, compared-site ratio vs the
 no-peel decode (pC_hs). calib_summary.py SUF (01 | 1x)"""
+import os
 import glob
 import json
 import sys
 from collections import defaultdict
 
-W = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/results"
+W = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "results")
 suf, pre = sys.argv[1], "pC"
 tags = sorted({p.split("/")[-1].rsplit("_", 2)[0] for p in glob.glob(f"{W}/{pre}_*_{suf}_*_fast")})
 res = {}

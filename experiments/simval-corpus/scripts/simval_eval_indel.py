@@ -26,6 +26,7 @@ Usage:
         --ckpt PATH [--panel-vcf PATH]
         [--dataset-id ID] [--coverage C] [--dataset-class CLASS] [--kind KIND]
 """
+import os
 import argparse
 import json
 import subprocess
@@ -46,9 +47,7 @@ hae.nb.LIFT = P.LIFT_V2
 # NOT hae.nb.BIN (older plain-count-npy binary). Verified working command
 # for this exact flag set: experiments/simulator-indels/results/
 # real_anchor_dist_npy_oh43xil14h.md (2026-09-16, IDX-HYB Oh43xIl14H 0.1x).
-ANCHORDIST_BIN = Path(
-    "/workdir/zrm22/HackathonJun2026/ropebwt_refMap/ropebwt3-phg/.claude/worktrees/"
-    "lift-ridx-ternary-dist-map/ropebwt3")
+ANCHORDIST_BIN = Path(os.environ.get("GRITS_REFMAP_ROOT", "/nonexistent-GRITS_REFMAP_ROOT-unset")) / "ropebwt3-phg/.claude/worktrees/lift-ridx-ternary-dist-map/ropebwt3"
 ANCHOR_DIST_THRESH = 2000  # matches the real --lift stride (-s 2000), not the
                             # simulator's indel_anchor_thresh=0 (different unit space)
 K = 25

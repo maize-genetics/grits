@@ -12,7 +12,7 @@
 # than regenerating slightly-different ones) is the whole point -- every
 # sample against the same GFF/CDS/SAM means only the query side varies.
 #
-# See /home/zrm22/.claude/plans/ok-now-that-we-warm-minsky.md.
+#
 #
 # Resumable: skips any sample whose <align>/<sample>.maf already exists and
 # is non-empty. align-assemblies swallows proali failures and still exits
@@ -31,19 +31,19 @@ set -uo pipefail
 PARALLEL="${1:-5}"
 THREADS_PER_RUN="${2:-10}"
 
-PHG_BIN="${PHG_BIN:-/local/workdir/zrm22/HackathonJun2026/DebugSim/phg/bin/phg}"
+PHG_BIN="${PHG_BIN:?set PHG_BIN}"
 JAVA_HOME="${JAVA_HOME:-/programs/jdk-21.0.1}"
 export PATH="$JAVA_HOME/bin:$PATH"
 
-CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:-/home/zrm22/mambaforge/envs/phgv2-conda}"
+CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:?set CONDA_ENV_PREFIX_ANCHORWAVE}"
 
 REF_FASTA="${REF_FASTA:-/workdir/shared_files/grits_crf_evaluation/index_asms/maize_v2/B73.fa}"
-REF_DIR="${REF_DIR:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_rebuild/ref}"
+REF_DIR="${REF_DIR:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_rebuild/ref}"
 REF_GFF="$REF_DIR/B73_v2.gff3"
 REF_CDS_FASTA="$REF_DIR/ref.cds.fasta"
 REF_SAM="$REF_DIR/B73.sam"
 
-OUT_DIR="${OUT_DIR:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_heldout}"
+OUT_DIR="${OUT_DIR:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_heldout}"
 ASM_DIR="${ASM_DIR:-$OUT_DIR/asm}"
 ALIGN_DIR="$OUT_DIR/align"
 LOG_DIR="$OUT_DIR/logs"

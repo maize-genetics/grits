@@ -16,7 +16,7 @@
 # into each file's own header text (preserving that file's own #CHROM
 # sample name), then apply via `bcftools reheader -h <header-file>` -- a
 # pure text substitution, not reliant on any internal hash iteration.
-# See /home/zrm22/.claude/plans/nifty-napping-crystal.md.
+#
 #
 # Resumable: skips any sample whose normalized output already exists.
 #
@@ -27,12 +27,12 @@ set -uo pipefail
 
 PARALLEL="${1:-8}"
 
-CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:-/home/zrm22/mambaforge/envs/phgv2-conda}"
+CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:?set CONDA_ENV_PREFIX_ANCHORWAVE}"
 export PATH="$CONDA_ENV_PREFIX_ANCHORWAVE/bin:$PATH"
 
 FAI="${FAI:-/workdir/shared_files/grits_crf_evaluation/index_asms/maize_v2/B73.fa.fai}"
 
-OUT_DIR="${OUT_DIR:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_rebuild}"
+OUT_DIR="${OUT_DIR:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_rebuild}"
 GVCF_DIR="${GVCF_DIR:-$OUT_DIR/gvcf}"
 NORM_DIR="${NORM_DIR:-$OUT_DIR/gvcf_normalized}"
 LOG_DIR="${LOG_DIR:-$OUT_DIR/logs}"

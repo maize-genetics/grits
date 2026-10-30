@@ -30,6 +30,7 @@ Several configs can be run in one process (--config NAME:k=v,k=v ...); each writ
 results/<NAME>_<scope>_fast/<NAME>__<DS>__<IND>__<depth>x.json (+ genome_covered) and BEDs under
 scratch/<NAME>_<scope>_fast/, the same layout as fast_eval_ckpt.py, so eval_suite-style tools work.
 """
+import os
 import argparse
 import contextlib
 import csv
@@ -55,10 +56,10 @@ import python.crf.train_diploid_indel as tdi  # noqa: E402
 import fast_snprc_score as fss  # noqa: E402
 import heldout_assembly_eval as hae  # noqa: E402
 
-WORK = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir")
+WORK = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"))
 EVAL_MANIFEST = "/workdir/shared_files/grits_crf_evaluation/reads/maize/simulated_validation/manifest.tsv"
 CALIB_MANIFEST = "/workdir/shared_files/grits_crf_evaluation/reads/maize/simulated_calibration/manifest.tsv"
-CK = "/workdir/zrm22/HackathonJun2026/grits_workdir/indel_baseline/checkpoints/v6cfullfe-stage2B/last.ckpt"
+CK = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "indel_baseline/checkpoints/v6cfullfe-stage2B/last.ckpt")
 SCOPES = {"out": ["OUT-INBRED", "OUT-HYB", "OUT-RIL2"], "idx": ["IDX-INBRED", "IDX-HYB", "IDX-RIL2"],
           "mix": ["MIX-HYB", "MIX-RIL2"]}
 GENOME_BP = 2.130e9

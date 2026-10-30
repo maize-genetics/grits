@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Realign the 24 NAM founders in index_asms/maize_v2/ against the new,
 # chr+organelle-trimmed B73 via PHGv2's align-assemblies (AnchorWave).
-# See /home/zrm22/.claude/plans/nifty-napping-crystal.md for full context.
+# for full context.
 #
 # Ref prep (gff2seq + minimap2-vs-ref) is done ONCE, then reused across all
 # 24 alignments via --reference-sam/--reference-cds-fasta -- this guarantees
@@ -25,16 +25,16 @@ set -uo pipefail
 PARALLEL="${1:-4}"
 THREADS_PER_RUN="${2:-8}"
 
-PHG_BIN="${PHG_BIN:-/local/workdir/zrm22/HackathonJun2026/DebugSim/phg/bin/phg}"
+PHG_BIN="${PHG_BIN:?set PHG_BIN}"
 JAVA_HOME="${JAVA_HOME:-/programs/jdk-21.0.1}"
 export PATH="$JAVA_HOME/bin:$PATH"
 
-CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:-/home/zrm22/mambaforge/envs/phgv2-conda}"
+CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:?set CONDA_ENV_PREFIX_ANCHORWAVE}"
 
 PANEL_DIR="${PANEL_DIR:-/workdir/shared_files/grits_crf_evaluation/index_asms/maize_v2}"
 REF_FASTA="${REF_FASTA:-$PANEL_DIR/B73.fa}"
 
-OUT_DIR="${OUT_DIR:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_rebuild}"
+OUT_DIR="${OUT_DIR:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_rebuild}"
 REF_DIR="$OUT_DIR/ref"
 ALIGN_DIR="$OUT_DIR/align"
 LOG_DIR="$OUT_DIR/logs"

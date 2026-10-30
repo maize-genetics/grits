@@ -29,11 +29,12 @@ Oh43 training/eval data was built from a pre-`head`-subsampled file instead of
 --target-hits despite the flag's existence.
 
 Usage:
-    /home/zrm22/mambaforge/envs/phg-ml/bin/python grits_workdir/scripts/nam_baseline.py list
-    /home/zrm22/mambaforge/envs/phg-ml/bin/python grits_workdir/scripts/nam_baseline.py one <Founder>
-    /home/zrm22/mambaforge/envs/phg-ml/bin/python grits_workdir/scripts/nam_baseline.py all
-    /home/zrm22/mambaforge/envs/phg-ml/bin/python grits_workdir/scripts/nam_baseline.py report
+    python experiments/refmap-founder-eval/scripts/nam_baseline.py list
+    python experiments/refmap-founder-eval/scripts/nam_baseline.py one <Founder>
+    python experiments/refmap-founder-eval/scripts/nam_baseline.py all
+    python experiments/refmap-founder-eval/scripts/nam_baseline.py report
 """
+import os
 import re
 import subprocess
 import sys
@@ -42,21 +43,21 @@ from pathlib import Path
 
 import numpy as np
 
-REFMAP_ROOT = Path("/workdir/zrm22/HackathonJun2026/ropebwt_refMap")
+REFMAP_ROOT = Path(os.environ.get("GRITS_REFMAP_ROOT", "/nonexistent-GRITS_REFMAP_ROOT-unset"))
 BIN = REFMAP_ROOT / "ropebwt3-phg/.claude/worktrees/refmap-ps4g-numpy/ropebwt3"
 LIFT = REFMAP_ROOT / "rope_bwt_index/maizeFastaIndex_SampleContig.lift"
 FMD = REFMAP_ROOT / "rope_bwt_index/maizeFastaIndex_SampleContig.fmd"
 LABELS_TEMPLATE = REFMAP_ROOT / "bench_ps4g_npy/labels_full.bed"
 
-CRF_SRC = Path("/workdir/zrm22/HackathonJun2026/test_crf_relatedness/src")
+CRF_SRC = Path(__file__).resolve().parents[3] / "src"
 WINDOW_SCRIPT = CRF_SRC / "python/crf/ropebwt_npy_to_matrix.py"
-CKPT = Path("/workdir/zrm22/HackathonJun2026/grits_workdir/checkpoints/haploid-sim/last.ckpt")
+CKPT = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "checkpoints/haploid-sim/last.ckpt"
 
-WGS_DIR = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/WGSReads")
+WGS_DIR = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "WGSReads"
 SCRATCH = Path("/tmp/claude-4347/-local-workdir-zrm22-HackathonJun2026-grits-workdir"
                "/ef670b81-b3d3-43b6-ad55-b6ca8008dc12/scratchpad/nam_baseline")
-RESULTS_TSV = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/results/nam_baseline_results.tsv")
-RESULTS_MD = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/results/nam_baseline.md")
+RESULTS_TSV = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "results/nam_baseline_results.tsv"
+RESULTS_MD = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "results/nam_baseline.md"
 
 PY = sys.executable
 SUBSAMPLE_READS = 1_000_000  # matches bench_ps4g_npy/reads/Oh43_1M.fastq (head -4000000 lines)

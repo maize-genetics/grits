@@ -33,8 +33,8 @@ from python.crf.train_diploid import (
 from python.crf.train_diploid_indel import (
     infer_real_founder_pairs, ibd_adjusted_accuracy, GRITSCRFDiploidIndel)
 
-REALDIR = "/workdir/zrm22/HackathonJun2026/grits_workdir/data/real"
-CKPT = ("/workdir/zrm22/HackathonJun2026/grits_workdir/indel_baseline/checkpoints/"
+REALDIR = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "data/real")
+CKPT = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "indel_baseline/checkpoints/"
         "diploid-indel-v3-k25-overlay-affinity/d-epoch=04-val_pair_acc=0.6820.ckpt")
 K = 25
 
@@ -46,7 +46,7 @@ K = 25
 # bin_truth_labels/write_truth_labels, "oracle max identity error 0.0235%"),
 # already materialized as truth_labels.npy (native K=25 space) next to the
 # cached raw.npy for these 5 pairs by this session.
-RIL2_SCRATCH = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/simval_eval_fixed"
+RIL2_SCRATCH = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "scratch/simval_eval_fixed")
 RIL2_PAIRS = ["B73xCML103", "B73xOh43", "B97xCML103", "Il14HxB97", "Oh43xIl14H"]
 
 

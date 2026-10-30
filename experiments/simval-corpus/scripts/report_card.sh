@@ -11,7 +11,7 @@
 set -e
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WT=$(cd "$D/../../.." && pwd)
-E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
+E=${GRITS_PYTHON_ENV:?set GRITS_PYTHON_ENV to the python env prefix (bin/python, lib)}
 export LD_LIBRARY_PATH=$E/lib PYTHONPATH=$WT/src
 tags=()
 [ "$2" != "-" ] && tags+=("0.1=$2")

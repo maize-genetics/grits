@@ -3,12 +3,13 @@
 
   calib_summary.py SUF [PREFIX]   (SUF 01 | 1x; tags PREFIX_<setting>_SUF_{idx,mix,out}_fast, default hsC)
 """
+import os
 import glob
 import json
 import sys
 from collections import defaultdict
 
-W = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/results"
+W = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "results")
 suf = sys.argv[1]
 pre = sys.argv[2] if len(sys.argv) > 2 else "hsC"
 tags = sorted({p.split("/")[-1].rsplit("_", 2)[0] for p in glob.glob(f"{W}/{pre}_*_{suf}_*_fast")})

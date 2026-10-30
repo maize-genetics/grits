@@ -4,8 +4,8 @@
 set -u
 N=$1; D=$2; PJ=$3
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)  # this checkout
-W=/local/workdir/zrm22/HackathonJun2026/grits_workdir; S=$W/scratch/peel
-E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
+W=${GRITS_WORKDIR:?set GRITS_WORKDIR to the GRITS working directory}; S=$W/scratch/peel
+E=${GRITS_PYTHON_ENV:?set GRITS_PYTHON_ENV to the python env prefix (bin/python, lib)}
 export LD_LIBRARY_PATH=$E/lib OMP_NUM_THREADS=${T:-4} PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 SUF=01; [ "$D" = 1.0 ] && SUF=1x
 TAG=pC_${N}_${SUF}

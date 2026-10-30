@@ -14,14 +14,16 @@ everything else imports.
 ## Environment
 
 ```bash
-PY=/home/zrm22/mambaforge/envs/phg-ml/bin/python
+PY=python                          # an env with torch + pytorch_lightning
 export LD_LIBRARY_PATH=            # must be empty -- clears a host-global lib
                                     # path that breaks the conda torch/htslib stack
-export PYTHONPATH=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/src
+export PYTHONPATH=$PWD/src          # run from the repo root
+export GRITS_WORKDIR=...            # working dir: data/, checkpoints/, scratch/, results/
+export GRITS_REFMAP_ROOT=...        # holds rope_bwt_index_v2/ and the ropebwt3 builds
 ```
-Every command below assumes these three are set. Third-party binaries used:
+Every command below assumes these are set. Third-party binaries used:
 `refmap` (a ropebwt3 fork) at
-`/workdir/zrm22/HackathonJun2026/ropebwt_refMap/ropebwt3-phg/.claude/worktrees/refmap-ps4g-numpy/ropebwt3`,
+`$GRITS_REFMAP_ROOT/ropebwt3-phg/.claude/worktrees/refmap-ps4g-numpy/ropebwt3`,
 `wgsim` at `/programs/samtools-1.20/bin/wgsim`, `bgzip` at
 `/programs/htslib-1.20/bin/bgzip`.
 

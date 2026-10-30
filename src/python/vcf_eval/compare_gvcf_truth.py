@@ -15,8 +15,7 @@ itself does when it builds a founder's own column in the panel VCF from that
 founder's own gVCF (reverse-engineered from `javap -c` on
 `biokotlin.util.MergeGVCFUtilsKt`, and independently verified this session at
 5-nines agreement against real founder gVCF/panel-column pairs -- see
-`scripts/verify_panel_projection.py` and
-`/home/zrm22/.claude/plans/ok-we-need-to-squishy-lovelace.md`). Truth's own
+`scripts/verify_panel_projection.py` and Truth's own
 selected allele A (from its single haploid GT), against its own record REF R,
 projects as:
   A == R (GT index 0, incl. <NON_REF> blocks)     -> panel-space REF here

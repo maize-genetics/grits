@@ -18,7 +18,7 @@
 # (data/maize_v2_rebuild/ref/canonical_contigs.txt) as the single source of
 # truth for what "canonical order" means, rather than rebuilding it.
 #
-# See /home/zrm22/.claude/plans/ok-now-that-we-warm-minsky.md.
+#
 #
 # Resumable: skips any sample whose sorted output already exists.
 #
@@ -31,15 +31,15 @@ set -uo pipefail
 
 PARALLEL="${1:-5}"
 
-CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:-/home/zrm22/mambaforge/envs/phgv2-conda}"
+CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:?set CONDA_ENV_PREFIX_ANCHORWAVE}"
 export PATH="$CONDA_ENV_PREFIX_ANCHORWAVE/bin:$PATH"
 
-OUT_DIR="${OUT_DIR:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_heldout}"
+OUT_DIR="${OUT_DIR:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_heldout}"
 GVCF_DIR="${GVCF_DIR:-$OUT_DIR/gvcf}"
 SORT_DIR="${SORT_DIR:-$OUT_DIR/gvcf_sorted}"
 LOG_DIR="${LOG_DIR:-$OUT_DIR/logs}"
 TMP_ROOT="${TMP_ROOT:-$OUT_DIR/tmp_sort}"
-CANONICAL_CONTIGS="${CANONICAL_CONTIGS:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_rebuild/ref/canonical_contigs.txt}"
+CANONICAL_CONTIGS="${CANONICAL_CONTIGS:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_rebuild/ref/canonical_contigs.txt}"
 mkdir -p "$SORT_DIR" "$LOG_DIR" "$TMP_ROOT"
 
 if [ ! -s "$CANONICAL_CONTIGS" ]; then

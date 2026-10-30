@@ -3,8 +3,8 @@
 set -u
 N=$1; D=$2; O1=$3; O2=$4
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)  # this checkout
-W=/local/workdir/zrm22/HackathonJun2026/grits_workdir; S=$W/scratch/hapswitch
-E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
+W=${GRITS_WORKDIR:?set GRITS_WORKDIR to the GRITS working directory}; S=$W/scratch/hapswitch
+E=${GRITS_PYTHON_ENV:?set GRITS_PYTHON_ENV to the python env prefix (bin/python, lib)}
 export LD_LIBRARY_PATH=$E/lib OMP_NUM_THREADS=${T:-4} PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 SUF=01; [ "$D" = 1.0 ] && SUF=1x
 TAG=hsC_${N}_${SUF}

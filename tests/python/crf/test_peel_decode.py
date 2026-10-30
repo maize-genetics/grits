@@ -9,7 +9,7 @@ import python.crf.train_diploid_indel as tdi
 from python.crf.train_diploid_indel import (GRITSCRFDiploidIndel, infer_real_founder_pairs, peel_decode,
                                             peel_for_sample, phase_pair_path)
 
-WORK = "/local/workdir/zrm22/HackathonJun2026/grits_workdir"
+WORK = os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")
 CKPT = f"{WORK}/indel_baseline/checkpoints/v6cfullfe-stage2B/last.ckpt"
 ROWS = f"{WORK}/scratch/editmatch/model_eval_E/rows_0.1"
 

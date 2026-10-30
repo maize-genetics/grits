@@ -11,6 +11,7 @@ identical to the full bed-to-vcf + compare path).
 Results: results/<tag>_<scope>_fast/<tag>__<DS>__<IND>__0.1x.json and a
 per-class summary printed at the end.
 """
+import os
 import argparse
 import contextlib
 import csv
@@ -34,7 +35,7 @@ from python.crf.train_diploid_indel import GRITSCRFDiploidIndel, infer_real_foun
 import fast_snprc_score as fss  # noqa: E402
 import heldout_assembly_eval as hae  # noqa: E402
 
-WORK = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir")
+WORK = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"))
 MANIFEST = "/workdir/shared_files/grits_crf_evaluation/reads/maize/simulated_validation/manifest.tsv"
 SCOPES = {"out": ["OUT-INBRED", "OUT-HYB", "OUT-RIL2"],
           "idx": ["IDX-INBRED", "IDX-HYB", "IDX-RIL2"],

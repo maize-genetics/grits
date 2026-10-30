@@ -1,8 +1,8 @@
 #!/bin/bash
 # run_suite.sh MODEL TAGPREFIX NOTE : eval_suite core + gene-window v2 for composite tags TAGPREFIX_{01,1x}
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)  # this checkout
-W=/local/workdir/zrm22/HackathonJun2026/grits_workdir; S=$W/scratch/hapswitch
-E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
+W=${GRITS_WORKDIR:?set GRITS_WORKDIR to the GRITS working directory}; S=$W/scratch/hapswitch
+E=${GRITS_PYTHON_ENV:?set GRITS_PYTHON_ENV to the python env prefix (bin/python, lib)}
 export LD_LIBRARY_PATH=$E/lib PYTHONPATH=$REPO/src
 cd $REPO/experiments/simval-corpus/scripts
 $E/bin/python -W ignore eval_suite.py run --model $1 --tags 0.1=$2_01 1.0=$2_1x --note "$3" --sections core genewindow \

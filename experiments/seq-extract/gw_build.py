@@ -11,6 +11,7 @@
 Samples: manifest rows of the 8 classes (old *-RIL rows ignored) at the requested depths; BEDs under
 scratch/v6cfullfe_homo[_1x]_<scope>_fast/.../bed.
 """
+import os
 import argparse
 import csv
 import hashlib
@@ -25,8 +26,8 @@ from python.seq_extract.haplotype import metadata_row, METADATA_COLUMNS  # noqa:
 from python.seq_extract.projection import ProjectionQuery  # noqa: E402
 
 MANIFEST = "/workdir/shared_files/grits_crf_evaluation/reads/maize/simulated_validation/manifest.tsv"
-SCRATCH = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch")
-RENAMED = "/workdir/zrm22/HackathonJun2026/ropebwt_refMap/rope_bwt_index_v2/renamedFastas"
+SCRATCH = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "scratch"
+RENAMED = os.path.join(os.environ.get("GRITS_REFMAP_ROOT", "/nonexistent-GRITS_REFMAP_ROOT-unset"), "rope_bwt_index_v2/renamedFastas")
 FAI_DIR = str(SCRATCH / "seq_extract_fai")
 CLASSES = ["IDX-INBRED", "IDX-HYB", "IDX-RIL2", "MIX-HYB", "MIX-RIL2", "OUT-INBRED", "OUT-HYB", "OUT-RIL2"]
 DEPTH_TAG = {"0.1": ("v6cfullfe_homo", "0.1x"), "1.0": ("v6cfullfe_homo_1x", "1.0x")}

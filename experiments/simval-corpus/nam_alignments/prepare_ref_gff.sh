@@ -17,7 +17,7 @@ set -euo pipefail
 
 IN_GFF="${1:-/workdir/shared_files/grits_crf_evaluation/index_asms/GCF_902167145.1_Zm-B73-REFERENCE-NAM-5.0_genomic.gff}"
 B73_FASTA="${2:-/workdir/shared_files/grits_crf_evaluation/index_asms/maize_v2/B73.fa}"
-OUT_GFF="${3:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_rebuild/ref/B73_v2.gff3}"
+OUT_GFF="${3:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_rebuild/ref/B73_v2.gff3}"
 
 FAI="${B73_FASTA}.fai"
 if [ ! -s "$FAI" ]; then

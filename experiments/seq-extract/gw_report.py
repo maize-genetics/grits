@@ -10,6 +10,7 @@ Definitions (bases): called = seq length - N; errors = mismatches + ins + dels +
 
 Usage: python gw_report.py RESULTS_DIR
 """
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -19,7 +20,7 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 CLASSES = ["IDX-INBRED", "IDX-HYB", "IDX-RIL2", "MIX-HYB", "MIX-RIL2", "OUT-INBRED", "OUT-HYB", "OUT-RIL2"]
-SNPRC = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/results/eval_suite/v6cfullfe_homo/per_sample.tsv"
+SNPRC = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "results/eval_suite/v6cfullfe_homo/per_sample.tsv")
 
 
 def summarize(d):

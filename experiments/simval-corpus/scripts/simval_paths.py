@@ -1,6 +1,6 @@
 """
 Central path/config overrides for the full-corpus affinity-model evaluation
-run (see /home/zrm22/.claude/plans/swift-chasing-melody.md).
+run
 
 Every v1->v2 refmap-index/panel-VCF override lives here, in one place, so
 nothing in the shared heldout_assembly_eval.py / nam_baseline.py / test_crf_
@@ -15,29 +15,24 @@ changed (v1 B73 -> v2 B73, same chr1-10 lengths -- confirmed byte-identical
 in .fmd.len.gz, so nam_baseline.LABELS_TEMPLATE needs no change).
 """
 
+import os
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # v1 -> v2 refmap index / panel VCF
 # ---------------------------------------------------------------------------
 
-REFMAP_ROOT = Path("/workdir/zrm22/HackathonJun2026/ropebwt_refMap")
+REFMAP_ROOT = Path(os.environ.get("GRITS_REFMAP_ROOT", "/nonexistent-GRITS_REFMAP_ROOT-unset"))
 FMD_V2 = REFMAP_ROOT / "rope_bwt_index_v2/maizeFastaIndex_SampleContig_v2.fmd"
 LIFT_V2 = REFMAP_ROOT / "rope_bwt_index_v2/maizeFastaIndex_SampleContig_v2.lift"
 
-PANEL_VCF_V2 = Path(
-    "/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/"
-    "maize_v2_rebuild/panel/panel_25founders_v2.vcf"
-)
+PANEL_VCF_V2 = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "data/maize_v2_rebuild/panel/panel_25founders_v2.vcf"
 
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
-CKPT_DIPLOID = Path(
-    "/local/workdir/zrm22/HackathonJun2026/grits_workdir/checkpoints/"
-    "diploid-affinity-sim512-h3/d-epoch=04-val_pair_acc=0.6179.ckpt"
-)
+CKPT_DIPLOID = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "checkpoints/diploid-affinity-sim512-h3/d-epoch=04-val_pair_acc=0.6179.ckpt"
 SOURCE_K = 25
 TARGET_K = 24
 
@@ -54,7 +49,7 @@ MANIFEST = Path(
 # Scratch / results / logs
 # ---------------------------------------------------------------------------
 
-GRITS_WORKDIR = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir")
+GRITS_WORKDIR = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"))
 SCRATCH_ROOT = GRITS_WORKDIR / "scratch/simval_eval"
 RESULTS_DIR = GRITS_WORKDIR / "results"
 RESULTS_TSV = RESULTS_DIR / "simval_results.tsv"

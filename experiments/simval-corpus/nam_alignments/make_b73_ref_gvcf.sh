@@ -3,7 +3,7 @@
 # spanning the WHOLE contig (POS=1..length). B73 IS the reference, so this
 # is correct by construction and gives literal 100% coverage -- unlike an
 # AnchorWave self-alignment, which leaves telomeres/gaps unaligned.
-# See /home/zrm22/.claude/plans/nifty-napping-crystal.md, Step 3.
+#
 #
 # The header (##fileformat/##FORMAT/##INFO block) is copied verbatim from a
 # real founder gVCF produced by build_maize_v2_gvcfs.sh, so merge-gvcfs'
@@ -16,11 +16,11 @@
 set -euo pipefail
 
 B73_FASTA="${1:-/workdir/shared_files/grits_crf_evaluation/index_asms/maize_v2/B73.fa}"
-OUT_DIR="${2:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_rebuild/gvcf}"
+OUT_DIR="${2:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_rebuild/gvcf}"
 HEADER_SOURCE_GVCF="${3:-}"
 
 JAVA_HOME="${JAVA_HOME:-/programs/jdk-21.0.1}"
-CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:-/home/zrm22/mambaforge/envs/phgv2-conda}"
+CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:?set CONDA_ENV_PREFIX_ANCHORWAVE}"
 export PATH="$JAVA_HOME/bin:$CONDA_ENV_PREFIX_ANCHORWAVE/bin:$PATH"
 
 FAI="${B73_FASTA}.fai"

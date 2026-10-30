@@ -43,6 +43,7 @@ already-built truth gVCF for this exact assembly (e.g. a real founder that
 already has one from elsewhere in the pipeline) -- see
 scripts/nam_inpanel_smoketest.py for the main use case.
 """
+import os
 import argparse
 import re
 import subprocess
@@ -64,21 +65,18 @@ import nam_baseline as nb  # noqa: E402  (reuse BIN/LIFT/FMD/WINDOW_SCRIPT/THREA
 # uses both. See CRF_SRC below.
 
 WGSIM = Path("/programs/samtools-1.20/bin/wgsim")  # matches tripsacum_diploid.py's WGSIM
-AFFINITY_CKPT = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/checkpoints/"
-                      "diploid-affinity-sim512-h3/d-epoch=04-val_pair_acc=0.6179.ckpt")
-PANEL_VCF_DEFAULT = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/"
-                          "maize_panel_vcf/panel_25founders.vcf")
-SAMPLE_BIN = Path("/local/workdir/zrm22/HackathonJun2026/DebugSim/sample-1.0-SNAPSHOT/bin/sample")
+AFFINITY_CKPT = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "checkpoints/diploid-affinity-sim512-h3/d-epoch=04-val_pair_acc=0.6179.ckpt"
+PANEL_VCF_DEFAULT = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "data/maize_panel_vcf/panel_25founders.vcf"
+SAMPLE_BIN = Path(os.environ.get("GRITS_BED2VCF", "sample"))
 BUILD_TRUTH_GVCF_SH = Path(__file__).parent / "build_truth_gvcf.sh"
-COMPARE_SCRIPT = Path("/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/"
-                       "src/python/vcf_eval/compare_gvcf_truth.py")
-CRF_REPO_ROOT = Path("/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness")
+COMPARE_SCRIPT = Path(__file__).resolve().parents[3] / "src/python/vcf_eval/compare_gvcf_truth.py"
+CRF_REPO_ROOT = Path(__file__).resolve().parents[3]
 CRF_SRC = CRF_REPO_ROOT / "src"
 sys.path.insert(0, str(CRF_SRC))         # for `python.crf...` (train_diploid, etc.)
 sys.path.insert(0, str(CRF_REPO_ROOT))   # for `src.python.bed_io...` (bed.py)
 
-SCRATCH = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/heldout_assembly_eval")
-RESULTS_DIR = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/results")
+SCRATCH = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "scratch/heldout_assembly_eval"
+RESULTS_DIR = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "results"
 
 PY = sys.executable
 THREADS = nb.THREADS
@@ -112,7 +110,7 @@ def simulate_reads(assembly_fasta, sample, depth, outdir):
 
 #: ropebwt3 built from the `pav-ps4g-insertion-rows` branch (chain --ps4g/--npy
 #: wiring + --insertion-rows), in its own worktree off the same real checkout
-#: nb.BIN lives under -- see /home/zrm22/.claude/plans/the-next-task-i-humming-
+#: nb.BIN lives under --
 #: lobster.md. Built, not the ephemeral job-tmp clone, so it survives past any
 #: one session; the checkout's pre-existing dirty tree and other worktrees are
 #: untouched (git worktree add is additive).

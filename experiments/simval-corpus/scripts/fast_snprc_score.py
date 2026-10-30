@@ -30,6 +30,7 @@ compared. So:
 (`validate`), which must agree to floating-point precision before any
 number from this tool is trusted.
 """
+import os
 import argparse
 import glob
 import hashlib
@@ -47,8 +48,8 @@ import compare_gvcf_truth_diploid as cgtd  # noqa: E402  (also puts vcf_eval on 
 from compare_gvcf_truth_diploid import cgt, gt_to_allele_multiset  # noqa: E402
 
 AUTOSOMES = [f"chr{i}" for i in range(1, 11)]
-PANEL_VCF = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_rebuild/panel/panel_25founders_v2.vcf"
-CACHE = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/fast_score_cache")
+PANEL_VCF = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "data/maize_v2_rebuild/panel/panel_25founders_v2.vcf")
+CACHE = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "scratch/fast_score_cache"
 
 # allele classes, matching compare_gvcf_truth.classify_alleles
 C_REF, C_SNP, C_INS, C_DEL = 0, 1, 2, 3

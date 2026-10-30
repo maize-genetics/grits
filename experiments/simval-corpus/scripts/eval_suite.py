@@ -40,6 +40,7 @@ Usage:
   eval_suite.py summary            # class tables for every registered model
   eval_suite.py dashboard          # results/eval_suite/dashboard.html (primary view) + report.html
 """
+import os
 import argparse
 import csv
 import glob
@@ -56,7 +57,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import fast_snprc_score as fss  # noqa: E402
 from panel_ceiling import best_path  # noqa: E402
 
-WORK = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir")
+WORK = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"))
 MANIFEST = "/workdir/shared_files/grits_crf_evaluation/reads/maize/simulated_validation/manifest.tsv"
 OUT = WORK / "results/eval_suite"
 REF = OUT / "_reference"

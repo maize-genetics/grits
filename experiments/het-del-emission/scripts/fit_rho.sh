@@ -2,10 +2,10 @@
 # Stage-2 refit on SIMULATED data (v6cfullfe recipe, frozen encoder + frozen read table) with the
 # presence-aware pair emission: fits log_del_rho together with the other CRF scalars.
 WT=$(cd "$(dirname "$0")/../../.." && pwd)  # this checkout
-E=/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/.pixi/envs/default
+E=${GRITS_PYTHON_ENV:?set GRITS_PYTHON_ENV to the python env prefix (bin/python, lib)}
 PY=$E/bin/python; export LD_LIBRARY_PATH=$E/lib PYTHONPATH=$WT/src OMP_NUM_THREADS=8
-D=/workdir/zrm22/HackathonJun2026/grits_workdir/indel_baseline; CK=$D/checkpoints
-J=/home/zrm22/.claude/jobs/hetdel
+D=${GRITS_WORKDIR:?set GRITS_WORKDIR to the GRITS working directory}/indel_baseline; CK=$D/checkpoints
+J=${GRITS_JOBDIR:-$GRITS_WORKDIR/scratch/jobs/hetdel}
 DATA=$D/data/training/maize_v6hoc_multidepth_fullscale_sliced.npy
 BASE="--data $DATA --workdir $D --num-parents 25 --time-local-emis --warmup-steps 100 --homo-penalty 3.0 --spike-skip --founder-affinity --windows-per-individual 117 --batch-size 64 --precision bf16-mixed --tie-aware-loss --pair-emission mixture --het-prior off --gate-target support --aff-source reads --emission likelihood --no-distance --extra-heads --no-null --freeze-emission"
 cd $WT

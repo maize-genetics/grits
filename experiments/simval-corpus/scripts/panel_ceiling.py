@@ -17,6 +17,7 @@ drops the site from the comparison (not an error, not a match).
 lam=0 is the per-site floor (free switching); larger lam forces sparser,
 more realistic paths. Reports error and switches per haplotype per sample.
 """
+import os
 import argparse
 import csv
 import json
@@ -93,7 +94,7 @@ def main():
     ap.add_argument("--classes", nargs="+", default=["OUT-INBRED", "OUT-HYB", "OUT-RIL2",
                                                      "IDX-INBRED", "IDX-HYB", "IDX-RIL2"])
     ap.add_argument("--lams", nargs="+", type=float, default=[0, 2, 10, 50, 200])
-    ap.add_argument("--out", default="/local/workdir/zrm22/HackathonJun2026/grits_workdir/results/panel_ceiling_0.1x.json")
+    ap.add_argument("--out", default=os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "results/panel_ceiling_0.1x.json"))
     args = ap.parse_args()
     panel = fss.Panel()
     panel.fa = np.asarray(panel.fa)

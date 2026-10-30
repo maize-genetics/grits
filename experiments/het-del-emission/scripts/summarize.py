@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Per (tag, dataset) means from hetdel_eval.py result JSONs: SNP+RC err, all-sites err, coverage,
 dosage-confusion row accuracies (truth 0/1/2 deleted haplotypes). Usage: summarize.py TAG [TAG ...]"""
+import os
 import glob
 import json
 import sys
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-RES = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/results")
+RES = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "results"
 print(f"{'tag':<22}{'dataset':<12}{'n':>3}{'snprc%':>9}{'all%':>8}{'cov%':>7}{'dos0%':>7}{'dos1%':>7}{'dos2%':>7}")
 for tag in sys.argv[1:]:
     by = defaultdict(list)

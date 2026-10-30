@@ -269,9 +269,9 @@ def test_snap_recovers_truth_from_perturbed_projections(fx):
 
 
 FULL_FIXTURE = Path(os.environ.get("SEQ_EXTRACT_FULL_FIXTURE",
-                                   "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_fixture"))
+                                   os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "scratch/seq_extract_fixture")))
 C_TABLES = Path(os.environ.get("SEQ_EXTRACT_SNAP_TABLES",
-                               "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/seq_extract_snapcheck"))
+                               os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "scratch/seq_extract_snapcheck")))
 
 
 @pytest.mark.parametrize("version,prefix", [("v3", "fx_"), ("v4", "v4_fx_"), ("v5", "v5_fx_"), ("v5", "v5_allb_")])

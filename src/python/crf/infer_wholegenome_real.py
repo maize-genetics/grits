@@ -19,8 +19,8 @@ of duplicating it. That module was built only for the dense, rectangular
      this codebase already uses for the v1->v2 index cutover, hae.nb.FMD=...).
 
 Usage:
-    LD_LIBRARY_PATH= PYTHONPATH=/local/workdir/zrm22/HackathonJun2026/grits-wholechrom-worktree/src \
-      /home/zrm22/mambaforge/envs/phg-ml/bin/python \
+    LD_LIBRARY_PATH= PYTHONPATH=src \
+      python \
       src/python/crf/infer_wholegenome_real.py \
         --row-dir /local/workdir/.../scratch/simval_eval/ROW_ID --sample NAME \
         --ckpt /local/workdir/.../checkpoints/diploid-affinity-sim512-h3/d-epoch=04-val_pair_acc=0.6179.ckpt \

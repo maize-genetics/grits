@@ -94,13 +94,13 @@ from python.seq_extract import write_projection_queries  # noqa: E402
 from python.seq_extract.haplotype import METADATA_COLUMNS, BedInterval, group_bed, metadata_row  # noqa: E402
 from python.seq_extract.projection import ProjectionQuery, bare_chrom  # noqa: E402
 
-WORK = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir")
+WORK = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"))
 MANIFEST = "/workdir/shared_files/grits_crf_evaluation/reads/maize/simulated_validation/manifest.tsv"
 GWC = WORK / "results/eval_suite/_reference/genewindow"
 SEED = WORK / "scratch/gene_window_eval/v2"
 MMI_DIR = WORK / "scratch/gene_window_eval/mmi"
 RB3 = WORK / "scratch/seq_extract_ropebwt/ropebwt3_v3"
-IDX = Path("/workdir/zrm22/HackathonJun2026/ropebwt_refMap/rope_bwt_index_v2")      # read only
+IDX = Path(os.path.join(os.environ.get("GRITS_REFMAP_ROOT", "/nonexistent-GRITS_REFMAP_ROOT-unset"), "rope_bwt_index_v2"))      # read only
 FMD = IDX / "maizeFastaIndex_SampleContig_v2.fmd"
 LIFT = IDX / "maizeFastaIndex_SampleContig_v2_s200.lift"
 CLASSES = ["IDX-INBRED", "IDX-HYB", "IDX-RIL2", "MIX-HYB", "MIX-RIL2", "OUT-INBRED", "OUT-HYB", "OUT-RIL2"]

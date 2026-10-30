@@ -1,7 +1,7 @@
 #!/bin/bash
 # align_one.sh SRC OUT : canonical (emE) alignment of one calibration row, skip if done
 set -u
-SRC=$1; OUT=$2; W=/local/workdir/zrm22/HackathonJun2026/grits_workdir
+SRC=$1; OUT=$2; W=${GRITS_WORKDIR:?set GRITS_WORKDIR to the GRITS working directory}
 [ -s $OUT/windowed_k25native_wcount.npy ] && exit 0
 mkdir -p $OUT
 $W/scripts/align_promoted.sh $(readlink -f $SRC/reads.fastq) $OUT ${T:-8} $SRC/labels.bed > $OUT/align.out 2>&1 || exit 1

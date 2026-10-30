@@ -19,6 +19,7 @@ Scoring one query (scores_<line>.tsv):
 
 Usage: python gw_align.py --stitch DIR --out-dir DIR [--lines ...] [--threads 3] [--rescore-only]
 """
+import os
 import argparse
 import csv
 import re
@@ -30,8 +31,8 @@ from pathlib import Path
 
 import numpy as np
 
-MM2 = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/tools/minimap2-2.28_x64-linux/minimap2"
-MMI = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/gene_window_eval/mmi/{line}.asm20.mmi"
+MM2 = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "scratch/tools/minimap2-2.28_x64-linux/minimap2")
+MMI = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "scratch/gene_window_eval/mmi/{line}.asm20.mmi")
 IDX_LINES = ["B73", "B97", "CML103", "Il14H", "Oh43"]
 OUT_LINES = ["A188", "CML459", "EP1", "Ia453", "Tx303"]
 ALL_LINES = IDX_LINES + OUT_LINES

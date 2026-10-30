@@ -4,7 +4,7 @@
 # --del-as-symbolic: project convention is that AnchorWave coverage gaps
 # stay as gaps (never asserted to match reference), and symbolic <INS>/<DEL>
 # encoding belongs inside merge-gvcfs, not upstream of it.
-# See /home/zrm22/.claude/plans/nifty-napping-crystal.md.
+#
 #
 # Resumable: skips any sample whose gvcf/<sample>.g.vcf.gz already exists
 # and is non-empty.
@@ -18,14 +18,14 @@ set -uo pipefail
 
 PARALLEL="${1:-8}"
 
-BIOKOTLIN_TOOLS_BIN="${BIOKOTLIN_TOOLS_BIN:-/local/workdir/zrm22/HackathonJun2026/biokotlin-tools/build/install/biokotlin-tools/bin/biokotlin-tools}"
+BIOKOTLIN_TOOLS_BIN="${BIOKOTLIN_TOOLS_BIN:?set BIOKOTLIN_TOOLS_BIN}"
 JAVA_HOME="${JAVA_HOME:-/programs/jdk-21.0.1}"
-CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:-/home/zrm22/mambaforge/envs/phgv2-conda}"
+CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:?set CONDA_ENV_PREFIX_ANCHORWAVE}"
 export PATH="$JAVA_HOME/bin:$CONDA_ENV_PREFIX_ANCHORWAVE/bin:$PATH"
 
 REF_FASTA="${REF_FASTA:-/workdir/shared_files/grits_crf_evaluation/index_asms/maize_v2/B73.fa}"
 
-OUT_DIR="${OUT_DIR:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_rebuild}"
+OUT_DIR="${OUT_DIR:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_rebuild}"
 ALIGN_DIR="${ALIGN_DIR:-$OUT_DIR/align}"
 GVCF_DIR="${GVCF_DIR:-$OUT_DIR/gvcf}"
 LOG_DIR="${LOG_DIR:-$OUT_DIR/logs}"

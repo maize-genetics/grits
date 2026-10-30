@@ -28,6 +28,7 @@ errors = mismatches + inserted + deleted + unaligned (bases); N never counts as 
 
 Writes per_hapwin.tsv, per_sample.tsv, per_class.tsv, ceiling.tsv, ril_regions_check.tsv into --out.
 """
+import os
 import argparse
 import csv
 import sys
@@ -38,8 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gw_align import ALL_LINES, EVENT_COLS, norm_chrom, split_pair  # noqa: E402
 
 CLASSES = ["IDX-INBRED", "IDX-HYB", "IDX-RIL2", "MIX-HYB", "MIX-RIL2", "OUT-INBRED", "OUT-HYB", "OUT-RIL2"]
-READS = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/read_datasets"
-SNPRC = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/results/eval_suite/v6cfullfe_homo/per_sample.tsv"
+READS = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "scratch/read_datasets")
+SNPRC = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "results/eval_suite/v6cfullfe_homo/per_sample.tsv")
 TRIM_KS = (50, 20)
 TCOLS = ("anchored", "matches", "errors", "trimmed_bp", "called")
 INT = ["qlen", "query_N", "n_blocks", "aligned_q", "matches", "mismatches", "ins", "dels", "unaligned", "truth_N",

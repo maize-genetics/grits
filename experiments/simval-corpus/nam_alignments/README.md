@@ -44,14 +44,14 @@ partial `.maf` before re-running `realign_maize_v2.sh`.
 | Purpose | Path |
 |---|---|
 | JDK 21 (**required**) | `/programs/jdk-21.0.1` — system `java` is JDK 13 and fails |
-| conda env (anchorwave, minimap2, bgzip, bcftools) | `/home/zrm22/mambaforge/envs/phgv2-conda` |
-| PHG v2 CLI (`align-assemblies`) | `/local/workdir/zrm22/HackathonJun2026/DebugSim/phg/bin/phg` |
-| biokotlin-tools (`maf-to-gvcf-converter`, `merge-gvcfs`) | `/local/workdir/zrm22/HackathonJun2026/biokotlin-tools/build/install/biokotlin-tools/bin/biokotlin-tools` |
+| conda env (anchorwave, minimap2, bgzip, bcftools) | `$CONDA_ENV_PREFIX_ANCHORWAVE` |
+| PHG v2 CLI (`align-assemblies`) | `$PHG_BIN` |
+| biokotlin-tools (`maf-to-gvcf-converter`, `merge-gvcfs`) | `$BIOKOTLIN_TOOLS_BIN` |
 
-## Hardcoded paths — needs parameterizing before this is repo-portable
+## Site-specific paths (set by environment variable or still fixed)
 
 - Reference/assembly location: `/workdir/shared_files/grits_crf_evaluation/index_asms/maize_v2/`
-- Output root: `/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_rebuild`
+- Output root: `$GRITS_WORKDIR/data/maize_v2_rebuild` (override with `OUT_DIR`)
 - The 24-name `FOUNDERS` array, duplicated identically in `realign_maize_v2.sh`
   and `build_maize_v2_gvcfs.sh`
 - The 12-accession RefSeq-seqid → chromosome-name map hardcoded in the awk

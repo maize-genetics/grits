@@ -18,6 +18,7 @@ Scope numbers (IDX / MIX / OUT) per depth:
   swr    switch ratio = sum(predicted founder-pair changes) / sum(reference-path changes)
 The status rules and the verdict rules are documented on the page (Rules) and in the template's JS.
 """
+import os
 import json
 import math
 import time
@@ -25,7 +26,7 @@ from pathlib import Path
 
 import pandas as pd
 
-OUT = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/results/eval_suite")
+OUT = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "results/eval_suite"
 CLASSES = ["IDX-INBRED", "IDX-HYB", "IDX-RIL2", "MIX-HYB", "MIX-RIL2", "OUT-INBRED", "OUT-HYB", "OUT-RIL2"]
 SCOPES = ["IDX", "MIX", "OUT"]
 DEPTHS = {0.1: "0.1", 1.0: "1"}

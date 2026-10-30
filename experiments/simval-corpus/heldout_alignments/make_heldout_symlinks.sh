@@ -9,7 +9,7 @@
 #
 # Source paths are the same 5 rows as the existing
 # scratch/heldout_assembly_eval/worklist_full5.tsv.
-# See /home/zrm22/.claude/plans/ok-now-that-we-warm-minsky.md.
+#
 #
 # Usage:
 #   scripts/heldout_alignments/make_heldout_symlinks.sh
@@ -18,15 +18,15 @@
 
 set -euo pipefail
 
-CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:-/home/zrm22/mambaforge/envs/phgv2-conda}"
+CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:?set CONDA_ENV_PREFIX_ANCHORWAVE}"
 export PATH="$CONDA_ENV_PREFIX_ANCHORWAVE/bin:$PATH"
 
-OUT_DIR="${OUT_DIR:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_heldout}"
+OUT_DIR="${OUT_DIR:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_heldout}"
 ASM_DIR="$OUT_DIR/asm"
 mkdir -p "$ASM_DIR"
 
 NON_INDEX="/workdir/shared_files/grits_crf_evaluation/non_index_asms/maize"
-IA453="/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/external_assemblies/Zm-Ia453-REFERENCE-FL-1.0.fa"
+IA453="${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/external_assemblies/Zm-Ia453-REFERENCE-FL-1.0.fa"
 
 declare -A SOURCES=(
   [Tx303]="$NON_INDEX/Zm-Tx303-REFERENCE-NAM-1.0.fa"

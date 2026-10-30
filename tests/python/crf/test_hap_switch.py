@@ -10,7 +10,7 @@ from python.crf.crf_kernels import build_pair_tables
 from python.crf.train_diploid_indel import (GRITSCRFDiploidIndel, crf_viterbi_prior, hap_switch_for_sample,
                                             hap_switch_nsw, infer_real_founder_pairs)
 
-WORK = "/local/workdir/zrm22/HackathonJun2026/grits_workdir"
+WORK = os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")
 CKPT = f"{WORK}/indel_baseline/checkpoints/v6cfullfe-stage2B/last.ckpt"
 ROWS = f"{WORK}/scratch/editmatch/model_eval_E/rows_0.1"
 

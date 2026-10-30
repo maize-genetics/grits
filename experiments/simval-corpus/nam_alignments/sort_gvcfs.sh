@@ -10,7 +10,7 @@
 # across all 25 files. Runs on the header-normalized set
 # (gvcf_normalized/), since sorting from there also carries forward the
 # canonical ##contig header block.
-# See /home/zrm22/.claude/plans/nifty-napping-crystal.md.
+#
 #
 # Resumable: skips any sample whose sorted output already exists.
 #
@@ -21,14 +21,14 @@ set -uo pipefail
 
 PARALLEL="${1:-6}"
 
-CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:-/home/zrm22/mambaforge/envs/phgv2-conda}"
+CONDA_ENV_PREFIX_ANCHORWAVE="${CONDA_ENV_PREFIX_ANCHORWAVE:?set CONDA_ENV_PREFIX_ANCHORWAVE}"
 export PATH="$CONDA_ENV_PREFIX_ANCHORWAVE/bin:$PATH"
 
-OUT_DIR="${OUT_DIR:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_rebuild}"
+OUT_DIR="${OUT_DIR:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_rebuild}"
 NORM_DIR="${NORM_DIR:-$OUT_DIR/gvcf_normalized}"
 SORT_DIR="${SORT_DIR:-$OUT_DIR/gvcf_sorted}"
 LOG_DIR="${LOG_DIR:-$OUT_DIR/logs}"
-BCFTOOLS_TMP_ROOT="${BCFTOOLS_TMP_ROOT:-/local/workdir/zrm22/HackathonJun2026/grits_workdir/data/maize_v2_rebuild/tmp_sort}"
+BCFTOOLS_TMP_ROOT="${BCFTOOLS_TMP_ROOT:-${GRITS_WORKDIR:?set GRITS_WORKDIR}/data/maize_v2_rebuild/tmp_sort}"
 mkdir -p "$SORT_DIR" "$LOG_DIR" "$BCFTOOLS_TMP_ROOT"
 
 sort_one() {

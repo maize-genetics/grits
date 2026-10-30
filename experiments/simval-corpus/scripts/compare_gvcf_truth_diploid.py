@@ -43,6 +43,7 @@ picks up the allele_multiset_score Counter-overhead fix. Switch back to
 CRF_REPO_ROOT = .../test_crf_relatedness once that branch is merged.
 """
 
+import os
 import argparse
 import json
 import sys
@@ -51,7 +52,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict
 
-CRF_REPO_ROOT = Path("/local/workdir/zrm22/HackathonJun2026/grits-perfscore-worktree")
+CRF_REPO_ROOT = Path(__file__).resolve().parents[3]
 CRF_SRC = CRF_REPO_ROOT / "src"
 sys.path.insert(0, str(CRF_SRC))
 

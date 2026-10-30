@@ -12,6 +12,7 @@ for every RIL2 sample x window: truth parent line (or BP when a mosaic breakpoin
 
 Usage: python gw_ril_truth.py windows.tsv OUT.tsv
 """
+import os
 import csv
 import sys
 
@@ -21,7 +22,7 @@ sys.path.insert(0, GEN)
 import config as cfg  # noqa: E402
 import mosaic  # noqa: E402
 
-READS = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/scratch/read_datasets"
+READS = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "scratch/read_datasets")
 CLASSES = ["IDX-RIL2", "MIX-RIL2", "OUT-RIL2"]
 
 

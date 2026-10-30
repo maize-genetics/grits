@@ -12,8 +12,6 @@ previously built against the *old* B73 (pre organelle-trim); those are now
 coordinate-incompatible with `rope_bwt_index_v2/` /
 `panel_25founders_v2.vcf` and cannot score anything from the rebuilt
 pipeline. This directory's scripts replace them.
-
-Full context and decisions: `/home/zrm22/.claude/plans/ok-now-that-we-warm-minsky.md`.
 Shared gotchas (AnchorWave swallowing `proali` failures, `.gz` double
 extension, etc.) are documented once in `scripts/nam_alignments/README.md`
 -- read that first, this file only covers what's different here.

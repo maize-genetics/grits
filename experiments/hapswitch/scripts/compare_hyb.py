@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """Hybrid-class table (SNP+RC / all-sites / GW per event + ceiling/random, routing, coverage) vs a baseline,
 plus a bit-identity check on every non-hybrid row.  compare_hyb.py BASE MODEL [MODEL...]"""
+import os
 import sys
 import pandas as pd
-R = "/local/workdir/zrm22/HackathonJun2026/grits_workdir/results/eval_suite"
+R = os.path.join(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset"), "results/eval_suite")
 models = sys.argv[1:]
 ps = {m: pd.read_csv(f"{R}/{m}/per_sample.tsv", sep="\t") for m in models}
 gw = {m: pd.read_csv(f"{R}/{m}/genewindow_v2/summary.tsv", sep="\t") for m in models}

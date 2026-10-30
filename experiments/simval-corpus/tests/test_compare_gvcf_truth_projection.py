@@ -3,7 +3,6 @@
 Unit tests for the Phase 1 rewrite of `TruthCursor.resolve()` /
 `iter_truth_records()` in
 `test_crf_relatedness/src/python/vcf_eval/compare_gvcf_truth.py` (see
-`/home/zrm22/.claude/plans/ok-we-need-to-squishy-lovelace.md`).
 
 Not wired into the repo's own pytest harness (`test_crf_relatedness/tests/`)
 because that harness's existing `from src.python.vcf_eval.accuracy import *`
@@ -17,11 +16,12 @@ scope covers fixing. Run directly instead:
 Exits 0 and prints "ALL PASS" if every assertion holds, else raises
 AssertionError with the failing case.
 """
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "test_crf_relatedness" / "src"))
-sys.path.insert(0, "/local/workdir/zrm22/HackathonJun2026/test_crf_relatedness/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 from python.vcf_eval.compare_gvcf_truth import (  # noqa: E402
     NON_REF,

@@ -6,13 +6,14 @@ and writes results/eval_suite/report.html: a headline table (SNP+RC error with %
 the panel-ceiling reference), then one section per area of the problem, each a models x classes table
 per depth. Lower-is-better metrics shade the best full-coverage model per class.
 """
+import os
 import html
 import json
 from pathlib import Path
 
 import pandas as pd
 
-OUT = Path("/local/workdir/zrm22/HackathonJun2026/grits_workdir/results/eval_suite")
+OUT = Path(os.environ.get("GRITS_WORKDIR", "/nonexistent-GRITS_WORKDIR-unset")) / "results/eval_suite"
 CLASSES = ["IDX-INBRED", "IDX-HYB", "IDX-RIL2", "MIX-HYB", "MIX-RIL2", "OUT-INBRED", "OUT-HYB", "OUT-RIL2"]
 DEPTHS = [(0.1, "0.1x"), (1.0, "1x")]
 FULL_COVERAGE = 0.9          # models below this genome coverage in a class are not eligible for "best"
