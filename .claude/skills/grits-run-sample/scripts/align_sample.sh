@@ -8,7 +8,8 @@
 #   raw.npy + raw.npy.{bins,gametes,layout}.tsv   per-bin founder support (refmap)
 #   raw.ps4g, raw.log                             PS4G counts, refmap log
 #   align_summary.txt                             reads in, and how many were placed (EXACT/PLACED) or dropped
-#   windowed_k25native_wcount.npy                 model input, [windows, 512, 77] int8
+#   windowed_k25native_wcount.npy                 model input, [windows, 512, 3K+2] int8 for K assemblies
+#                                                 (the name is historical; any panel size is written here)
 #   align.done                                    marker; the script skips a finished OUTDIR
 # The per-read table raw.tsv is deleted (it is large and not used downstream); set KEEP_TSV=1 to keep it.
 set -euo pipefail
@@ -27,7 +28,7 @@ if [ $# -eq 1 ] && [[ "$1" != *.gz ]]; then FQ=$1; else
 fi
 
 echo "[$(date +%H:%M:%S)] refmap ($T threads) -> $OUT"
-"$GRITS_ROPEBWT3" refmap --ref-prefix=B73 --max-occ=-1 -l 19 --lift="$GRITS_LIFT" -t "$T" \
+"$GRITS_ROPEBWT3" refmap --ref-prefix="$GRITS_REF_PREFIX" --max-occ=-1 -l 19 --lift="$GRITS_LIFT" -t "$T" \
   --ps4g="$OUT/raw.ps4g" --npy="$OUT/raw.npy" --anchor-dist-npy --anchor-dist-thresh=2000 \
   --lift-local-win=20000 --lift-chain-nb=3 --lift-chain-interp \
   --placed-min-chr-agree=1 --exact-min-asm-agree=1 --exact-max-ref-hits=1 \
@@ -42,7 +43,7 @@ awk -F'\t' '{n[$3]++; t++} END {printf "reads\t%d\n", t; for (s in n) printf "%s
 echo "[$(date +%H:%M:%S)] windowing -> windowed_k25native_wcount.npy"
 LD_LIBRARY_PATH=$GRITS_LD:${LD_LIBRARY_PATH:-} PYTHONPATH="$REPO/src:$REPO" \
   "$GRITS_PY" "$REPO/src/python/crf/ropebwt_npy_to_matrix.py" --npy="$OUT/raw.npy" \
-  --bins="$OUT/raw.npy.bins.tsv" --gametes="$OUT/raw.npy.gametes.tsv" --num-parents 25 --window-size 512 \
+  --bins="$OUT/raw.npy.bins.tsv" --gametes="$OUT/raw.npy.gametes.tsv" --window-size 512 \
   --anchor-dist-npy --emit-read-counts --out="$OUT/windowed_k25native_wcount.npy" > "$OUT/n2m.log" 2>&1
 touch "$OUT/align.done"
 echo "[$(date +%H:%M:%S)] done"

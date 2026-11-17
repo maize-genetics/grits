@@ -7,6 +7,12 @@ chromosome, columns chrom start end parent1 parent2, founder names) and OUTDIR/d
 
 This is the same call the promoted evaluation makes (infer_real_founder_pairs with preset
 placedfix_hetdel_hs_peel, route=True, knockout="homoroute"); only the corpus bookkeeping is left out.
+
+Panels other than the 25-founder maize one (EXPERIMENTAL, accuracy not validated): the checkpoint has a fixed
+founder count K. A panel with fewer assemblies is padded up to K with "null" founders that carry no read
+support (ternary 0 = diverged, distance -1 = no anchor, count 0: the same values the model uses for its own
+built-in null founder). Rows decoded to a padding founder are left uncalled. A panel with more than K
+assemblies is refused; build the index from at most K of them.
 """
 import argparse
 import contextlib
@@ -42,6 +48,17 @@ def contig_layout(bins_tsv, window=WINDOW):
     return out
 
 
+def pad_founders(data, n_real, k):
+    """[N, T, 3n+2] -> [N, T, 3k+2]: append k-n null founders to each block of
+    [ternary(n) | H1 | H2 | distance(n) | count(n)]; unknown labels (n) become k."""
+    n = n_real
+    tern, lab, dist, cnt = data[..., :n], data[..., n:n + 2], data[..., n + 2:2 * n + 2], data[..., 2 * n + 2:]
+    shape = data.shape[:2] + (k - n,)
+    lab = np.where(lab >= n, k, lab).astype(data.dtype)
+    return np.concatenate([tern, np.zeros(shape, data.dtype), lab, dist, np.full(shape, -1, data.dtype),
+                           cnt, np.zeros(shape, data.dtype)], axis=2)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", required=True, help="align_sample.sh output directory")
@@ -68,8 +85,10 @@ def main():
     t0 = time.time()
     data = np.load(d / "windowed_k25native_wcount.npy")
     names = pd.read_csv(d / "raw.npy.gametes.tsv", sep="\t").sort_values("gameteIndex")["sampleName"].tolist()
-    if len(names) != 25 or data.shape[2] != 3 * 25 + 2:
-        sys.exit(f"expected the 25-founder panel (input width 77); got {len(names)} founders, width {data.shape[2]}")
+    n_real = len(names)
+    if data.shape[2] != 3 * n_real + 2:
+        sys.exit(f"input width {data.shape[2]} does not match {n_real} founders (expected {3 * n_real + 2}): "
+                 "re-run align_sample.sh into a fresh directory")
     layout = contig_layout(d / "raw.npy.bins.tsv")
     if sum(n for _, _, n in layout) != data.shape[0]:
         sys.exit("window count does not match raw.npy.bins.tsv: windowing and bins are out of sync")
@@ -77,10 +96,18 @@ def main():
     row_bin = row_bin.reshape(data.shape[:2])
 
     model = GRITSCRFDiploidIndel.load_from_checkpoint(a.ckpt, map_location=dev, strict=False).eval().to(dev)
+    K = int(model.num_parents)
+    if n_real > K:
+        sys.exit(f"the index has {n_real} assemblies but the checkpoint was trained for {K}: rebuild the index "
+                 f"from at most {K} assemblies")
+    if n_real < K:
+        data = pad_founders(data, n_real, K)
+        print(f"EXPERIMENTAL: {n_real}-assembly panel padded to the checkpoint's {K} founders with null founders",
+              flush=True)
     print(f"decoding {data.shape[0]:,} windows on {dev}", flush=True)
     log = io.StringIO()
     with contextlib.redirect_stdout(log):
-        lo, hi = infer_real_founder_pairs(model, data, 25, device=dev, batch_size=a.batch_size,
+        lo, hi = infer_real_founder_pairs(model, data, K, device=dev, batch_size=a.batch_size,
                                           preset="placedfix_hetdel_hs_peel", route=True, row_bin=row_bin,
                                           knockout="homoroute")
     print(log.getvalue(), end="")
@@ -95,7 +122,7 @@ def main():
         m = n * WINDOW
         p1, p2 = lo[cur:cur + m].astype(int), hi[cur:cur + m].astype(int)
         cur += m
-        keep = (p1 < len(names)) & (p2 < len(names))       # null-state rows (no founder fits) stay uncalled
+        keep = (p1 < n_real) & (p2 < n_real)       # null-state and padding-founder rows stay uncalled
         if not keep.any():
             lines.append(f"{contig}: no founder calls")
             continue
@@ -111,6 +138,10 @@ def main():
                                 capture_output=True, text=True).stdout.strip() or "unknown"
     except OSError:
         commit = "unknown"
+    if n_real < K:
+        n_pad = int(((lo >= n_real) & (lo < K)).sum() + ((hi >= n_real) & (hi < K)).sum())
+        lines.append(f"panel: {n_real} assemblies padded to {K} (EXPERIMENTAL); "
+                     f"{n_pad:,} haplotype-rows decoded to a padding founder (left uncalled)")
     lines.append(f"decode wall time {time.time() - t0:.0f} s")
     lines.append(f"provenance: checkpoint {a.ckpt}; preset placedfix_hetdel_hs_peel, route, knockout homoroute; "
                  f"GRITS commit {commit}")

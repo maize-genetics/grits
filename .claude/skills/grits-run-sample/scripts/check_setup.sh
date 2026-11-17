@@ -20,15 +20,27 @@ need "index .ssa" "$GRITS_INDEX.ssa"
 need "index .len.gz" "$GRITS_INDEX.len.gz"
 need "lift (k50 s200)" "$GRITS_LIFT"
 need "checkpoint" "$GRITS_CKPT"
+n=0
 if [ -e "$GRITS_INDEX.len.gz" ]; then
   n=$(zcat "$GRITS_INDEX.len.gz" | cut -f1 | sed 's/_.*//' | sort -u | wc -l)
-  [ "$n" = 25 ] && ok "index holds 25 assemblies" || fail "index holds $n assemblies; the model needs exactly the 25-founder panel"
+  zcat "$GRITS_INDEX.len.gz" | cut -f1 | grep -q "^${GRITS_REF_PREFIX}_" \
+    && ok "reference assembly '$GRITS_REF_PREFIX' is in the index" \
+    || fail "no contigs named ${GRITS_REF_PREFIX}_* in the index: set GRITS_REF_PREFIX to the reference assembly's name"
 fi
 if [ -x "$GRITS_PY" ]; then
   LD_LIBRARY_PATH=$GRITS_LD:${LD_LIBRARY_PATH:-} "$GRITS_PY" -c \
     "import torch, pytorch_lightning, numpy, pandas; print(torch.__version__, 'cuda' if torch.cuda.is_available() else 'cpu-only')" \
     > /tmp/grits_py_check.$$ 2>&1 && ok "python: $(cat /tmp/grits_py_check.$$)" || fail "python env lacks torch/pytorch_lightning/pandas: $(tail -1 /tmp/grits_py_check.$$)"
   rm -f /tmp/grits_py_check.$$
+  if [ -e "$GRITS_CKPT" ]; then
+    k=$(LD_LIBRARY_PATH=$GRITS_LD:${LD_LIBRARY_PATH:-} "$GRITS_PY" -c \
+      "import sys, torch; print(torch.load(sys.argv[1], map_location='cpu', weights_only=False)['hyper_parameters']['num_parents'])" \
+      "$GRITS_CKPT" 2>/dev/null)
+    if [ -z "$k" ]; then fail "could not read the founder count from the checkpoint"
+    elif [ "$n" -gt "$k" ]; then fail "index holds $n assemblies but the checkpoint takes at most $k: rebuild it from at most $k"
+    elif [ "$n" = "$k" ]; then ok "index holds $n assemblies = checkpoint founder count"
+    else ok "index holds $n assemblies; decode pads them to the checkpoint's $k (EXPERIMENTAL, not validated)"; fi
+  fi
 else
   fail "python not found: $GRITS_PY"
 fi

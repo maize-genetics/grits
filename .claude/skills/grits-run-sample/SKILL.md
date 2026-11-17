@@ -27,8 +27,12 @@ and in-panel samples at 0.1x and 1x), so results are comparable with the publish
    `references/inputs.md`: it says what each resource is and how to build or obtain it. Point the scripts at other paths by exporting the
    variables or with `GRITS_ENV=/path/to/copy.env`.
 2. **Find out about the sample**, because it decides how much to trust the result:
-   - **Species and panel.** Maize only, and the model works with exactly this 25-founder panel. Other
-     species or panels need a new index and retraining, which this skill does not cover.
+   - **Species and panel.** The model was trained on the 25-founder maize panel. Other species, or panels of
+     up to 25 assemblies, can be run **experimentally**: build an index and lift for that panel
+     (`references/inputs.md`), set `GRITS_REF_PREFIX` to the reference assembly's name, and the decode pads the
+     panel up to the checkpoint's 25 founders. There are no accuracy numbers outside maize, so say so, and
+     validate first: reads from one of the user's own assemblies should come back as that assembly. Panels of
+     more than 25 assemblies are refused.
    - **What the sample is**: an inbred, an F1 hybrid, a RIL or other cross. The model works this out
      itself (see "Routing" below); you only need it to sanity-check the result.
    - **How related it is to the panel.** A NAM founder or a cross of them ("in panel") is imputed almost

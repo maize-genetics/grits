@@ -34,11 +34,12 @@ pixi install --environment gpu
 conda env create -f environment.yml
 ```
 
-## Quick start: impute a maize sample
+## Quick start: impute a sample
 
-GRITS calls, along each chromosome, which pair of the 25 maize founders (B73 + 24 NAM) your sample's two
-haplotypes look most like. Input: FASTQ reads (short reads, ~0.1x-1x). Output: one BED of founder pairs per
-chromosome, and optionally a VCF. Full guide: [docs/run-sample.md](docs/run-sample.md).
+GRITS calls, along each chromosome, which pair of founder assemblies your sample's two haplotypes look most like.
+Input: FASTQ reads (short reads, ~0.1x-1x). Output: one BED of founder pairs per chromosome, and optionally a VCF.
+The released model was trained on maize with 25 founders (B73 + 24 NAM); other species and panels of up to 25
+assemblies run too, but are **experimental and not yet validated**. Full guide: [docs/run-sample.md](docs/run-sample.md).
 
 **1. Build the aligner** (ropebwt3 with the GRITS `refmap` options):
 
@@ -54,12 +55,24 @@ git clone https://github.com/maize-genetics/grits
 cd grits && pixi install                   # default env; its torch already supports CUDA GPUs
 ```
 
-**3. Get the data files.** All three must come from the same 25-founder panel:
+**3. Get the model, and get or build an index:**
 - the model checkpoint `v6cfullfe-stage2B/last.ckpt`, from the Buckler lab (it can't be rebuilt);
-- the v2 25-founder FM-index (`.fmd` + `.fmd.ssa` + `.fmd.len.gz`), from the lab, or rebuilt as described in
-  the full guide;
-- the lift, built once from the index in about 4 min:
+- maize: the lab's v2 25-founder FM-index (`.fmd` + `.fmd.ssa` + `.fmd.len.gz`), then build the lift (~4 min):
   `ropebwt3 lift --ref-prefix=B73 -k 50 -s 200 -t 16 -o k50_s200.lift INDEX.fmd B73.fa`
+- another species or panel: build the index and lift from one FASTA per assembly (at most 25, reference first):
+
+```bash
+R=/path/to/ropebwt3-phg/ropebwt3; REF=RefName; ASM="RefName Asm2 Asm3"   # names must not contain "_"
+mkdir -p ren
+for a in $ASM; do sed "s/^>\([^ \t]*\).*/>${a}_\1/" /path/to/fastas/$a.fa > ren/$a.fa; done   # >chr1 -> >RefName_chr1
+set -- $ASM; $R build -t 30 -bo pan.fmr ren/$1.fa; shift
+for a in "$@"; do $R build -t 30 -i pan.fmr -bo tmp.fmr ren/$a.fa && mv tmp.fmr pan.fmr; done   # one at a time
+$R build -i pan.fmr -do pan.fmd && $R ssa -t 30 -s 8 -o pan.fmd.ssa pan.fmd
+for a in $ASM; do
+  awk '/^>/{if(n!="")print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)}END{print n"\t"l}' ren/$a.fa
+done | gzip > pan.fmd.len.gz
+$R lift --ref-prefix=$REF -k 50 -s 200 -t 16 -o pan.k50_s200.lift pan.fmd ren/$REF.fa
+```
 
 **4. Point GRITS at them and check:**
 
@@ -68,6 +81,7 @@ export GRITS_WORKDIR=$PWD                    # required; the variables below ove
 export GRITS_ROPEBWT3=/path/to/ropebwt3-phg/ropebwt3
 export GRITS_INDEX=/path/to/maizeFastaIndex_SampleContig_v2.fmd
 export GRITS_LIFT=/path/to/k50_s200.lift
+export GRITS_REF_PREFIX=B73                  # your reference assembly's name (RefName above) for other panels
 export GRITS_CKPT=/path/to/v6cfullfe-stage2B/last.ckpt
 export GRITS_PYTHON_ENV=$PWD/.pixi/envs/default
 S=.claude/skills/grits-run-sample/scripts
@@ -85,7 +99,8 @@ $S/bed_to_vcf.sh out/NAME NAME                                     # optional VC
 
 Results are in `out/NAME/bed/NAME_<chrom>_imputed.bed` (`chrom start end parent1 parent2`) and
 `out/NAME/decode_summary.txt`. Check its first line, e.g. `route: ... hybrid=False`, against what you know
-about the sample. For expected accuracy and how to read the calls, see [docs/run-sample.md](docs/run-sample.md).
+about the sample. For a new species, first check that reads from one of your own assemblies come back as
+that assembly (see "Other species and panels" in the guide). For expected accuracy and how to read the calls, see [docs/run-sample.md](docs/run-sample.md).
 With [Claude Code](https://claude.com/claude-code), you can instead ask Claude to run GRITS on your sample;
 the `grits-run-sample` skill runs these same steps.
 

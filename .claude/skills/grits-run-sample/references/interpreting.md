@@ -79,6 +79,14 @@ route: disj=0.47 p90=0.35 hybrid=True in_panel=True
   - Each chromosome's final partial window is never called, so expect small uncalled tails at the
     chromosome ends.
 
+## Other species and panels
+
+Everything above was measured on maize. For another species, or a panel padded up to 25 founders, there are no
+accuracy numbers: say so when reporting. `decode_summary.txt` has a `panel:` line giving how many haplotype-rows
+were decoded to a padding founder and left uncalled; a large share suggests the model is not fitting the panel.
+The hybrid threshold and depth settings were calibrated on maize, so check the routing line against what the
+user knows.
+
 ## Depth
 
 The model has two tuned settings, chosen automatically from read density: the 0.1x one up to about
@@ -92,7 +100,8 @@ boundary, and coverage far above 1x was not calibrated.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `check_setup.sh` FAIL on ropebwt3 options | old ropebwt3 build | build ropebwt3-phg `develop` |
-| `expected the 25-founder panel` | wrong index (e.g. a 24-founder one) | use the v2 25-founder index; it must match the checkpoint |
+| `the index has N assemblies but the checkpoint was trained for 25` | panel too large | rebuild the index from at most 25 assemblies |
+| `no contigs named <REF>_* in the index` | `GRITS_REF_PREFIX` doesn't match the index | set it to the reference assembly's name |
 | `unknown preset` | GRITS checkout too old | use a branch with `placedfix_hetdel_hs_peel` |
 | CUDA out of memory | GPU shared or too small | `--batch-size 64`, or wait for a free GPU |
 | `GLIBCXX ... not found` | env's libstdc++ not on the library path | run with `LD_LIBRARY_PATH=$GRITS_LD` |
