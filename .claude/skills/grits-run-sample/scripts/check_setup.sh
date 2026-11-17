@@ -41,9 +41,10 @@ fi
 if [ "${1:-}" = --vcf ]; then
   echo "Optional (VCF output):"
   need "panel VCF" "$GRITS_PANEL_VCF"
-  [ -x "$GRITS_BED2VCF" ] && ok "bed-to-vcf CLI: $GRITS_BED2VCF" || fail "bed-to-vcf CLI not executable: $GRITS_BED2VCF"
-  [ -x "$GRITS_JAVA_HOME_BIN/java" ] && ok "java: $("$GRITS_JAVA_HOME_BIN/java" -version 2>&1 | head -1)" || fail "java 21 not found in $GRITS_JAVA_HOME_BIN"
-  PATH=$GRITS_HTSLIB_BIN:$PATH command -v bcftools >/dev/null && ok "bcftools" || fail "bcftools not found"
+  B=$(command -v "$GRITS_BED2VCF") && ok "bed-to-vcf CLI: $B" || fail "bed-to-vcf CLI not found: $GRITS_BED2VCF (set GRITS_BED2VCF to the sample CLI)"
+  TP=${GRITS_JAVA_HOME_BIN:+$GRITS_JAVA_HOME_BIN:}${GRITS_HTSLIB_BIN:+$GRITS_HTSLIB_BIN:}$PATH
+  J=$(PATH=$TP command -v java) && ok "java: $("$J" -version 2>&1 | head -1)" || fail "java 21 not found (put it on PATH or set GRITS_JAVA_HOME_BIN)"
+  for t in bcftools bgzip tabix; do PATH=$TP command -v $t >/dev/null && ok "$t" || fail "$t not found (put it on PATH or set GRITS_HTSLIB_BIN)"; done
 fi
 [ $bad = 0 ] && echo "All required resources found." || echo "Fix the FAIL lines (see references/inputs.md)."
 exit $bad

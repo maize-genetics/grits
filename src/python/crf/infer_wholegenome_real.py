@@ -22,10 +22,10 @@ Usage:
     LD_LIBRARY_PATH= PYTHONPATH=src \
       python \
       src/python/crf/infer_wholegenome_real.py \
-        --row-dir /local/workdir/.../scratch/simval_eval/ROW_ID --sample NAME \
-        --ckpt /local/workdir/.../checkpoints/diploid-affinity-sim512-h3/d-epoch=04-val_pair_acc=0.6179.ckpt \
+        --row-dir ROW_DIR --sample NAME \
+        --ckpt CHECKPOINT.ckpt \
         --homo-scale 0.5 --drop-idx 23 --win 512 --stride 256 \
-        --out-bed-dir /local/workdir/.../scratch/simval_eval/ROW_ID/bed_wholechrom
+        --out-bed-dir ROW_DIR/bed_wholechrom
 """
 import argparse
 import sys

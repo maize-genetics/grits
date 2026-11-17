@@ -9,7 +9,7 @@ import pytest
 from python.seq_extract.fai import (FaiEntry, FastaFile, FastaIndexError, Region, RegionError, build_fai,
                                     index_fasta, read_fai, revcomp, write_fai)
 
-SAMTOOLS = os.environ.get("SAMTOOLS", "/programs/samtools-1.20/bin/samtools")
+SAMTOOLS = os.environ.get("SAMTOOLS", "samtools")
 HAVE_SAMTOOLS = shutil.which(SAMTOOLS) is not None or Path(SAMTOOLS).exists()
 needs_samtools = pytest.mark.skipif(not HAVE_SAMTOOLS, reason="samtools not available")
 

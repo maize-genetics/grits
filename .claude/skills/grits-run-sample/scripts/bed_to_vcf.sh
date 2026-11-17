@@ -12,7 +12,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 source "${GRITS_ENV:-$HERE/grits.env}"
 [ $# -eq 2 ] || { sed -n '2,9p' "$0"; exit 2; }
 OUT=$1; S=$2
-export PATH=$GRITS_JAVA_HOME_BIN:$GRITS_HTSLIB_BIN:$PATH
+export PATH=${GRITS_JAVA_HOME_BIN:+$GRITS_JAVA_HOME_BIN:}${GRITS_HTSLIB_BIN:+$GRITS_HTSLIB_BIN:}$PATH
 ls "$OUT"/bed/"${S}"_*_imputed.bed > /dev/null || { echo "no BEDs for $S in $OUT/bed (run decode_sample.py)"; exit 1; }
 "$GRITS_BED2VCF" bed-to-vcf --bed-dir="$OUT/bed" --reference-panel-vcf="$GRITS_PANEL_VCF" \
   --out-file="$OUT/${S}_imputed.all.vcf"

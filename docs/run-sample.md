@@ -94,8 +94,9 @@ sample, treat the result with suspicion. This is the most damaging single failur
 $S/bed_to_vcf.sh OUTDIR NAME     # -> OUTDIR/NAME_imputed.vcf.gz, chr1-10, ~45 min
 ```
 
-This needs the panel VCF, the `sample bed-to-vcf` CLI, Java 21 and bcftools/htslib (`GRITS_PANEL_VCF`,
-`GRITS_BED2VCF`, `GRITS_JAVA_HOME_BIN`, `GRITS_HTSLIB_BIN`).
+This needs the panel VCF (`GRITS_PANEL_VCF`), the `sample bed-to-vcf` CLI (`GRITS_BED2VCF`), and Java 21 plus
+bcftools, bgzip and tabix on `PATH`. If they are installed elsewhere, set `GRITS_JAVA_HOME_BIN` and
+`GRITS_HTSLIB_BIN` to their directories.
 
 ## 6. Several samples
 

@@ -63,8 +63,8 @@ out as that founder almost everywhere) before running your own.
 |---|---|
 | `GRITS_PANEL_VCF` | 25-founder panel VCF (about 14 GB). It has one sample column per founder, with names matching the panel. |
 | `GRITS_BED2VCF` | the `sample bed-to-vcf` CLI (Kotlin, in the GRITS repo under the `test_crf_relatedness` Kotlin project; build with `./gradlew installDist`). |
-| `GRITS_JAVA_HOME_BIN` | a directory holding a Java 21 `java` |
-| `GRITS_HTSLIB_BIN` | directories holding `bcftools`, `bgzip` and `tabix` |
+| `GRITS_JAVA_HOME_BIN` | optional: a directory holding a Java 21 `java`, if it is not already on PATH |
+| `GRITS_HTSLIB_BIN` | optional: directories holding `bcftools`, `bgzip` and `tabix`, if they are not already on PATH |
 
 ## Code version
 

@@ -22,7 +22,7 @@ from python.seq_extract.snap import SnapProvider
 
 REPO = Path(__file__).resolve().parents[3]
 SIM = REPO / "experiments" / "seq-extract" / "simulate_pangenome.py"
-SAMTOOLS = os.environ.get("SAMTOOLS", "/programs/samtools-1.20/bin/samtools")
+SAMTOOLS = os.environ.get("SAMTOOLS", "samtools")
 SMALL_ARGS = ["--seed", "7", "--chrom-lens", "60000", "40000", "--founders", "Oh43", "Mo17", "Ki3",
               "--large-rate", "3e-5", "--te-copies", "3", "--n-direct", "150", "--n-ref", "150", "--window", "8000"]
 
@@ -69,7 +69,7 @@ def fx(tmp_path_factory):
 
 def test_fixture_fai_matches_samtools(fx):
     d, meta, asm, work = fx
-    if not Path(SAMTOOLS).exists():
+    if shutil.which(SAMTOOLS) is None and not Path(SAMTOOLS).exists():
         pytest.skip("samtools not available")
     for a in ["B73"] + meta["founders"][:1]:
         asm.get(a)
