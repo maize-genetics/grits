@@ -34,23 +34,60 @@ pixi install --environment gpu
 conda env create -f environment.yml
 ```
 
-## Impute founder haplotypes for your own maize sample (promoted pipeline)
+## Quick start: impute a maize sample
 
-To call which of the 25 maize founders (B73 + 24 NAM) each region of your sample's two haplotypes comes
-from, starting from FASTQ reads:
+GRITS calls, along each chromosome, which pair of the 25 maize founders (B73 + 24 NAM) your sample's two
+haplotypes look most like. Input: FASTQ reads (short reads, ~0.1x-1x). Output: one BED of founder pairs per
+chromosome, and optionally a VCF. Full guide: [docs/run-sample.md](docs/run-sample.md).
+
+**1. Build the aligner** (ropebwt3 with the GRITS `refmap` options):
 
 ```bash
-S=.claude/skills/grits-run-sample/scripts
-$S/check_setup.sh                                   # after setting the GRITS_* paths, see the guide
-$S/align_sample.sh OUTDIR 8 reads_R1.fq.gz reads_R2.fq.gz
-source $S/grits.env && LD_LIBRARY_PATH=$GRITS_LD $GRITS_PY $S/decode_sample.py --dir OUTDIR --sample NAME
-$S/bed_to_vcf.sh OUTDIR NAME                        # optional VCF
+git clone https://github.com/maize-genetics/ropebwt3-phg
+cd ropebwt3-phg && git checkout develop && make && cd ..
 ```
 
-- **Running it by hand:** [docs/run-sample.md](docs/run-sample.md) covers the required resources (ropebwt3-phg
-  `develop`, the 25-founder index, lift and model checkpoint), setup, outputs and expected accuracy.
-- **With Claude Code:** open Claude Code in this repository and ask it to run GRITS on your sample. The
-  `grits-run-sample` skill (`.claude/skills/grits-run-sample/`) drives the same scripts.
+**2. Set up GRITS** (Linux, NVIDIA GPU with ~30 GB free recommended):
+
+```bash
+git clone https://github.com/maize-genetics/grits
+cd grits && pixi install                   # default env; its torch already supports CUDA GPUs
+```
+
+**3. Get the data files.** All three must come from the same 25-founder panel:
+- the model checkpoint `v6cfullfe-stage2B/last.ckpt`, from the Buckler lab (it can't be rebuilt);
+- the v2 25-founder FM-index (`.fmd` + `.fmd.ssa` + `.fmd.len.gz`), from the lab, or rebuilt as described in
+  the full guide;
+- the lift, built once from the index in about 4 min:
+  `ropebwt3 lift --ref-prefix=B73 -k 50 -s 200 -t 16 -o k50_s200.lift INDEX.fmd B73.fa`
+
+**4. Point GRITS at them and check:**
+
+```bash
+export GRITS_WORKDIR=$PWD                    # required; the variables below override the defaults under it
+export GRITS_ROPEBWT3=/path/to/ropebwt3-phg/ropebwt3
+export GRITS_INDEX=/path/to/maizeFastaIndex_SampleContig_v2.fmd
+export GRITS_LIFT=/path/to/k50_s200.lift
+export GRITS_CKPT=/path/to/v6cfullfe-stage2B/last.ckpt
+export GRITS_PYTHON_ENV=$PWD/.pixi/envs/default
+S=.claude/skills/grits-run-sample/scripts
+$S/check_setup.sh                            # must end with "All required resources found."
+```
+
+**5. Run:**
+
+```bash
+$S/align_sample.sh out/NAME 8 NAME_R1.fq.gz NAME_R2.fq.gz        # CPU, ~3 min at 0.1x, ~20 min at 1x
+source $S/grits.env
+LD_LIBRARY_PATH=$GRITS_LD $GRITS_PY $S/decode_sample.py --dir out/NAME --sample NAME   # GPU, 1-2 min
+$S/bed_to_vcf.sh out/NAME NAME                                     # optional VCF, ~45 min
+```
+
+Results are in `out/NAME/bed/NAME_<chrom>_imputed.bed` (`chrom start end parent1 parent2`) and
+`out/NAME/decode_summary.txt`. Check its first line, e.g. `route: ... hybrid=False`, against what you know
+about the sample. For expected accuracy and how to read the calls, see [docs/run-sample.md](docs/run-sample.md).
+With [Claude Code](https://claude.com/claude-code), you can instead ask Claude to run GRITS on your sample;
+the `grits-run-sample` skill runs these same steps.
 
 ## Run (CLI tool)
 

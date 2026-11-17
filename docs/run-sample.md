@@ -28,7 +28,7 @@ S=/path/to/grits/.claude/skills/grits-run-sample/scripts
 | 25-founder FM-index | `GRITS_INDEX` | `.fmd`, with `.fmd.ssa` and `.fmd.len.gz` beside it, ~8 GB. Copy the lab's v2 index. Rebuilding is possible but must match exactly (see `references/inputs.md` in the skill). |
 | Lift | `GRITS_LIFT` | `ropebwt3 lift --ref-prefix=B73 -k 50 -s 200 -t 16 -o k50_s200.lift INDEX.fmd B73.fa`, ~4 min, 10 GB RAM. It must be k50/s200. |
 | Model checkpoint | `GRITS_CKPT` | `v6cfullfe-stage2B/last.ckpt` (23 MB). Get it from the lab; it can't be rebuilt from the assemblies. |
-| Python | `GRITS_PY`, `GRITS_LD` | torch, pytorch_lightning, numpy, pandas. The repo's pixi env works: `pixi install --environment gpu`. |
+| Python | `GRITS_PY`, `GRITS_LD` | torch, pytorch_lightning, numpy, pandas. Use the repo's default pixi env: `pixi install` (on Linux its torch build already supports CUDA GPUs). The `gpu` env is not needed and currently fails to build `mamba-ssm`. |
 | GPU | — | ~30 GB free for a 1x sample; less at 0.1x. CPU works but is slow. |
 | CPU / RAM | — | Alignment uses 10-14 GB RAM. |
 
@@ -48,7 +48,7 @@ export GRITS_ROPEBWT3=/path/to/ropebwt3-phg/ropebwt3
 export GRITS_INDEX=/path/to/maizeFastaIndex_SampleContig_v2.fmd
 export GRITS_LIFT=/path/to/k50_s200.lift
 export GRITS_CKPT=/path/to/v6cfullfe-stage2B/last.ckpt
-export GRITS_PYTHON_ENV=/path/to/grits/.pixi/envs/gpu  # or set GRITS_PY to a python binary
+export GRITS_PYTHON_ENV=/path/to/grits/.pixi/envs/default  # or set GRITS_PY to a python binary
 
 $S/check_setup.sh        # add --vcf to also check the VCF-step resources
 ```

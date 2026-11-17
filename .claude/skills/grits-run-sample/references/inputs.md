@@ -15,7 +15,7 @@ is tied to one specific 25-founder panel, so the index, lift and checkpoint must
 | `GRITS_INDEX` | FM-index of the 25 founder assemblies (`.fmd`), with `.fmd.ssa` and `.fmd.len.gz` beside it | Ask the lab for the v2 maize index (about 8 GB). To rebuild, see below. |
 | `GRITS_LIFT` | anchor map from each founder to B73, `-k 50 -s 200` | `ropebwt3 lift --ref-prefix=B73 -k 50 -s 200 -t 16 -o k50_s200.lift INDEX.fmd B73.fa` takes about 4 min and 10 GB RAM. It must be k50/s200: the read-placement fix relies on dense anchors. |
 | `GRITS_CKPT` | the promoted model checkpoint (`v6cfullfe-stage2B/last.ckpt`, 23 MB) | Ask the lab. It is trained for exactly this panel. |
-| `GRITS_PY`, `GRITS_LD` | Python with torch, pytorch_lightning, numpy, pandas | The repo's pixi environment works: `pixi install --environment gpu`, then set `GRITS_PY` to its python and `GRITS_LD` to its `lib/`. |
+| `GRITS_PY`, `GRITS_LD` | Python with torch, pytorch_lightning, numpy, pandas | The repo's default pixi environment works: `pixi install` (its torch build supports CUDA; the `gpu` environment is not needed and currently fails to build `mamba-ssm`), then set `GRITS_PY` to its python and `GRITS_LD` to its `lib/`. |
 
 A GPU with about 30 GB free is strongly recommended.
 
