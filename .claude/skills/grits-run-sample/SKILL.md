@@ -104,3 +104,5 @@ BED in `OUTDIR/bed`.
   checkpoint and tools. Read it whenever `check_setup.sh` fails or the user is on another machine.
 - `references/interpreting.md`: expected accuracy by sample type and depth, the routing line, and the
   common ways results go wrong. Read it before summarising results, or when results look odd.
+- `docs/run-sample.md` (repo root): the same steps written for a person running them by hand. Point users
+  there if they want to run without Claude. If you change a step here, change it there too.

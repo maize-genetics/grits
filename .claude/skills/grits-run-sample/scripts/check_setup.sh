@@ -13,7 +13,7 @@ echo "Required:"
 [ -x "$GRITS_ROPEBWT3" ] && ok "ropebwt3: $GRITS_ROPEBWT3" || fail "ropebwt3 not executable: $GRITS_ROPEBWT3"
 if [ -x "$GRITS_ROPEBWT3" ]; then
   "$GRITS_ROPEBWT3" refmap 2>&1 | grep -q -- '--err-noclip' && ok "ropebwt3 has the promoted refmap options" \
-    || fail "ropebwt3 is too old (no --err-noclip): build maize-genetics/ropebwt3-phg branch grits-pipeline"
+    || fail "ropebwt3 is too old (no --err-noclip): build maize-genetics/ropebwt3-phg branch develop"
 fi
 need "index" "$GRITS_INDEX"
 need "index .ssa" "$GRITS_INDEX.ssa"

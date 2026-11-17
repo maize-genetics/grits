@@ -34,6 +34,24 @@ pixi install --environment gpu
 conda env create -f environment.yml
 ```
 
+## Impute founder haplotypes for your own maize sample (promoted pipeline)
+
+To call which of the 25 maize founders (B73 + 24 NAM) each region of your sample's two haplotypes comes
+from, starting from FASTQ reads:
+
+```bash
+S=.claude/skills/grits-run-sample/scripts
+$S/check_setup.sh                                   # after setting the GRITS_* paths, see the guide
+$S/align_sample.sh OUTDIR 8 reads_R1.fq.gz reads_R2.fq.gz
+source $S/grits.env && LD_LIBRARY_PATH=$GRITS_LD $GRITS_PY $S/decode_sample.py --dir OUTDIR --sample NAME
+$S/bed_to_vcf.sh OUTDIR NAME                        # optional VCF
+```
+
+- **Running it by hand:** [docs/run-sample.md](docs/run-sample.md) covers the required resources (ropebwt3-phg
+  `develop`, the 25-founder index, lift and model checkpoint), setup, outputs and expected accuracy.
+- **With Claude Code:** open Claude Code in this repository and ask it to run GRITS on your sample. The
+  `grits-run-sample` skill (`.claude/skills/grits-run-sample/`) drives the same scripts.
+
 ## Run (CLI tool)
 
 Conda:

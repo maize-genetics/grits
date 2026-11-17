@@ -91,7 +91,7 @@ boundary, and coverage far above 1x was not calibrated.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `check_setup.sh` FAIL on ropebwt3 options | old ropebwt3 build | build ropebwt3-phg `grits-pipeline` |
+| `check_setup.sh` FAIL on ropebwt3 options | old ropebwt3 build | build ropebwt3-phg `develop` |
 | `expected the 25-founder panel` | wrong index (e.g. a 24-founder one) | use the v2 25-founder index; it must match the checkpoint |
 | `unknown preset` | GRITS checkout too old | use a branch with `placedfix_hetdel_hs_peel` |
 | CUDA out of memory | GPU shared or too small | `--batch-size 64`, or wait for a free GPU |

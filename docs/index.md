@@ -78,6 +78,11 @@ npm run tauri build
 
 ## Documentation Files
 
+### [Run GRITS on your own sample](./run-sample.md)
+The promoted pipeline, by hand: FASTQ reads → ropebwt3 refmap → model decode → per-chromosome BED of
+founder pairs (and optionally a VCF). Covers required resources, setup, outputs and expected accuracy.
+Claude Code users can use the `grits-run-sample` skill instead.
+
 ### [CLI Usage Guide](https://github.com/maize-genetics/grits/wiki/CLI-Usage)
 Complete guide for the Python command-line interface including:
 - Installation with pixi or conda

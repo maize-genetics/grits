@@ -11,7 +11,7 @@ is tied to one specific 25-founder panel, so the index, lift and checkpoint must
 
 | Variable | What it is | How to get it |
 |---|---|---|
-| `GRITS_ROPEBWT3` | ropebwt3 with the GRITS `refmap` options | Build [maize-genetics/ropebwt3-phg](https://github.com/maize-genetics/ropebwt3-phg), branch `grits-pipeline` or later: `make`. `check_setup.sh` confirms the build has `--err-noclip`. |
+| `GRITS_ROPEBWT3` | ropebwt3 with the GRITS `refmap` options | Build [maize-genetics/ropebwt3-phg](https://github.com/maize-genetics/ropebwt3-phg), branch `develop` (PR #10 merged the GRITS options there): `git clone https://github.com/maize-genetics/ropebwt3-phg && cd ropebwt3-phg && git checkout develop && make`. `check_setup.sh` confirms the build has `--err-noclip`. |
 | `GRITS_INDEX` | FM-index of the 25 founder assemblies (`.fmd`), with `.fmd.ssa` and `.fmd.len.gz` beside it | Ask the lab for the v2 maize index (about 8 GB). To rebuild, see below. |
 | `GRITS_LIFT` | anchor map from each founder to B73, `-k 50 -s 200` | `ropebwt3 lift --ref-prefix=B73 -k 50 -s 200 -t 16 -o k50_s200.lift INDEX.fmd B73.fa` takes about 4 min and 10 GB RAM. It must be k50/s200: the read-placement fix relies on dense anchors. |
 | `GRITS_CKPT` | the promoted model checkpoint (`v6cfullfe-stage2B/last.ckpt`, 23 MB) | Ask the lab. It is trained for exactly this panel. |
