@@ -63,7 +63,8 @@ def _encode(model, feats, starts, win, ext_emb, device, bs):
     for i in range(0, len(starts), bs):
         Xb = Xs[i:i + bs].to(device)
         eb = ext_emb.expand(Xb.shape[0], -1, -1) if ext_emb is not None else None
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        dev_type = torch.device(device).type
+        with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=dev_type == "cuda"):
             emis_p, _g, c = model(Xb, None, eb)
         em.append(emis_p.float().cpu())
         cc.append(c.float().cpu())

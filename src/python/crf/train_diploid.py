@@ -38,168 +38,17 @@ from torch.utils.data import Dataset, DataLoader
 
 from python.crf.train_crf import FounderPathEncoder
 from python.crf.train_haploid import make_splits
-
-# --------------------------------------------------------------------------- #
-#  Pair-state CRF — state-count-agnostic recursion with a pair switch matrix.  #
-#  Transition cost -c*nsw, nsw in {0,1,2}: a two-chromosome switch costs        #
-#  exp(-2c) = exp(-c)^2, i.e. two INDEPENDENT chromosome switches (matches the  #
-#  generative sim). No hard ban — simultaneous switches are rare, not illegal.  #
-# --------------------------------------------------------------------------- #
-
-@torch.jit.script
-def _dcrf_nll(emis: torch.Tensor, c: torch.Tensor, nsw: torch.Tensor,
-              stay_bonus: torch.Tensor, tags: torch.Tensor) -> torch.Tensor:
-    """Pair-state CRF NLL. emis [B,T,P], c [B,T], nsw/stay [P,P], tags [B,T]."""
-    B, T, P = emis.shape
-    # fp32 partition (see train_haploid._crf_nll): the sequential logsumexp
-    # accumulation needs fp32 precision; encoder stays bf16, no matmuls here.
-    emis = emis.float()
-    c = c.float()
-    nsw = nsw.float()
-    stay_bonus = stay_bonus.float()
-    stay_mask = (nsw == 0).float()
-    a = emis[:, 0]
-    for t in range(1, T):
-        tr_t = -c[:, t, None, None] * nsw[None] + stay_bonus * stay_mask[None]
-        a = emis[:, t] + torch.logsumexp(a.unsqueeze(2) + tr_t, dim=1)
-    log_Z = torch.logsumexp(a, dim=1)
-
-    bi = torch.arange(B, device=emis.device)
-    t_idx = torch.arange(T, device=emis.device)
-    emis_score = emis[bi.unsqueeze(1), t_idx.unsqueeze(0), tags].sum(1)
-    # transition score along the true path: -c*nsw[prev,next] + stay where equal
-    prev = tags[:, :-1]
-    nxt = tags[:, 1:]
-    nsw_path = nsw[prev, nxt]                                   # [B,T-1]
-    stay_path = (nsw_path == 0).float()
-    tr_score = (-c[:, 1:] * nsw_path + stay_bonus * stay_path).sum(1)
-    return (log_Z - emis_score - tr_score).mean()
-
-
-@torch.jit.script
-def _dcrf_viterbi(emis: torch.Tensor, c: torch.Tensor, nsw: torch.Tensor,
-                  stay_bonus: torch.Tensor) -> torch.Tensor:
-    """Pair-state Viterbi. emis [B,T,P] -> [B,T] pair indices."""
-    B, T, P = emis.shape
-    stay_mask = (nsw == 0).float()
-    delta = emis[:, 0]
-    bp = torch.zeros(T - 1, B, P, dtype=torch.long, device=emis.device)
-    for t in range(1, T):
-        tr_t = -c[:, t, None, None] * nsw[None] + stay_bonus * stay_mask[None]
-        sc = delta.unsqueeze(2) + tr_t
-        best, idx = sc.max(dim=1)
-        delta = emis[:, t] + best
-        bp[t - 1] = idx
-    path = torch.zeros(B, T, dtype=torch.long, device=emis.device)
-    path[:, T - 1] = delta.argmax(dim=1)
-    for t in range(T - 2, -1, -1):
-        path[:, t] = bp[t].gather(1, path[:, t + 1].unsqueeze(1)).squeeze(1)
-    return path
-
-
-def _dcrf_marginal(emis: torch.Tensor, c: torch.Tensor, nsw: torch.Tensor,
-                   stay_bonus: torch.Tensor) -> torch.Tensor:
-    """Posterior max-marginal (forward-backward) decode. emis [B,T,P] -> [B,T].
-
-    Viterbi returns the single highest-scoring JOINT path; this returns the
-    per-site argmax of the posterior marginal P(state_t | x), which maximises
-    expected PER-SITE accuracy -- the quantity we actually report. Same forward
-    recursion as the partition (_dcrf_nll) plus a symmetric backward pass; the
-    transition into time t uses c[:,t], matching the forward convention."""
-    emis = emis.float()
-    c = c.float()
-    nsw = nsw.float()
-    stay_bonus = stay_bonus.float()
-    stay_mask = (nsw == 0).float()
-    B, T, P = emis.shape
-
-    alpha = torch.empty(B, T, P, device=emis.device)
-    alpha[:, 0] = emis[:, 0]
-    for t in range(1, T):
-        tr_t = -c[:, t, None, None] * nsw[None] + stay_bonus * stay_mask[None]
-        alpha[:, t] = emis[:, t] + torch.logsumexp(alpha[:, t - 1].unsqueeze(2) + tr_t, dim=1)
-
-    beta = torch.zeros(B, P, device=emis.device)
-    pred = torch.empty(B, T, dtype=torch.long, device=emis.device)
-    pred[:, T - 1] = (alpha[:, T - 1] + beta).argmax(dim=1)
-    for t in range(T - 2, -1, -1):
-        tr_n = -c[:, t + 1, None, None] * nsw[None] + stay_bonus * stay_mask[None]  # [B,p=t,q=t+1]
-        msg = emis[:, t + 1] + beta                                                 # [B,P] over q
-        beta = torch.logsumexp(tr_n + msg.unsqueeze(1), dim=2)                      # [B,P] over p=t
-        pred[:, t] = (alpha[:, t] + beta).argmax(dim=1)
-    return pred
-
-
-def _dcrf_viterbi_factored(emis, c, nsw, stay_bonus, pi, pj):
-    """O(T·(P+K)) pair-state Viterbi — bit-identical to _dcrf_viterbi but it exploits
-    the factored transition (-c·nsw, nsw∈{0,1,2}=per-chromosome switches): the max over
-    P prev-states reduces to per-FOUNDER maxima. The step from p→q=(i,j) is either a
-    stay (p=q), one switch (p shares founder i or j → use best[i]/best[j]), or two
-    switches (any p → global max). **Faster on CPU (~4.6× at P=325), SLOWER on GPU**
-    (it trades one fused [B,P,P] kernel for several launch-bound ops) — use for CPU
-    whole-genome decode. emis [B,T,P], c [B,T] -> [B,T] pair indices."""
-    emis = emis.float(); c = c.float(); stay = stay_bonus.float()
-    B, T, P = emis.shape
-    dev = emis.device
-    K = int(max(pi.max(), pj.max())) + 1
-    piB, pjB = pi.expand(B, P), pj.expand(B, P)
-    idxP = torch.arange(P, device=dev).expand(B, P)
-    catidx = torch.cat([piB, pjB], 1)
-    bp = torch.empty(T, B, P, dtype=torch.long, device=dev)
-    delta = emis[:, 0].clone()
-    bp[0] = idxP
-    for t in range(1, T):
-        best = torch.full((B, K), float("-inf"), device=dev)
-        best.scatter_reduce_(1, catidx, torch.cat([delta, delta], 1),
-                             reduce="amax", include_self=True)
-        mi, mj = best.gather(1, piB), best.gather(1, pjB)
-        # argbest per founder = lowest pair index achieving best (matches torch.max ties)
-        cand_i = torch.where(delta == mi, idxP, torch.full_like(idxP, P))
-        cand_j = torch.where(delta == mj, idxP, torch.full_like(idxP, P))
-        argbest = torch.full((B, K), P, dtype=torch.long, device=dev)
-        argbest.scatter_reduce_(1, piB, cand_i, reduce="amin", include_self=True)
-        argbest.scatter_reduce_(1, pjB, cand_j, reduce="amin", include_self=True)
-        use_i = mi >= mj
-        m1 = torch.where(use_i, mi, mj)                                     # one-switch value
-        bp1 = torch.where(use_i, argbest.gather(1, piB), argbest.gather(1, pjB))
-        gmax, argg = delta.max(1)                                          # two-switch
-        ct = c[:, t, None]
-        vals = torch.stack([delta + stay, -ct + m1,
-                            (-2 * ct + gmax[:, None]).expand(B, P)])        # [3,B,P]
-        bps = torch.stack([idxP, bp1, argg[:, None].expand(B, P)])
-        bi = vals.argmax(0)
-        delta = emis[:, t] + vals.gather(0, bi[None])[0]
-        bp[t] = bps.gather(0, bi[None])[0]
-    path = torch.empty(B, T, dtype=torch.long, device=dev)
-    path[:, T - 1] = delta.argmax(1)
-    for t in range(T - 2, -1, -1):
-        path[:, t] = bp[t + 1].gather(1, path[:, t + 1:t + 2]).squeeze(1)
-    return path
-
-
-def build_pair_tables(K):
-    """Unordered founder pairs over K states. Returns:
-      pi, pj      [P]      sorted member indices of each pair (i<=j)
-      pair_table  [K,K]    (a,b) -> pair index (order-insensitive)
-      nsw_pair    [P,P]    min #chromosome switches between pairs (0,1,2)
-    """
-    pairs = [(i, j) for i in range(K) for j in range(i, K)]
-    P = len(pairs)
-    idx = {p: k for k, p in enumerate(pairs)}
-    pi = torch.tensor([p[0] for p in pairs], dtype=torch.long)
-    pj = torch.tensor([p[1] for p in pairs], dtype=torch.long)
-
-    pair_table = torch.zeros(K, K, dtype=torch.long)
-    for a in range(K):
-        for b in range(K):
-            pair_table[a, b] = idx[(min(a, b), max(a, b))]
-
-    nsw = torch.zeros(P, P, dtype=torch.float32)
-    for p, (a, b) in enumerate(pairs):
-        for q, (c, d) in enumerate(pairs):
-            s = min((a != c) + (b != d), (a != d) + (b != c))
-            nsw[p, q] = float(s)
-    return pi, pj, pair_table, nsw
+from python.crf.callbacks import EMACallback
+# Pair-state CRF kernels — extracted verbatim into crf_kernels.py (2026-09,
+# experiments/simulator-indels/TRAINING_PLAN.md §2) so the new indel-aware
+# model (train_diploid_indel.py) shares them instead of duplicating them.
+# Re-imported into this module's namespace (not just used locally) so every
+# existing `from python.crf.train_diploid import _dcrf_viterbi`-style call
+# site elsewhere in the repo keeps working unchanged.
+from python.crf.crf_kernels import (
+    _dcrf_nll, _dcrf_viterbi, _dcrf_marginal, _dcrf_viterbi_factored,
+    build_pair_tables,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -305,6 +154,86 @@ def _founder_affinity(feats_block):
     Reads only (no labels), so identical at inference."""
     r = feats_block.reshape(-1, feats_block.shape[-1]).mean(0).astype(np.float32)  # [K]
     return np.stack([r, r - r.mean()], axis=-1)                     # [K,2] bounded
+
+
+def estimate_inbreeding_coef(affinity_rate):
+    """Genome-wide zygosity estimate from _founder_affinity's raw match-rate
+    column [K]: background-corrected gap between the top-1 and top-2 founder.
+    Real reads carry a substantial non-zero match rate even for unrelated
+    founders (pangenome background co-support, not signal) -- the top-2 rate
+    alone isn't near zero for a true hybrid, so the gap must be normalized
+    against the rate of an uninvolved (rank>=3) founder, not against 0.
+    1.0 = one dominant founder (inbred), 0.0 = two comparably-elevated
+    founders (outbred/hybrid). Verified on real IDX-INBRED/IDX-HYB samples --
+    see tests/python/crf/test_real_data_affinity.py."""
+    order = np.argsort(-affinity_rate)
+    r1, r2 = affinity_rate[order[0]], affinity_rate[order[1]]
+    bg = np.median(affinity_rate[order[2:]])
+    denom = r1 - bg
+    if denom <= 1e-6:
+        return 0.0
+    return float(1.0 - np.clip((r2 - bg) / denom, 0.0, 1.0))
+
+
+def homo_scale_from_affinity(M, percentile=90, inbred_thresh=0.5):
+    """Single --homo-scale value for a whole individual, auto-detecting
+    "selfing-type" (INBRED or RIL -- truly homozygous at every site,
+    homo_scale=0.0) vs a true outbred F1 hybrid (heterozygous at every
+    site, homo_scale=1.0) from reads alone, instead of applying the
+    checkpoint's fixed homo_penalty uniformly regardless of evidence
+    (infer_wholegenome_real.py's documented gap).
+
+    Genome-wide affinity CANNOT make this call: a RIL individual is a
+    mosaic of homozygous-founder-A / homozygous-founder-B blocks, so
+    pooled over the whole genome it shows two comparably-elevated
+    founders -- identical in shape to a true hybrid's constant
+    heterozygous pair. The two kinds are instead distinguished by whether
+    the individual's most-confident windows ever show a SINGLE dominant
+    founder: a RIL block, though genuinely homozygous, is noisy at real
+    0.1x per-window coverage (T~512 sites), so its per-window estimate
+    only clears a high threshold in its best windows -- but it does clear
+    it, repeatedly. A true hybrid never does, at any window, because
+    there's no single-founder-dominant genomic region to find. Taking the
+    90th percentile of the per-window estimate (not the genome-wide-pooled
+    mean, and not a per-window-varying scale) cleanly separates the two:
+    real INBRED p90~0.73-0.81, real RIL2 p90~0.74-0.78 (indistinguishable
+    from INBRED), real HYB p90~0.31-0.33 (2x lower, zero overlap across 15
+    real samples) -- see tests/python/crf/test_real_data_affinity.py.
+
+    Once an individual is correctly classified, the right policy is a
+    SINGLE constant scale for the whole individual, not a per-window one:
+    RIL truly is homozygous everywhere, so a per-window scale that reverts
+    to the penalty in "ambiguous" (but still truly homozygous) windows
+    underperforms (~73% real RIL2 pair_acc) the simpler always-0 policy
+    used here (~98.6%). Recovers 100% INBRED / 98.9% HYB / 98.6% RIL2 real
+    pair_acc, all from this one function -- see
+    TestRealDataEndToEndPairAccuracy / TestRealRIL2EndToEndPairAccuracy.
+
+    M: [N,T,K] binary match indicator for the WHOLE individual (all
+    windows), NOT pre-aggregated."""
+    win_rate = M.mean(axis=1)                                     # [N,K]
+    per_window_est_F = _estimate_inbreeding_coef_batch(win_rate)   # [N]
+    p_val = np.percentile(per_window_est_F, percentile)
+    return 0.0 if p_val > inbred_thresh else 1.0
+
+
+def _estimate_inbreeding_coef_batch(rates):
+    """Vectorized estimate_inbreeding_coef over [N,K] -> [N] (one row per
+    window). Numerically identical to calling estimate_inbreeding_coef on
+    each row in a Python loop, but computed via argsort/take_along_axis
+    across the whole batch at once -- the loop was the actual bottleneck in
+    homo_scale_from_affinity at real high-coverage N (tens of thousands of
+    windows per individual at 2.0x), not the model inference or the
+    prediction-vs-truth comparison."""
+    order = np.argsort(-rates, axis=1)
+    r1 = np.take_along_axis(rates, order[:, :1], axis=1)[:, 0]
+    r2 = np.take_along_axis(rates, order[:, 1:2], axis=1)[:, 0]
+    bg = np.median(np.take_along_axis(rates, order[:, 2:], axis=1), axis=1)
+    denom = r1 - bg
+    out = np.zeros(len(rates), dtype=np.float64)
+    valid = denom > 1e-6
+    out[valid] = 1.0 - np.clip((r2[valid] - bg[valid]) / denom[valid], 0.0, 1.0)
+    return out
 
 
 class DiploidAffinityDataset(PreWindowedDiploidDataset):
@@ -487,6 +416,12 @@ class GRITSCRFDiploid(pl.LightningModule):
         pair_acc, hap_acc = self._accuracy(emis_p, c, batch["h1"], batch["h2"])
         self.log("val/loss", loss, prog_bar=True)
         self.log("val/pair_acc", pair_acc, prog_bar=True)
+        self.log("val_pair_acc", pair_acc)              # slash-free alias: ModelCheckpoint's
+                                                          # filename= can't safely interpolate a
+                                                          # metric name containing "/" (Lightning
+                                                          # treats it as a path separator and
+                                                          # scatters checkpoints into a stray
+                                                          # val/ subdir) — see callbacks below.
         self.log("val/hap_acc", hap_acc, prog_bar=True)
         self.log("val/gate", g.mean())
         return loss
@@ -540,52 +475,6 @@ class GRITSCRFDiploid(pl.LightningModule):
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
             opt, mode="min", factor=0.5, patience=5)
         return {"optimizer": opt, "lr_scheduler": sched, "monitor": "val/loss"}
-
-
-class EMACallback(pl.Callback):
-    """Exponential moving average of the weights. The EMA is swapped into the model
-    for every validation pass (so val/pair_acc — what ModelCheckpoint selects on —
-    and the saved checkpoint both reflect the averaged weights) and swapped back out
-    when training resumes. Targets the late-epoch oscillation directly: even when the
-    raw weights spike out of the basin, their moving average stays in it, so the
-    averaged decode is far steadier than any single late-epoch snapshot."""
-    def __init__(self, decay=0.999):
-        self.decay = decay
-        self.shadow = None
-        self._backup = None
-
-    def on_train_start(self, trainer, pl_module):
-        self.shadow = {k: v.detach().clone().float()
-                       for k, v in pl_module.state_dict().items()
-                       if v.is_floating_point()}
-
-    @torch.no_grad()
-    def on_train_batch_end(self, trainer, pl_module, *a):
-        if self.shadow is None:
-            return
-        d = self.decay
-        for k, v in pl_module.state_dict().items():
-            if k in self.shadow:
-                self.shadow[k].mul_(d).add_(v.detach().float(), alpha=1.0 - d)
-
-    @torch.no_grad()
-    def on_validation_start(self, trainer, pl_module):
-        if self.shadow is None or self._backup is not None:
-            return                                          # skip pre-train sanity val
-        self._backup = {k: v.detach().clone()
-                        for k, v in pl_module.state_dict().items() if k in self.shadow}
-        for k, v in pl_module.state_dict().items():
-            if k in self.shadow:
-                v.copy_(self.shadow[k].to(v.dtype))
-
-    @torch.no_grad()
-    def on_train_batch_start(self, trainer, pl_module, *a):
-        if self._backup is None:                            # restore raw weights once
-            return
-        sd = pl_module.state_dict()
-        for k, v in self._backup.items():
-            sd[k].copy_(v)
-        self._backup = None
 
 
 def parse_args():
@@ -646,6 +535,9 @@ def parse_args():
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--devices", type=int, default=1)
     p.add_argument("--run-name", default="diploid-pair")
+    p.add_argument("--resume", default=None,
+                   help="Path to a .ckpt to resume training from (optimizer/scheduler "
+                        "state included; passed as Trainer.fit(ckpt_path=...)).")
     return p.parse_args()
 
 
@@ -687,10 +579,13 @@ def main():
     # long-block data even as Viterbi accuracy stays good, so selecting on loss
     # can discard the best model. Accuracy is the quantity we report.
     callbacks = [
-        ModelCheckpoint(dirpath=str(ckpt_dir), monitor="val/pair_acc",
-                        mode="max", save_top_k=2,
-                        filename="d-{epoch:02d}-{val/pair_acc:.4f}"),
-        EarlyStopping(monitor="val/pair_acc", mode="max", patience=args.patience),
+        # monitor the slash-free "val_pair_acc" alias (logged alongside "val/pair_acc"):
+        # a filename= token containing "/" makes Lightning scatter checkpoints into a
+        # stray val/ subdir instead of writing directly under ckpt_dir.
+        ModelCheckpoint(dirpath=str(ckpt_dir), monitor="val_pair_acc",
+                        mode="max", save_top_k=2, save_last=True,
+                        filename="d-{epoch:02d}-{val_pair_acc:.4f}"),
+        EarlyStopping(monitor="val_pair_acc", mode="max", patience=args.patience),
     ]
     if args.ema:
         callbacks.append(EMACallback(args.ema_decay))
@@ -700,7 +595,7 @@ def main():
         accelerator="auto", devices=args.devices, precision=args.precision,
         val_check_interval=(args.val_check_interval or None),
         gradient_clip_val=args.grad_clip)
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, train_loader, val_loader, ckpt_path=args.resume)
     print(f"Best checkpoint: {callbacks[0].best_model_path}")
 
 

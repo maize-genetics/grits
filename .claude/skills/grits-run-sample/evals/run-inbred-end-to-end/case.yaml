@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: run-inbred-end-to-end
+expected_outcome: |
+  The sample is aligned with the promoted refmap settings and decoded with the promoted model (preset placedfix_hetdel_hs_peel, route=True, knockout homoroute), producing per-chromosome founder-pair BEDs; the reply summarises founders per chromosome, notes the sample was routed non-hybrid (homozygous calls), and warns that Ia453 is not one of the 25 panel founders so calls mean 'closest founder'.

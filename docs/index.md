@@ -78,6 +78,11 @@ npm run tauri build
 
 ## Documentation Files
 
+### [Run GRITS on your own sample](./run-sample.md)
+The promoted pipeline, by hand: FASTQ reads → ropebwt3 refmap → model decode → per-chromosome BED of
+founder pairs (and optionally a VCF). Covers required resources, setup, outputs and expected accuracy.
+Claude Code users can use the `grits-run-sample` skill instead.
+
 ### [CLI Usage Guide](https://github.com/maize-genetics/grits/wiki/CLI-Usage)
 Complete guide for the Python command-line interface including:
 - Installation with pixi or conda
@@ -93,6 +98,13 @@ Comprehensive guide for the desktop application including:
 - Python integration and bootstrap system
 - Data visualization features
 - Platform-specific troubleshooting
+
+### [Session Handoff](./HANDOFF.md)
+Current project status and research history — start here for "what's
+being worked on and why." Research/evaluation work lives under
+[`experiments/`](../experiments/) as self-contained directories, each
+with its own `README.md` (setup, exact commands, results); the most
+recent `HANDOFF.md` entry links directly to the relevant ones.
 
 ## Architecture Overview
 

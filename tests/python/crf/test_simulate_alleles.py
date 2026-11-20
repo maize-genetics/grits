@@ -1,0 +1,1704 @@
+"""Tests for the --simulate-indels indel-modeling additions to
+simulate_alleles.py (experiments/simulator-indels/PLAN.md). Run in
+isolation: `pixi run -- pytest tests/python/crf/test_simulate_alleles.py -v`
+-- several pre-existing, unrelated test files in this repo already fail
+at collection time, so the full-suite baseline is not green.
+"""
+import numpy as np
+import pytest
+
+from python.crf.simulate_alleles import (
+    TERN_DEL, TERN_DIV, TERN_MATCH, TERN_PAD,
+    DIST_PAD, DIST_SAT, LABEL_PAD, DIST_LOG_SCALE,
+    _indel_lengths, _encode_dist, _anchor_distance, _gather_by_lineage,
+    _indel_tracts, _draw_lineages, _coalescent_feats, _good_mask, simulate,
+    _indel_suppressed_rate, _row_counts, _sample_rows, _indel_chunk,
+    _lineage_indels, _overlay_indels, _lineage_substitutions, _replacement_indels,
+    _run_length, _refmap_observation,
+)
+
+# --- golden hashes: pre-change simulate() output on fixed args/seed, ------
+# recorded BEFORE any --simulate-indels code was added (see this branch's
+# commit history / experiments/simulator-indels/PLAN.md). Every new rng
+# call this feature adds sits inside an `if simulate_indels:` (or
+# `per_gamete=True`) branch, so the flag-off path's draw sequence -- and
+# therefore this hash -- must never change.
+_GOLDEN_COALESCENT_SHA256 = "382822cc04ab24849f39776285511e35b6bcab8a938bb3ad7c9d383410ebb2aa"
+_GOLDEN_INDEPENDENT_SHA256 = "9f67f97fbb28fde38e83b07ecb2d443aaa7b626ff7ff8c9b1d703baa224c7911"
+
+
+# --- _encode_dist -----------------------------------------------------
+
+def test_encode_dist_shape_dtype_range():
+    d = np.arange(0, 200_000)
+    code = _encode_dist(d)
+    assert code.dtype == np.int8
+    assert code.shape == d.shape
+    assert (code >= 0).all() and (code <= DIST_SAT - 1).all()
+
+
+def test_encode_dist_zero_at_zero():
+    assert _encode_dist(np.array([0]))[0] == 0
+
+
+def test_encode_dist_monotone_nondecreasing():
+    d = np.arange(0, 100_000)
+    code = _encode_dist(d).astype(np.int64)
+    assert (np.diff(code) >= 0).all()
+
+
+def test_encode_dist_tiny_exact():
+    # code = round(8*log2(1+d)): d=0->0, 1->8, 3->16, 7->24, 255->64
+    got = _encode_dist(np.array([0, 1, 3, 7, 255]), scale=8.0)
+    np.testing.assert_array_equal(got, np.array([0, 8, 16, 24, 64], dtype=np.int8))
+
+
+# --- _anchor_distance ---------------------------------------------------
+
+def test_anchor_distance_shape_dtype():
+    del_mask = np.zeros((3, 5, 20), dtype=bool)
+    dist = _anchor_distance(del_mask)
+    assert dist.shape == del_mask.shape
+    assert dist.dtype == np.int32
+    assert (dist >= 0).all()
+
+
+def test_anchor_distance_zero_outside_tracts():
+    rng = np.random.default_rng(0)
+    del_mask = rng.random((4, 6, 40)) < 0.3
+    dist = _anchor_distance(del_mask)
+    assert (dist[~del_mask] == 0).all()
+    assert (dist[del_mask] >= 1).all()
+
+
+def test_anchor_distance_interior_run_tiny_exact():
+    # Real anchors flank both sides of every deleted run here, so this case
+    # is unaffected by the no-fabricated-edge-anchor design (see docstring).
+    d = np.array([False, True, True, True, False, False, True, False])
+    got = _anchor_distance(d)
+    np.testing.assert_array_equal(got, np.array([0, 1, 2, 1, 0, 0, 1, 0]))
+
+
+def test_anchor_distance_left_edge_run_tiny_exact():
+    # [T,T,F]: only real anchor is at index 2. site1 is 1 away (real anchor),
+    # site0 is 2 away (real anchor) -- NOT 1, which would require fabricating
+    # a virtual anchor at the array's own left edge (index -1). This is the
+    # specific behavior this implementation deliberately avoids (see
+    # _anchor_distance's docstring) -- verified independently before writing
+    # the implementation, not copied from an unverified design note.
+    d = np.array([True, True, False])
+    got = _anchor_distance(d)
+    np.testing.assert_array_equal(got, np.array([2, 1, 0]))
+
+
+def test_anchor_distance_no_real_anchor_saturates():
+    # Entirely-deleted row, R=4: no real anchor anywhere, so every position
+    # must report a distance that exceeds any possible real (in-array)
+    # distance (which is bounded by R-1=3) -- not a small fabricated value.
+    d = np.array([True, True, True, True])
+    got = _anchor_distance(d)
+    assert (got > 3).all()
+
+
+def test_anchor_distance_matches_bruteforce_oracle_fuzz():
+    def bruteforce(del_mask):
+        R = del_mask.shape[-1]
+        flat = del_mask.reshape(-1, R)
+        out = np.zeros(flat.shape, dtype=np.int64)
+        has_no_anchor = np.zeros(flat.shape[0], dtype=bool)
+        for i in range(flat.shape[0]):
+            row = flat[i]
+            anchors = np.flatnonzero(~row)
+            if anchors.size == 0:
+                has_no_anchor[i] = True
+                continue
+            for t in range(R):
+                out[i, t] = 0 if not row[t] else int(np.min(np.abs(anchors - t)))
+        return out.reshape(del_mask.shape), has_no_anchor.reshape(del_mask.shape[:-1])
+
+    rng = np.random.default_rng(1)
+    for _ in range(200):
+        n, R = rng.integers(1, 4), rng.integers(1, 15)
+        p = rng.uniform(0.0, 1.0)
+        del_mask = rng.random((n, R)) < p
+        expect, no_anchor = bruteforce(del_mask)
+        got = _anchor_distance(del_mask)
+        # rows with a real anchor somewhere: exact match
+        keep = ~np.repeat(no_anchor[:, None], R, axis=1)
+        np.testing.assert_array_equal(got[keep], expect[keep])
+        # rows with no real anchor at all: every deleted position must
+        # exceed the max possible real in-array distance (R-1)
+        if no_anchor.any():
+            assert (got[no_anchor] > R - 1).all()
+
+
+# --- _gather_by_lineage ---------------------------------------------------
+
+def test_gather_by_lineage_matches_take_along_axis():
+    rng = np.random.default_rng(2)
+    n, M, K, T = 3, 5, 4, 6
+    a_lin = rng.integers(0, 100, size=(n, M, T))
+    lineage = rng.integers(0, M, size=(n, K, T))
+    got = _gather_by_lineage(a_lin, lineage)
+    expect = np.take_along_axis(a_lin, lineage, axis=1)
+    np.testing.assert_array_equal(got, expect)
+    assert got.shape == (n, K, T)
+
+
+def test_gather_by_lineage_ibd_founders_share_content():
+    # Two founders assigned the same lineage at every site must gather
+    # byte-identical content -- this is the mechanism that makes indel
+    # presence IBD-coupled with SNP sharing (PLAN SS2.2).
+    n, M, K, T = 1, 3, 4, 10
+    a_lin = np.arange(n * M * T).reshape(n, M, T)
+    lineage = np.zeros((n, K, T), dtype=np.int64)
+    lineage[:, 0, :] = 1
+    lineage[:, 2, :] = 1   # founders 0 and 2 share lineage 1 everywhere
+    lineage[:, 1, :] = 0
+    lineage[:, 3, :] = 2
+    got = _gather_by_lineage(a_lin, lineage)
+    np.testing.assert_array_equal(got[:, 0, :], got[:, 2, :])
+    assert not np.array_equal(got[:, 0, :], got[:, 1, :])
+
+
+# --- _indel_lengths ---------------------------------------------------
+
+def test_indel_lengths_shape_dtype_range():
+    rng = np.random.default_rng(3)
+    L = _indel_lengths(rng, 1000, large_frac=0.03, small_alpha=1.7,
+                        small_max=50, large_logmean=8.6, large_logsd=1.6,
+                        max_len=65536)
+    assert L.shape == (1000,)
+    assert L.dtype == np.int64
+    assert (L >= 1).all() and (L <= 65536).all()
+
+
+def test_indel_lengths_zero_large_frac_is_all_small():
+    rng = np.random.default_rng(4)
+    L = _indel_lengths(rng, 500, large_frac=0.0, small_alpha=1.7,
+                        small_max=50, large_logmean=8.6, large_logsd=1.6,
+                        max_len=65536)
+    assert (L <= 50).all()
+
+
+def test_indel_lengths_one_large_frac_is_all_large():
+    rng = np.random.default_rng(5)
+    L = _indel_lengths(rng, 500, large_frac=1.0, small_alpha=1.7,
+                        small_max=50, large_logmean=8.6, large_logsd=1.6,
+                        max_len=65536)
+    assert (L >= 51).all()
+
+
+def test_indel_lengths_matches_independent_reference_fuzz():
+    def reference(rng, size, large_frac, small_alpha, small_max,
+                  large_logmean, large_logsd, max_len):
+        # Independently reimplemented (Python loop + branching, not
+        # vectorized where/clip) but fed the SAME rng draw sequence, per
+        # this repo's test_accuracy.py:183 precedent for probabilistic code.
+        u = rng.random(size)
+        z = rng.zipf(small_alpha, size)
+        ln = rng.lognormal(large_logmean, large_logsd, size)
+        out = np.empty(size, dtype=np.int64)
+        for i in range(size):
+            if u[i] < large_frac:
+                v = round(ln[i])
+                v = max(small_max + 1, min(max_len, v))
+            else:
+                v = max(1, min(small_max, int(z[i])))
+            out[i] = v
+        return out
+
+    param_rng = np.random.default_rng(6)
+    for _ in range(200):
+        large_frac = float(param_rng.uniform(0.0, 1.0))
+        small_alpha = float(param_rng.uniform(1.05, 3.0))
+        small_max = int(param_rng.integers(2, 200))
+        max_len = int(param_rng.integers(small_max + 10, 1_000_000))
+        large_logmean = float(param_rng.uniform(3.0, 12.0))
+        large_logsd = float(param_rng.uniform(0.5, 2.5))
+        size = int(param_rng.integers(1, 50))
+        seed = int(param_rng.integers(0, 2**31 - 1))
+
+        got = _indel_lengths(np.random.default_rng(seed), size, large_frac,
+                              small_alpha, small_max, large_logmean,
+                              large_logsd, max_len)
+        expect = reference(np.random.default_rng(seed), size, large_frac,
+                            small_alpha, small_max, large_logmean,
+                            large_logsd, max_len)
+        np.testing.assert_array_equal(got, expect)
+
+
+# --- _indel_tracts ---------------------------------------------------
+
+_TRACT_KW = dict(density=2.65e-3, ins_frac=0.5, large_frac=0.027,
+                  small_alpha=1.7, small_max=50, large_logmean=8.6,
+                  large_logsd=1.6, max_len=65536)
+
+
+def test_indel_tracts_shape_dtype():
+    rng = np.random.default_rng(20)
+    del_mask, ins_bp = _indel_tracts(rng, n=2, M=3, R=500, **_TRACT_KW)
+    assert del_mask.shape == (2, 3, 500)
+    assert ins_bp.shape == (2, 3, 500)
+    assert del_mask.dtype == bool
+    assert ins_bp.dtype == np.int32
+    assert (ins_bp >= 0).all()
+    assert (ins_bp[del_mask] == 0).all()
+
+
+def test_indel_tracts_zero_density_is_empty():
+    rng = np.random.default_rng(21)
+    del_mask, ins_bp = _indel_tracts(rng, n=2, M=3, R=500,
+                                      density=0.0, ins_frac=0.5,
+                                      large_frac=0.027, small_alpha=1.7,
+                                      small_max=50, large_logmean=8.6,
+                                      large_logsd=1.6, max_len=65536)
+    assert not del_mask.any()
+    assert ins_bp.sum() == 0
+
+
+def test_indel_tracts_deterministic():
+    a_del, a_ins = _indel_tracts(np.random.default_rng(22), n=3, M=4, R=2000, **_TRACT_KW)
+    b_del, b_ins = _indel_tracts(np.random.default_rng(22), n=3, M=4, R=2000, **_TRACT_KW)
+    np.testing.assert_array_equal(a_del, b_del)
+    np.testing.assert_array_equal(a_ins, b_ins)
+
+
+def test_indel_tracts_ibd_lineages_share_content():
+    del_lin, ins_lin = _indel_tracts(np.random.default_rng(23), n=2, M=5,
+                                      R=2000, **_TRACT_KW)
+    K = 4
+    lineage = np.zeros((2, K, 2000), dtype=np.int64)
+    lineage[:, 0, :] = 1
+    lineage[:, 2, :] = 1   # founders 0,2 share lineage 1 -> must be identical
+    lineage[:, 1, :] = 0
+    lineage[:, 3, :] = 3
+    del_f = _gather_by_lineage(del_lin, lineage)
+    ins_f = _gather_by_lineage(ins_lin, lineage)
+    np.testing.assert_array_equal(del_f[:, 0, :], del_f[:, 2, :])
+    np.testing.assert_array_equal(ins_f[:, 0, :], ins_f[:, 2, :])
+
+
+def test_indel_tracts_matches_bruteforce_oracle_fuzz():
+    def reference(rng, n, M, R, density, ins_frac, large_frac, small_alpha,
+                  small_max, large_logmean, large_logsd, max_len):
+        # Independently reimplemented as a plain per-event Python loop (not
+        # the vectorized scatter+cumsum interval-union trick), fed the SAME
+        # rng draw sequence -- this repo's test_accuracy.py:183 precedent
+        # for probabilistic code.
+        span = R + max_len
+        lam = density * span
+        cnt = rng.poisson(lam, size=n * M)
+        E = int(cnt.sum())
+        cell = np.repeat(np.arange(n * M), cnt)
+        start = rng.integers(-max_len, R, E)
+        L = _indel_lengths(rng, E, large_frac, small_alpha, small_max,
+                            large_logmean, large_logsd, max_len)
+        is_ins = rng.random(E) < ins_frac
+        del_mask = np.zeros((n * M, R), dtype=bool)
+        ins_bp = np.zeros((n * M, R), dtype=np.int64)
+        for i in range(E):
+            c = cell[i]
+            if is_ins[i]:
+                a = int(start[i])
+                if 0 <= a < R:
+                    ins_bp[c, a] += L[i]
+            else:
+                s, e = max(0, int(start[i])), min(R, int(start[i] + L[i]))
+                if s < e:
+                    del_mask[c, s:e] = True
+        ins_bp[del_mask] = 0
+        return del_mask.reshape(n, M, R), ins_bp.reshape(n, M, R)
+
+    param_rng = np.random.default_rng(24)
+    for _ in range(30):
+        n = int(param_rng.integers(1, 3))
+        M = int(param_rng.integers(1, 4))
+        R = int(param_rng.integers(20, 200))
+        density = float(param_rng.uniform(1e-4, 1e-2))
+        ins_frac = float(param_rng.uniform(0.2, 0.8))
+        large_frac = float(param_rng.uniform(0.0, 0.3))
+        small_alpha = float(param_rng.uniform(1.2, 2.5))
+        small_max = int(param_rng.integers(2, 20))
+        max_len = int(param_rng.integers(small_max + 5, 300))
+        large_logmean = float(param_rng.uniform(2.0, 5.0))
+        large_logsd = float(param_rng.uniform(0.5, 1.5))
+        seed = int(param_rng.integers(0, 2**31 - 1))
+
+        got_del, got_ins = _indel_tracts(
+            np.random.default_rng(seed), n, M, R, density, ins_frac,
+            large_frac, small_alpha, small_max, large_logmean, large_logsd,
+            max_len)
+        exp_del, exp_ins = reference(
+            np.random.default_rng(seed), n, M, R, density, ins_frac,
+            large_frac, small_alpha, small_max, large_logmean, large_logsd,
+            max_len)
+        np.testing.assert_array_equal(got_del, exp_del)
+        np.testing.assert_array_equal(got_ins, exp_ins.astype(np.int32))
+
+
+# --- flag-off backward-compat regression ---------------------------------
+
+def test_simulate_flag_off_matches_golden_hash_coalescent():
+    import hashlib
+    rng = np.random.default_rng(42)
+    out, *_ = simulate(
+        rng, windows=50, sites=64, founders=8, min_cross=2, max_cross=6,
+        inbreeding=0.5, allele_sharing=0.2, bad_frac=0.05,
+        sharing_model="coalescent", sharing_theta=4.0, ancestors=6,
+        ancestor_crossovers=8, derived_sfs=0.3, read_snps=8,
+        gamete_balance=0.5, chunk=1000)
+    assert out.shape == (50, 64, 10)
+    assert out.dtype == np.int8
+    assert hashlib.sha256(out.tobytes()).hexdigest() == _GOLDEN_COALESCENT_SHA256
+
+
+def test_simulate_flag_off_matches_golden_hash_independent():
+    import hashlib
+    rng = np.random.default_rng(7)
+    out, *_ = simulate(
+        rng, windows=30, sites=48, founders=6, min_cross=1, max_cross=4,
+        inbreeding=1.0, allele_sharing=0.2, bad_frac=0.05,
+        sharing_model="independent", chunk=1000)
+    assert out.shape == (30, 48, 8)
+    assert out.dtype == np.int8
+    assert hashlib.sha256(out.tobytes()).hexdigest() == _GOLDEN_INDEPENDENT_SHA256
+
+
+def test_simulate_flag_off_deterministic_same_seed():
+    kw = dict(windows=20, sites=32, founders=6, min_cross=1, max_cross=3,
+              inbreeding=0.5, allele_sharing=0.2, bad_frac=0.05,
+              sharing_model="coalescent", sharing_theta=3.0, chunk=1000)
+    a, *_ = simulate(np.random.default_rng(99), **kw)
+    b, *_ = simulate(np.random.default_rng(99), **kw)
+    np.testing.assert_array_equal(a, b)
+    c, *_ = simulate(np.random.default_rng(100), **kw)
+    assert not np.array_equal(a, c)
+
+
+# --- _draw_lineages / _coalescent_feats(lineage=, per_gamete=) -----------
+
+def test_draw_lineages_shape_and_range():
+    rng = np.random.default_rng(30)
+    n, T, K, A = 3, 40, 5, 4
+    lineage, M = _draw_lineages(rng, n, T, K, A, anc_cx=3, rate=None,
+                                 theta=None, max_lineages=None)
+    assert lineage.shape == (n, K, T)
+    assert M == A
+    assert (lineage >= 0).all() and (lineage < M).all()
+
+
+def test_draw_lineages_theta_mode_shape_and_range():
+    rng = np.random.default_rng(31)
+    n, T, K = 2, 40, 5
+    lineage, M = _draw_lineages(rng, n, T, K, A=4, anc_cx=3, rate=None,
+                                 theta=2.0, max_lineages=8)
+    assert lineage.shape == (n, K, T)
+    assert M == 8
+    assert (lineage >= 0).all() and (lineage < M).all()
+
+
+def test_coalescent_feats_precomputed_lineage_requires_M():
+    rng = np.random.default_rng(32)
+    n, T, K = 2, 20, 4
+    lineage, M = _draw_lineages(rng, n, T, K, A=3, anc_cx=2, rate=None,
+                                 theta=None, max_lineages=None)
+    h1 = np.zeros((n, T), dtype=np.int64)
+    good = _good_mask(rng, n, T, bad_frac=0.0, block=1.0)
+    with pytest.raises(ValueError, match="lineage_M"):
+        _coalescent_feats(rng, n, T, K, A=3, anc_cx=2, sfs_shape=0.3,
+                           read_snps=4, h1=h1, h2=h1, rate=None, good=good,
+                           gamete=good, lineage=lineage)
+
+
+def test_coalescent_feats_per_gamete_shape_dtype():
+    rng = np.random.default_rng(33)
+    n, T, K = 3, 25, 5
+    lineage, M = _draw_lineages(rng, n, T, K, A=4, anc_cx=2, rate=None,
+                                 theta=None, max_lineages=None)
+    h1 = rng.integers(0, K, size=(n, T))
+    h2 = rng.integers(0, K, size=(n, T))
+    good = _good_mask(rng, n, T, bad_frac=0.05, block=1.0)
+    (match1, match2), lin_out, panel = _coalescent_feats(
+        rng, n, T, K, A=4, anc_cx=2, sfs_shape=0.3, read_snps=4,
+        h1=h1, h2=h2, rate=None, good=good, gamete=good,
+        lineage=lineage, lineage_M=M, per_gamete=True)
+    assert match1.shape == (n, T, K)
+    assert match2.shape == (n, T, K)
+    assert match1.dtype == np.int8 and match2.dtype == np.int8
+    assert set(np.unique(match1)) <= {0, 1}
+    assert set(np.unique(match2)) <= {0, 1}
+    np.testing.assert_array_equal(lin_out, lineage)
+
+
+def test_coalescent_feats_per_gamete_matches_at_good_sites_when_inbred():
+    # h1 == h2 (fully inbred): at GOOD (uncorrupted) sites both gametes
+    # observe the identical active founder's mini-haplotype, so their
+    # match vectors must agree exactly there. Bad sites are excluded --
+    # each gamete draws its OWN independent corruption founder (real
+    # reads corrupt independently), so they may legitimately disagree
+    # exactly at bad sites.
+    rng = np.random.default_rng(34)
+    n, T, K = 4, 60, 6
+    lineage, M = _draw_lineages(rng, n, T, K, A=5, anc_cx=3, rate=None,
+                                 theta=None, max_lineages=None)
+    h1 = rng.integers(0, K, size=(n, T))
+    h2 = h1.copy()
+    good = _good_mask(rng, n, T, bad_frac=0.1, block=1.0)
+    (match1, match2), _, _ = _coalescent_feats(
+        rng, n, T, K, A=5, anc_cx=3, sfs_shape=0.3, read_snps=4,
+        h1=h1, h2=h2, rate=None, good=good, gamete=good,
+        lineage=lineage, lineage_M=M, per_gamete=True)
+    good_bc = np.broadcast_to(good[:, :, None], match1.shape)
+    np.testing.assert_array_equal(match1[good_bc], match2[good_bc])
+
+
+# --- _indel_suppressed_rate -----------------------------------------------
+
+def test_indel_suppressed_rate_no_variation_leaves_rate_unchanged():
+    del_mask = np.zeros((2, 3, 50), dtype=bool)
+    ins_bp = np.zeros((2, 3, 50), dtype=np.int32)
+    rate = np.full((2, 50), 7.0)
+    out = _indel_suppressed_rate(rate, del_mask, ins_bp, suppress=0.9, flank=5)
+    np.testing.assert_allclose(out, rate)
+
+
+def test_indel_suppressed_rate_none_rate_starts_from_ones():
+    del_mask = np.zeros((1, 2, 20), dtype=bool)
+    ins_bp = np.zeros((1, 2, 20), dtype=np.int32)
+    out = _indel_suppressed_rate(None, del_mask, ins_bp, suppress=0.9, flank=0)
+    np.testing.assert_allclose(out, np.ones((1, 20)))
+
+
+def test_indel_suppressed_rate_never_hits_zero():
+    rng = np.random.default_rng(40)
+    del_mask = rng.random((3, 4, 200)) < 0.9   # heavily variable, near-worst-case
+    ins_bp = np.zeros((3, 4, 200), dtype=np.int32)
+    out = _indel_suppressed_rate(None, del_mask, ins_bp, suppress=0.9, flank=10)
+    assert (out > 0).all()
+
+
+def test_indel_suppressed_rate_lower_inside_and_near_tracts():
+    del_mask = np.zeros((1, 4, 60), dtype=bool)
+    del_mask[:, :, 20:30] = True   # every lineage deleted over [20,30)
+    ins_bp = np.zeros((1, 4, 60), dtype=np.int32)
+    out = _indel_suppressed_rate(None, del_mask, ins_bp, suppress=0.9, flank=3)
+    # strictly suppressed well inside the tract and its flank
+    assert (out[0, 20:30] < 0.2).all()
+    assert (out[0, 17:20] < 1.0).all() and (out[0, 30:33] < 1.0).all()
+    # unaffected far from the tract
+    assert np.allclose(out[0, 0:15], 1.0)
+    assert np.allclose(out[0, 40:60], 1.0)
+
+
+def test_indel_suppressed_rate_dilation_tiny_exact():
+    del_mask = np.array([[[False, False, True, True, False, False]]])
+    ins_bp = np.zeros((1, 1, 6), dtype=np.int32)
+    out = _indel_suppressed_rate(None, del_mask, ins_bp, suppress=0.9, flank=1)
+    np.testing.assert_allclose(out, np.array([[1.0, 0.1, 0.1, 0.1, 0.1, 1.0]]))
+
+
+# --- _row_counts ---------------------------------------------------------
+
+def test_row_counts_shape_dtype():
+    rng = np.random.default_rng(50)
+    n, R = 3, 40
+    pres1 = rng.random((n, R)) < 0.7
+    pres2 = rng.random((n, R)) < 0.7
+    ins1 = rng.integers(0, 5000, (n, R)) * pres1
+    ins2 = rng.integers(0, 5000, (n, R)) * pres2
+    on1, on2, c1, c2, cnt = _row_counts(rng, pres1, pres2, ins1, ins2,
+                                         gamete_balance=0.5, coverage=2.0,
+                                         ins_read_per_bp=2e-3, max_stack=64)
+    assert on1.dtype == bool and on2.dtype == bool
+    assert c1.dtype == np.int32 and c2.dtype == np.int32
+    assert (c1 >= 0).all() and (c1 <= 64).all()
+    assert (c2 >= 0).all() and (c2 <= 64).all()
+    np.testing.assert_array_equal(cnt, on1.astype(np.int32) + on2.astype(np.int32) + c1 + c2)
+
+
+def test_row_counts_absent_never_gets_a_colinear_read():
+    rng = np.random.default_rng(51)
+    n, R = 1, 200
+    pres1 = np.zeros((n, R), dtype=bool)
+    pres2 = np.zeros((n, R), dtype=bool)
+    ins1 = np.zeros((n, R), dtype=np.int64)
+    ins2 = np.zeros((n, R), dtype=np.int64)
+    on1, on2, c1, c2, cnt = _row_counts(rng, pres1, pres2, ins1, ins2,
+                                         gamete_balance=0.5, coverage=1e9,
+                                         ins_read_per_bp=0.0, max_stack=64)
+    assert not on1.any() and not on2.any()
+    assert (cnt == 0).all()
+
+
+def test_row_counts_hemizygous_only_surviving_homolog_reads_exact():
+    # coverage huge -> colinear Bernoulli saturates to ~1 for any present
+    # homolog; H2 absent everywhere -> every colinear read must come from
+    # H1 only, exactly the "hemizygous" acceptance-criterion mechanism.
+    rng = np.random.default_rng(52)
+    n, R = 1, 500
+    pres1 = np.ones((n, R), dtype=bool)
+    pres2 = np.zeros((n, R), dtype=bool)
+    ins1 = np.zeros((n, R), dtype=np.int64)
+    ins2 = np.zeros((n, R), dtype=np.int64)
+    on1, on2, c1, c2, cnt = _row_counts(rng, pres1, pres2, ins1, ins2,
+                                         gamete_balance=0.5, coverage=1e9,
+                                         ins_read_per_bp=0.0, max_stack=64)
+    assert on1.all()
+    assert not on2.any()
+
+
+def test_row_counts_stack_capped_at_max_stack():
+    rng = np.random.default_rng(53)
+    n, R = 1, 10
+    pres1 = np.ones((n, R), dtype=bool)
+    pres2 = np.zeros((n, R), dtype=bool)
+    ins1 = np.full((n, R), 1_000_000, dtype=np.int64)  # huge insertion
+    ins2 = np.zeros((n, R), dtype=np.int64)
+    _, _, c1, c2, _ = _row_counts(rng, pres1, pres2, ins1, ins2,
+                                   gamete_balance=0.5, coverage=0.0,
+                                   ins_read_per_bp=1.0, max_stack=64)
+    assert (c1 == 64).all()
+    assert (c2 == 0).all()
+
+
+# --- _sample_rows ----------------------------------------------------
+
+def test_sample_rows_tiny_exact():
+    cnt = np.array([[0, 2, 0, 1, 1], [1, 0, 0, 0, 0]])
+    w_of, t_of, row_of, o_of, short = _sample_rows(cnt, T=3)
+    np.testing.assert_array_equal(w_of, [0, 0, 0, 1])
+    np.testing.assert_array_equal(t_of, [1, 1, 3, 0])
+    np.testing.assert_array_equal(row_of, [0, 1, 2, 0])
+    # the two rows stacked at (window0, site1) get within-site ordinals
+    # 0 and 1; every other kept row is alone at its site -> ordinal 0.
+    np.testing.assert_array_equal(o_of, [0, 1, 0, 0])
+    np.testing.assert_array_equal(short, [False, True])
+
+
+def test_sample_rows_empty_cnt():
+    cnt = np.zeros((3, 10), dtype=np.int64)
+    w_of, t_of, row_of, o_of, short = _sample_rows(cnt, T=5)
+    assert w_of.size == 0 and t_of.size == 0 and row_of.size == 0 and o_of.size == 0
+    np.testing.assert_array_equal(short, [True, True, True])
+
+
+def test_sample_rows_exactly_T_no_shortfall():
+    cnt = np.zeros((2, 10), dtype=np.int64)
+    cnt[0, [1, 4, 7]] = 1   # exactly T=3 rows
+    cnt[1, [0, 1, 2, 3, 4]] = 1  # 5 rows, more than T=3
+    w_of, t_of, row_of, o_of, short = _sample_rows(cnt, T=3)
+    np.testing.assert_array_equal(short, [False, False])
+    # each window contributes exactly T rows
+    for w in (0, 1):
+        assert (w_of == w).sum() == 3
+
+
+def test_sample_rows_rows_within_window_are_reference_ordered():
+    rng = np.random.default_rng(54)
+    cnt = rng.integers(0, 4, size=(5, 60))
+    w_of, t_of, row_of, o_of, short = _sample_rows(cnt, T=20)
+    for w in range(5):
+        sites = t_of[w_of == w]
+        assert (np.diff(sites) >= 0).all()
+        rows = row_of[w_of == w]
+        np.testing.assert_array_equal(rows, np.arange(rows.size))
+
+
+def test_sample_rows_o_of_within_site_ordinal_exact():
+    # 3 rows stacked at (window0, site2): within-site ordinals 0,1,2.
+    cnt = np.array([[0, 0, 3, 0]])
+    w_of, t_of, row_of, o_of, short = _sample_rows(cnt, T=3)
+    np.testing.assert_array_equal(t_of, [2, 2, 2])
+    np.testing.assert_array_equal(o_of, [0, 1, 2])
+
+
+def test_sample_rows_matches_pure_python_oracle_fuzz():
+    def reference(cnt, T):
+        n, R = cnt.shape
+        w_out, t_out, r_out, o_out = [], [], [], []
+        short = np.zeros(n, dtype=bool)
+        for w in range(n):
+            rows = []   # (site, within-site ordinal)
+            for t in range(R):
+                for o in range(int(cnt[w, t])):
+                    rows.append((t, o))
+            short[w] = len(rows) < T
+            for r, (t, o) in enumerate(rows[:T]):
+                w_out.append(w); t_out.append(t); r_out.append(r); o_out.append(o)
+        return (np.array(w_out, dtype=np.int64), np.array(t_out, dtype=np.int64),
+                np.array(r_out, dtype=np.int64), np.array(o_out, dtype=np.int64), short)
+
+    rng = np.random.default_rng(55)
+    for _ in range(100):
+        n = int(rng.integers(1, 4))
+        R = int(rng.integers(1, 30))
+        T = int(rng.integers(1, 15))
+        cnt = rng.integers(0, 4, size=(n, R))
+        got = _sample_rows(cnt, T)
+        exp = reference(cnt, T)
+        for g, e in zip(got, exp):
+            np.testing.assert_array_equal(g, e)
+
+
+# --- _indel_chunk ----------------------------------------------------
+
+def _chunk_fixture():
+    """A fully deterministic (coverage=1e9, ins_read_per_bp=1.0) 2-founder,
+    2-lineage scenario, hand-traced then numerically verified before being
+    fixed as a test value: founder0 (lineage0) is deleted at site2;
+    founder1 (lineage1) carries a 3000bp insertion anchored at site1;
+    H1 is always founder0, H2 always founder1."""
+    n, R, K = 1, 6, 2
+    lineage = np.array([[[0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1]]], dtype=np.int64)
+    del_lin = np.array([[[False, False, True, False, False, False],
+                          [False, False, False, False, False, False]]])
+    ins_lin = np.zeros((1, 2, 6), dtype=np.int32)
+    ins_lin[0, 1, 1] = 3000
+    h1 = np.zeros((1, 6), dtype=np.int64)
+    h2 = np.ones((1, 6), dtype=np.int64)
+    match1 = np.zeros((1, 6, 2), dtype=np.int8); match1[0, :, 0] = 1
+    match2 = np.zeros((1, 6, 2), dtype=np.int8); match2[0, :, 1] = 1
+    return n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2
+
+
+def test_indel_chunk_tiny_exact():
+    n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
+    T = 8
+    rng = np.random.default_rng(0)
+    tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+
+    expect_tern = np.array([[1, 0], [0, 1], [1, 0], [0, 1], [0, 1], [0, 1],
+                             [-1, 1], [1, 0]], dtype=np.int8)
+    expect_dist = np.array([[0, 0]] * 6 + [[8, 0], [0, 0]], dtype=np.int8)
+    np.testing.assert_array_equal(tern[0], expect_tern)
+    np.testing.assert_array_equal(dist[0], expect_dist)
+    np.testing.assert_array_equal(lab1[0], np.zeros(8, dtype=np.int8))
+    np.testing.assert_array_equal(lab2[0], np.ones(8, dtype=np.int8))
+    np.testing.assert_array_equal(refpos[0], [0, 0, 1, 1, 1, 1, 2, 3])
+    np.testing.assert_array_equal(short, [False])
+    # True genome-wide (all R=6 sites) presence counts: h2's founder
+    # (lineage1) is never deleted, so every site has >=1 true founder
+    # present (n_either=R=6); only site2 is hemizygous (h1's founder
+    # absent there, h2's present); nothing is nullizygous.
+    assert (n_either, n_hemi, n_null) == (6, 1, 0)
+    # Population marginal deletion: K=2 founders x R=6 sites = 12 total
+    # (founder,site) pairs; only founder0 (lineage0) at site2 is deleted.
+    assert (n_deleted, n_founder_sites) == (1, 12)
+
+
+def test_indel_chunk_shape_dtype():
+    n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
+    T = 5
+    rng = np.random.default_rng(1)
+    tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=2.0, ins_read_per_bp=2e-3, max_stack=64,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+    assert tern.shape == (n, T, K) and tern.dtype == np.int8
+    assert dist.shape == (n, T, K) and dist.dtype == np.int8
+    assert lab1.shape == (n, T) and lab2.shape == (n, T)
+    assert refpos.shape == (n, T) and refpos.dtype == np.int32
+    assert short.shape == (n,)
+
+
+def test_indel_chunk_rare_shortfall_pads_and_flags():
+    # T far larger than any realistic row count over a tiny R with zero
+    # coverage/insertions -> every window falls short and must be padded
+    # with the module's sentinels, not silently truncated to fewer rows.
+    n, R, K = 2, 4, 3
+    lineage = np.zeros((n, K, R), dtype=np.int64)
+    del_lin = np.zeros((n, K, R), dtype=bool)
+    ins_lin = np.zeros((n, K, R), dtype=np.int32)
+    h1 = np.zeros((n, R), dtype=np.int64)
+    h2 = np.zeros((n, R), dtype=np.int64)
+    match1 = np.zeros((n, R, K), dtype=np.int8)
+    match2 = np.zeros((n, R, K), dtype=np.int8)
+    T = 50
+    rng = np.random.default_rng(2)
+    tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=0.0, ins_read_per_bp=0.0, max_stack=1,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+    assert short.all()
+    assert (tern == TERN_PAD).all()
+    assert (dist == DIST_PAD).all()
+    assert (lab1 == LABEL_PAD).all() and (lab2 == LABEL_PAD).all()
+    assert (refpos == -1).all()
+
+
+def test_indel_chunk_ternary_never_one_where_deleted_fuzz():
+    rng = np.random.default_rng(3)
+    for _ in range(20):
+        n, M, K, R, T = 2, 4, 3, 60, 40
+        lineage = rng.integers(0, M, size=(n, K, R)).astype(np.int64)
+        del_lin, ins_lin = _indel_tracts(rng, n, M, R, **_TRACT_KW)
+        h1 = rng.integers(0, K, size=(n, R))
+        h2 = rng.integers(0, K, size=(n, R))
+        match1 = (rng.random((n, R, K)) < 0.3).astype(np.int8)
+        match2 = (rng.random((n, R, K)) < 0.3).astype(np.int8)
+        tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+            rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+            gamete_balance=0.5, coverage=2.0, ins_read_per_bp=2e-3,
+            max_stack=64, anchor_thresh=0, ref_founder=-1,
+            dist_scale=DIST_LOG_SCALE)
+        real = tern != TERN_PAD
+        # decode: dist code 0 means real distance 0 (colinear); any nonzero
+        # code means a real deletion at that (row,founder) under thresh=0
+        deleted = (dist > 0) & (dist != DIST_PAD)
+        assert not ((tern == 1) & deleted & real).any()
+        assert ((tern == -1) == (deleted & real))[real].all()
+
+
+def test_indel_chunk_insertion_stacking_appears_with_enough_budget():
+    n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
+    T = 8
+    rng = np.random.default_rng(4)
+    tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+    # site 1 (the insertion anchor) must appear more than twice (its 2
+    # colinear reads) -- the extra occurrences are the stacked insertion
+    # reads, all landing at the SAME reference position.
+    assert (refpos[0] == 1).sum() > 2
+
+
+# --- v3 --indel-model: _lineage_indels / _overlay_indels ----------------
+
+def _shared_lineage_fixture(seed=7, n=2, K=6, M=3, R=200):
+    rng = np.random.default_rng(seed)
+    lineage = rng.integers(0, M, size=(n, K, R)).astype(np.int32)
+    lineage[:, 0, 20:80] = 0
+    lineage[:, 1, 20:80] = 0          # founders 0,1 share lineage 0 on [20,80)
+    lineage[:, 2, 20:80] = 1          # founder 2 on a different lineage there
+    return rng, lineage, n, K, M, R
+
+
+def test_lineage_indels_shape_dtype():
+    rng, lineage, n, K, M, R = _shared_lineage_fixture()
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=0.5,
+                                        ins_frac=0.5, max_len=1000)
+    assert del_mask.shape == (n, M, R) and del_mask.dtype == bool
+    assert ins_bp.shape == (n, M, R) and ins_bp.dtype == np.int32
+
+
+def test_lineage_indels_never_active_where_lineage_unoccupied():
+    rng, lineage, n, K, M, R = _shared_lineage_fixture()
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=0.9,
+                                        ins_frac=0.3, max_len=1000)
+    occ = np.zeros((n, M, R), dtype=bool)
+    ii, rr = np.arange(n)[:, None], np.arange(R)[None, :]
+    for k in range(K):
+        occ[ii, lineage[:, k, :], rr] = True
+    assert not (del_mask & ~occ).any()
+    assert not ((ins_bp > 0) & ~occ).any()
+
+
+def test_lineage_indels_ibd_founders_share_content_after_gather():
+    """Founders 0,1 share lineage 0 on [20,80) -- after the SAME
+    `_gather_by_lineage` projection `_indel_tracts` output also goes
+    through, they must see byte-identical indel content there (the
+    core correlation claim of --indel-model lineage)."""
+    rng, lineage, n, K, M, R = _shared_lineage_fixture()
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=0.9,
+                                        ins_frac=0.3, max_len=1000)
+    del_kt = _gather_by_lineage(del_mask, lineage)
+    ins_kt = _gather_by_lineage(ins_bp, lineage)
+    assert np.array_equal(del_kt[:, 0, 20:80], del_kt[:, 1, 20:80])
+    assert np.array_equal(ins_kt[:, 0, 20:80], ins_kt[:, 1, 20:80])
+
+
+def test_lineage_indels_promoted_run_uses_its_own_full_length():
+    """frac=1.0, ins_frac=0.0 -> every occupied run is a full-length
+    deletion; the promoted run on [20,80) must be deleted in full,
+    not some Poisson-drawn sub-length."""
+    rng, lineage, n, K, M, R = _shared_lineage_fixture()
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=1.0,
+                                        ins_frac=0.0, max_len=1000)
+    assert del_mask[:, 0, 20:80].all()
+    assert not ins_bp.any()
+
+
+def test_lineage_indels_deletion_capped_at_max_len_from_run_start():
+    """A run much longer than max_len must not have its deletion extend
+    past max_len sites from the run's own start (regression: earlier
+    version capped only the reported ins_bp/run_len VALUE, not del_mask's
+    spatial extent, so one very-long-lived lineage could delete far more
+    than max_len sites for any founder on it)."""
+    rng = np.random.default_rng(11)
+    n, K, M, R = 1, 2, 1, 5000
+    lineage = np.zeros((n, K, R), dtype=np.int32)   # both founders on lineage 0, entire region
+    max_len = 100
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=1.0,
+                                        ins_frac=0.0, max_len=max_len)
+    assert del_mask[:, 0, :max_len].all()
+    assert not del_mask[:, 0, max_len:].any()
+
+
+def test_lineage_indels_zero_frac_is_a_no_op():
+    rng, lineage, n, K, M, R = _shared_lineage_fixture()
+    del_mask, ins_bp = _lineage_indels(rng, n, K, M, R, lineage, frac=0.0,
+                                        ins_frac=0.5, max_len=1000)
+    assert not del_mask.any()
+    assert not ins_bp.any()
+
+
+def test_overlay_indels_shape_dtype():
+    rng = np.random.default_rng(3)
+    n, K, R = 3, 8, 500
+    del_mask, ins_bp = _overlay_indels(rng, n, K, R, rate=1e-2, mean_len=50,
+                                        ins_frac=0.4, founder_freq=1.0, max_len=1000)
+    assert del_mask.shape == (n, K, R) and del_mask.dtype == bool
+    assert ins_bp.shape == (n, K, R) and ins_bp.dtype == np.int32
+
+
+def test_overlay_indels_founder_freq_gates_whole_founders():
+    rng = np.random.default_rng(3)
+    n, K, R = 4, 40, 2000
+    del_mask, ins_bp = _overlay_indels(rng, n, K, R, rate=0.02, mean_len=40,
+                                        ins_frac=0.4, founder_freq=0.5, max_len=1000)
+    active = del_mask.any(axis=2) | (ins_bp > 0).any(axis=2)   # [n,K]
+    frac_active = active.mean()
+    assert 0.3 < frac_active < 0.7   # loose band around founder_freq=0.5
+
+
+def test_overlay_indels_zero_founder_freq_is_a_no_op():
+    rng = np.random.default_rng(3)
+    n, K, R = 2, 6, 500
+    del_mask, ins_bp = _overlay_indels(rng, n, K, R, rate=0.05, mean_len=50,
+                                        ins_frac=0.5, founder_freq=0.0, max_len=1000)
+    assert not del_mask.any()
+    assert not ins_bp.any()
+
+
+@pytest.mark.parametrize("model", ["tracts", "lineage", "overlay"])
+def test_simulate_indel_model_end_to_end_shape(model):
+    """Each --indel-model runs simulate() end to end without crashing and
+    produces the same [windows,T,2K+2] output contract."""
+    K, T = 8, 300
+    out = simulate(
+        np.random.default_rng(5), windows=2, sites=T, founders=K,
+        min_cross=1, max_cross=3, inbreeding=0.0, allele_sharing=0.6,
+        bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+        sharing_theta=4.0, simulate_indels=True, indel_model=model,
+        indel_region_mult=4, indel_coverage=2.0)[0]
+    assert out.shape == (2, T, 2 * K + 2)
+    assert out.dtype == np.int8
+
+
+def test_simulate_indel_model_lineage_and_tracts_differ():
+    """Same seed/args, only --indel-model differs -> output must differ
+    (confirms the dispatch actually takes effect, not a silent fallthrough)."""
+    K, T = 8, 300
+    kw = dict(windows=3, sites=T, founders=K, min_cross=1, max_cross=3,
+              inbreeding=0.0, allele_sharing=0.6, bad_frac=0.02,
+              sharing_model="coalescent", ancestors=6, sharing_theta=4.0,
+              simulate_indels=True, indel_region_mult=4, indel_coverage=2.0)
+    out_tracts = simulate(np.random.default_rng(9), indel_model="tracts", **kw)[0]
+    out_lineage = simulate(np.random.default_rng(9), indel_model="lineage", **kw)[0]
+    out_overlay = simulate(np.random.default_rng(9), indel_model="overlay", **kw)[0]
+    assert not np.array_equal(out_tracts, out_lineage)
+    assert not np.array_equal(out_tracts, out_overlay)
+    assert not np.array_equal(out_lineage, out_overlay)
+
+
+def test_simulate_bad_indel_model_raises():
+    with pytest.raises(ValueError):
+        simulate(np.random.default_rng(1), windows=1, sites=100, founders=4,
+                 min_cross=1, max_cross=2, inbreeding=0.0, allele_sharing=0.6,
+                 bad_frac=0.0, sharing_model="coalescent",
+                 simulate_indels=True, indel_model="bogus")
+
+
+# --- v4: _lineage_substitutions / --subst-model / --indel-coverage-model ---
+
+def test_lineage_substitutions_shape_dtype():
+    rng = np.random.default_rng(5)
+    n, M, T, L = 3, 6, 400, 8
+    lin_alleles = _lineage_substitutions(rng, n, M, T, L, rate=0.05, sfs_shape=0.3)
+    assert lin_alleles.shape == (n, M, T, L)
+    assert lin_alleles.dtype == np.int8
+
+
+def test_lineage_substitutions_nonsubstitution_sites_are_constant_zero():
+    """Sites with no substitution event must show every lineage trivially
+    agreeing (all-zero) -- the core positional-persistence claim: divergence
+    only exists at the sparse substitution sites, not everywhere."""
+    rng = np.random.default_rng(5)
+    n, M, T, L = 2, 4, 2000, 8
+    lin_alleles = _lineage_substitutions(rng, n, M, T, L, rate=0.02, sfs_shape=0.3)
+    any_nonzero_per_site = (lin_alleles != 0).any(axis=(1, 3))  # [n,T]
+    n_subst_sites = int(any_nonzero_per_site.sum())
+    expected = 0.02 * T * n
+    assert 0 < n_subst_sites < 0.5 * T * n           # sparse, not dense
+    assert abs(n_subst_sites - expected) < 5 * (expected ** 0.5 + 1)  # loose Poisson band
+    # every site NOT flagged as a substitution site must be all-zero across the board
+    const_sites = ~any_nonzero_per_site
+    for i in range(n):
+        assert (lin_alleles[i, :, const_sites[i], :] == 0).all()
+
+
+def test_lineage_substitutions_rate_zero_is_a_no_op():
+    rng = np.random.default_rng(5)
+    lin_alleles = _lineage_substitutions(rng, 2, 4, 500, 8, rate=0.0, sfs_shape=0.3)
+    assert not lin_alleles.any()
+
+
+def test_coalescent_feats_subst_model_dense_matches_pre_change_call_signature():
+    """subst_model='dense' (default) must reproduce _coalescent_feats' output
+    exactly -- the golden-hash regression test already pins simulate()'s
+    overall output for the flag-off path; this checks the function directly
+    stays byte-identical when called with the same rng seed twice, once with
+    subst_model passed explicitly and once relying on the default."""
+    rng1 = np.random.default_rng(3)
+    rng2 = np.random.default_rng(3)
+    n, T, K, A, anc_cx = 2, 100, 6, 4, 3
+    h1 = rng1.integers(0, K, size=(n, T))
+    h2 = rng1.integers(0, K, size=(n, T))
+    rng1 = np.random.default_rng(3)  # reset after drawing h1/h2 identically for both calls
+    rng2 = np.random.default_rng(3)
+    h1b = rng2.integers(0, K, size=(n, T))
+    h2b = rng2.integers(0, K, size=(n, T))
+    good = np.ones((n, T), dtype=bool)
+    out1 = _coalescent_feats(np.random.default_rng(7), n, T, K, A, anc_cx, 0.3, 8,
+                              h1, h2, None, good, gamete=None)
+    out2 = _coalescent_feats(np.random.default_rng(7), n, T, K, A, anc_cx, 0.3, 8,
+                              h1b, h2b, None, good, gamete=None, subst_model="dense")
+    assert np.array_equal(out1[0], out2[0])  # match features identical
+
+
+def test_coalescent_feats_bad_subst_model_raises():
+    n, T, K, A, anc_cx = 1, 20, 4, 2, 2
+    h1 = np.zeros((n, T), dtype=np.int64)
+    h2 = np.zeros((n, T), dtype=np.int64)
+    good = np.ones((n, T), dtype=bool)
+    with pytest.raises(ValueError):
+        _coalescent_feats(np.random.default_rng(1), n, T, K, A, anc_cx, 0.3, 8,
+                           h1, h2, None, good, gamete=None, subst_model="bogus")
+
+
+def test_row_counts_coverage_model_poisson_matches_formula():
+    rng = np.random.default_rng(2)
+    n, R = 1, 200_000
+    pres1 = np.ones((n, R), dtype=bool)
+    pres2 = np.ones((n, R), dtype=bool)
+    ins1 = np.zeros((n, R), dtype=np.int32)
+    ins2 = np.zeros((n, R), dtype=np.int32)
+    X, w = 0.1, 0.5
+    on1, on2, c1, c2, cnt = _row_counts(rng, pres1, pres2, ins1, ins2, w, X,
+                                         0.0, 64, coverage_model="poisson")
+    expected_p = 1.0 - np.exp(-X * w)
+    assert abs(on1.mean() - expected_p) < 0.01
+    assert abs(on2.mean() - expected_p) < 0.01
+
+
+def test_row_counts_coverage_model_linear_unchanged():
+    rng1 = np.random.default_rng(2)
+    rng2 = np.random.default_rng(2)
+    n, R = 1, 50_000
+    pres1 = np.ones((n, R), dtype=bool)
+    pres2 = np.ones((n, R), dtype=bool)
+    ins1 = np.zeros((n, R), dtype=np.int32)
+    ins2 = np.zeros((n, R), dtype=np.int32)
+    out_default = _row_counts(rng1, pres1, pres2, ins1, ins2, 0.5, 2.0, 0.0, 64)
+    out_explicit = _row_counts(rng2, pres1, pres2, ins1, ins2, 0.5, 2.0, 0.0, 64,
+                                coverage_model="linear")
+    for a, b in zip(out_default, out_explicit):
+        assert np.array_equal(a, b)
+
+
+def test_row_counts_coverage_model_reads_matches_mean_depth():
+    rng = np.random.default_rng(4)
+    n, R = 1, 500_000
+    pres1 = np.ones((n, R), dtype=bool)
+    pres2 = np.ones((n, R), dtype=bool)
+    ins1 = np.zeros((n, R), dtype=np.int32)
+    ins2 = np.zeros((n, R), dtype=np.int32)
+    X, w = 0.1, 0.5
+    on1, on2, c1, c2, cnt = _row_counts(rng, pres1, pres2, ins1, ins2, w, X,
+                                         0.0, 64, coverage_model="reads", read_len=150)
+    expected_p = 1.0 - np.exp(-X * w)   # same mean depth as "poisson", different spatial structure
+    assert abs(on1.mean() - expected_p) < 0.01
+    assert abs(on2.mean() - expected_p) < 0.01
+
+
+def test_row_counts_reads_gives_contiguous_blocks_not_independent_sites():
+    """The whole point of "reads": a covered site's neighbors are far more
+    likely to ALSO be covered than under "poisson" (independent per-site),
+    since real coverage comes from a single read_len-bp fragment."""
+    rng_reads = np.random.default_rng(9)
+    rng_poisson = np.random.default_rng(9)
+    n, R = 1, 200_000
+    pres1 = np.ones((n, R), dtype=bool)
+    pres2 = np.zeros((n, R), dtype=bool)  # isolate homolog 1 only
+    ins1 = np.zeros((n, R), dtype=np.int32)
+    ins2 = np.zeros((n, R), dtype=np.int32)
+    X, w = 0.1, 1.0
+    on1_reads, *_ = _row_counts(rng_reads, pres1, pres2, ins1, ins2, w, X,
+                                 0.0, 64, coverage_model="reads", read_len=150)
+    on1_poisson, *_ = _row_counts(rng_poisson, pres1, pres2, ins1, ins2, w, X,
+                                   0.0, 64, coverage_model="poisson")
+
+    def frac_bins_any_covered(on, bin_size=256):
+        n_bins = on.shape[1] // bin_size
+        trimmed = on[0, :n_bins * bin_size].reshape(n_bins, bin_size)
+        return trimmed.any(axis=1).mean()
+
+    frac_reads = frac_bins_any_covered(on1_reads)
+    frac_poisson = frac_bins_any_covered(on1_poisson)
+    # same mean per-site depth, but "reads" must leave far more EMPTY bins
+    # (clustered coverage) than "poisson" (independent sites, ~always some
+    # hit in a 256-site bin at this depth)
+    assert frac_reads < 0.6 * frac_poisson
+
+
+def test_row_counts_bad_coverage_model_raises():
+    rng = np.random.default_rng(1)
+    pres1 = np.ones((1, 10), dtype=bool)
+    with pytest.raises(ValueError):
+        _row_counts(rng, pres1, pres1, np.zeros((1, 10), dtype=np.int32),
+                    np.zeros((1, 10), dtype=np.int32), 0.5, 1.0, 0.0, 64,
+                    coverage_model="bogus")
+
+
+@pytest.mark.parametrize("subst_model,coverage_model", [
+    ("dense", "linear"), ("sparse", "linear"), ("dense", "poisson"), ("sparse", "poisson"),
+])
+def test_simulate_v4_flags_end_to_end(subst_model, coverage_model):
+    """All four combinations of the new v4 flags run end to end without
+    crashing and produce the same [windows,T,2K+2] output contract."""
+    K, T = 8, 200
+    out = simulate(
+        np.random.default_rng(5), windows=2, sites=T, founders=K,
+        min_cross=1, max_cross=3, inbreeding=0.0, allele_sharing=0.6,
+        bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+        sharing_theta=4.0, simulate_indels=True, indel_model="overlay",
+        indel_region_mult=8, indel_coverage=0.1 if coverage_model == "poisson" else 2.0,
+        subst_model=subst_model, subst_rate=0.02, coverage_model=coverage_model)[0]
+    assert out.shape == (2, T, 2 * K + 2)
+    assert out.dtype == np.int8
+
+
+# --- read-support count (--emit-read-counts) -----------------------------
+# experiments/depth-confidence-fix/. Colleague's lab-meeting suggestion,
+# validated first against real cached data (readcount_probe.py) before any
+# implementation: per-cell true-founder read-support count separates
+# correct from incorrect real predictions sharply (4.40% error at 0
+# reads vs 0.36% at >10, at 2.0x) -- a real, previously-unused signal.
+#
+# GROUPED-COUNT design (branch indel-readcount-grouped-count): SUPERSEDES an
+# earlier per-founder-MATCH-tally-pooled-across-kinds design that broadcast
+# a site-wide count to every row at a site regardless of that row's own
+# pattern, and was always 0 for non-MATCH cells. A full-scale retrain with
+# that design broke real-data accuracy broadly (see
+# depth_confidence_fix_2026-09-18.md's "RESOLVED" section) -- not narrowly
+# tied to one founder, so the count semantics themselves were suspect, not
+# just an unlucky training run. This design groups rows by (window, site,
+# their own EXACT K-length ternary vector) and uses each row's own group
+# size as its count, broadcast across all K columns of ITS OWN row only --
+# "how many reads showed this exact observed pattern here," always >0 (a
+# row is always a member of its own group), and meaningful for DEL/
+# DIVERGED patterns too, not just MATCH.
+
+def test_indel_chunk_count_tiny_exact():
+    """Same fixture as test_indel_chunk_tiny_exact. Hand-derived from the
+    fixture's own known tern/refpos structure (expect_tern in
+    test_indel_chunk_tiny_exact, reproduced here for the grouping):
+      row0=[1,0] row1=[0,1]                 at site0 -- two distinct
+                                              patterns, each size 1
+      row2=[1,0] row3=[0,1] row4=[0,1] row5=[0,1]  at site1 -- [1,0] size 1
+                                              (row2), [0,1] size 3 (rows3-5,
+                                              the 3000bp insertion stacking
+                                              on founder1/lineage1)
+      row6=[-1,1]                           at site2 -- size 1
+      row7=[1,0]                            at site3 -- size 1
+    Cross-checked directly against _indel_chunk's own output before being
+    fixed as a test value.
+    """
+    n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
+    T = 8
+    rng = np.random.default_rng(0)
+    tern, dist, count, lab1, lab2, refpos, short, n_either, n_hemi, n_null, n_deleted, n_founder_sites = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+
+    expect_raw = np.array([[1, 1], [1, 1], [1, 1], [3, 3], [3, 3], [3, 3],
+                            [1, 1], [1, 1]])
+    expect_count = _encode_dist(expect_raw, DIST_LOG_SCALE)
+    np.testing.assert_array_equal(count[0], expect_count)
+
+
+def test_indel_chunk_count_always_positive():
+    """Every real (non-PAD) row is a member of its own (site, pattern)
+    group, so its count is always > 0 -- regardless of whether its own
+    ternary vector is all-MATCH, all-DEL, all-DIVERGED, or mixed. This is
+    the key semantic difference from the superseded design (which was
+    always 0 for DEL/DIVERGED cells)."""
+    n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
+    T = 8
+    rng = np.random.default_rng(0)
+    tern, dist, count, *_ = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+    deleted = tern[0] == TERN_DEL
+    assert deleted.any(), "fixture should have at least one deleted cell"
+    assert (count[0][deleted] > 0).all(), \
+        "grouped-count design: DEL cells get a real group-size count too"
+
+
+def test_indel_chunk_count_positive_where_matched():
+    """A row showing MATCH for founder k is (like every row) a member of
+    its own group, so count there is guaranteed > 0."""
+    n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
+    T = 8
+    rng = np.random.default_rng(0)
+    tern, dist, count, *_ = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+    matched = tern[0] == TERN_MATCH
+    assert matched.any(), "fixture should have at least one matched cell"
+    assert (count[0][matched] >= _encode_dist(np.array([1]), DIST_LOG_SCALE)[0]).all()
+
+
+def test_indel_chunk_count_matches_naive_reference_fuzz():
+    """Vectorized group-by-(site,full-pattern) vs a trivially-correct
+    per-row Python loop, on randomized fixtures -- catches aggregation
+    bugs (grouping by the wrong key, or leaking counts across rows that
+    share a site but not the same pattern)."""
+    rng = np.random.default_rng(9)
+    for trial in range(15):
+        n, M, K, R = 2, 3, 3, int(rng.integers(4, 12))
+        T = int(rng.integers(2, R))
+        lineage = rng.integers(0, M, size=(n, K, R)).astype(np.int64)
+        del_lin, ins_lin = _indel_tracts(rng, n, M, R, **_TRACT_KW)
+        h1 = rng.integers(0, K, size=(n, R))
+        h2 = rng.integers(0, K, size=(n, R))
+        match1 = (rng.random((n, R, K)) < 0.5).astype(np.int8)
+        match2 = (rng.random((n, R, K)) < 0.5).astype(np.int8)
+
+        chunk_rng = np.random.default_rng(trial)
+        tern, dist, count, lab1, lab2, refpos, short, *_ = _indel_chunk(
+            chunk_rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
+            match1, match2, gamete_balance=0.5, coverage=8.0,
+            ins_read_per_bp=5e-3, max_stack=8, anchor_thresh=0,
+            ref_founder=-1, dist_scale=DIST_LOG_SCALE)
+
+        for wi in range(n):
+            valid = refpos[wi] >= 0
+            if not valid.any():
+                continue
+            sites = refpos[wi][valid]
+            tern_v = tern[wi][valid]
+            count_v = count[wi][valid]
+            for site in np.unique(sites):
+                rows_at_site = np.flatnonzero(sites == site)
+                patterns = tern_v[rows_at_site]
+                # naive per-row group size: count of OTHER rows at this site
+                # sharing this row's exact full ternary vector (self included)
+                naive = np.array([
+                    int((patterns == patterns[i]).all(axis=1).sum())
+                    for i in range(len(rows_at_site))
+                ])
+                expect = _encode_dist(naive, DIST_LOG_SCALE)
+                got = count_v[rows_at_site][:, 0]  # scalar broadcast across K
+                np.testing.assert_array_equal(
+                    got, expect, err_msg=f"trial={trial} window={wi} site={site}")
+                # broadcast check: every column within a row is identical
+                for row in count_v[rows_at_site]:
+                    assert (row == row[0]).all()
+
+
+def test_simulate_emit_read_counts_widens_output_and_invariant_holds():
+    """End-to-end: --emit-read-counts widens 2K+2 -> 3K+2, and count is
+    always > 0 for every real (non-PAD) cell, including DEL/DIVERGED --
+    the grouped-count design's key invariant (every row is a member of at
+    least its own group)."""
+    K, T = 8, 256
+    out = simulate(
+        np.random.default_rng(5), windows=3, sites=T, founders=K,
+        min_cross=1, max_cross=3, inbreeding=0.0, allele_sharing=0.6,
+        bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+        sharing_theta=4.0, simulate_indels=True, indel_model="overlay",
+        indel_region_mult=8, indel_coverage=2.0, emit_read_counts=True)[0]
+    assert out.shape == (3, T, 3 * K + 2)
+    tern = out[:, :, :K]
+    count = out[:, :, 2 * K + 2:3 * K + 2]
+    real_cell = tern != TERN_PAD
+    assert (count[real_cell] > 0).all()
+    assert (count[tern == TERN_DEL] > 0).any(), \
+        "sanity: fixture should exercise at least one DEL cell with a real count"
+
+
+def test_simulate_emit_read_counts_off_by_default_is_2k2():
+    """emit_read_counts=False (default) keeps the exact pre-existing 2K+2
+    contract -- no behavior change for existing callers."""
+    K, T = 8, 200
+    out = simulate(
+        np.random.default_rng(5), windows=2, sites=T, founders=K,
+        min_cross=1, max_cross=3, inbreeding=0.0, allele_sharing=0.6,
+        bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+        sharing_theta=4.0, simulate_indels=True, indel_model="overlay",
+        indel_region_mult=8, indel_coverage=2.0)[0]
+    assert out.shape == (2, T, 2 * K + 2)
+
+
+def test_simulate_emit_read_counts_requires_simulate_indels():
+    with pytest.raises(ValueError, match="emit_read_counts requires simulate_indels"):
+        simulate(
+            np.random.default_rng(0), windows=2, sites=32, founders=4,
+            min_cross=1, max_cross=2, inbreeding=0.0, allele_sharing=0.6,
+            bad_frac=0.02, emit_read_counts=True)
+
+
+# --- collapse_rows (branch indel-readcount-row-collapse) -----------------
+# Physically collapses each site's same-kind row stack into ONE row BEFORE
+# sampling (instead of sampling one row per read, then computing count via
+# post-hoc grouping) -- windows then span more distinct reference sites for
+# the same T-row budget. User request: "group the reads which have the same
+# ternary structure at the same position, and use the total number of reads
+# as the count" -- literal row merge, not just a re-derived count value
+# (that's the sibling indel-readcount-grouped-count design, which keeps
+# today's row structure exactly as-is).
+
+def test_indel_chunk_collapse_rows_tiny_exact():
+    """Same fixture as test_indel_chunk_tiny_exact. Colinear on1/on2 are
+    already boolean (never stacked -- 1 row each per site); only
+    insertion evidence genuinely stacks. Hand-derived from the fixture's
+    known structure: site0 has on1+on2 (2 groups, weight 1 each); site1
+    has on1+on2+ins-H2 (3 groups -- ins-H2's real stack is
+    min(Binomial(3000,1.0),max_stack=2)=2, so weight=2 there); site2 has
+    only on2 (founder0/lineage0 is deleted there, so on1 can't fire; 1
+    group); site3 has on1+on2 (2 groups). Cumulative group budget reaches
+    T=8 exactly at site3's 2nd group (2+3+1+2=8), one group more than the
+    3 sites test_indel_chunk_tiny_exact's uncollapsed design reaches with
+    the same T in this particular fixture (a coincidence of this tiny
+    example's exact counts, not a general claim -- see
+    test_indel_chunk_collapse_rows_spans_more_sites_with_real_stacking
+    for a case sized to make the span benefit unambiguous)."""
+    n, R, K, lineage, del_lin, ins_lin, h1, h2, match1, match2 = _chunk_fixture()
+    T = 8
+    rng = np.random.default_rng(0)
+    tern, dist, count, lab1, lab2, refpos, short, *_ = _indel_chunk(
+        rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin, match1, match2,
+        gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0, max_stack=2,
+        anchor_thresh=0, ref_founder=-1, dist_scale=DIST_LOG_SCALE,
+        collapse_rows=True)
+
+    expect_tern = np.array([[1, 0], [0, 1], [1, 0], [0, 1], [0, 1],
+                             [-1, 1], [1, 0], [0, 1]], dtype=np.int8)
+    expect_refpos = [0, 0, 1, 1, 1, 2, 3, 3]
+    expect_raw = np.array([[1, 1], [1, 1], [1, 1], [1, 1], [2, 2],
+                            [1, 1], [1, 1], [1, 1]])
+    expect_count = _encode_dist(expect_raw, DIST_LOG_SCALE)
+
+    np.testing.assert_array_equal(tern[0], expect_tern)
+    np.testing.assert_array_equal(refpos[0], expect_refpos)
+    np.testing.assert_array_equal(count[0], expect_count)
+    np.testing.assert_array_equal(short, [False])
+
+
+def test_indel_chunk_collapse_rows_spans_more_sites_with_real_stacking():
+    """The core motivating claim, sized so it's unambiguous: with genuine
+    insertion read-stacking (max_stack=8, a real 5000bp insertion on one
+    lineage), collapse_rows=True reaches a HIGHER max reference site
+    within the same small T-row budget than collapse_rows=False -- windows
+    span more distinct genomic sites instead of burning T-slots on
+    duplicate rows. Same rng seed for both calls: _row_counts (the only
+    rng consumer) runs identically either way -- only downstream row
+    sampling/kind-boundary logic differs, so this isolates the effect."""
+    n, R, K = 1, 12, 2
+    lineage = np.array([[[0] * R, [1] * R]], dtype=np.int64)
+    del_lin = np.zeros((1, 2, R), dtype=bool)
+    ins_lin = np.zeros((1, 2, R), dtype=np.int32)
+    ins_lin[0, 1, 0] = 5000  # big insertion on lineage1, anchored at site0
+    h1 = np.zeros((1, R), dtype=np.int64)
+    h2 = np.ones((1, R), dtype=np.int64)
+    match1 = np.zeros((1, R, K), dtype=np.int8); match1[0, :, 0] = 1
+    match2 = np.zeros((1, R, K), dtype=np.int8); match2[0, :, 1] = 1
+
+    T = 6
+    kw = dict(gamete_balance=0.5, coverage=1e9, ins_read_per_bp=1.0,
+              max_stack=8, anchor_thresh=0, ref_founder=-1,
+              dist_scale=DIST_LOG_SCALE)
+    _, _, _, _, _, refpos_c, short_c, *_ = _indel_chunk(
+        np.random.default_rng(3), n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
+        match1, match2, collapse_rows=True, **kw)
+    _, _, _, _, _, refpos_u, short_u, *_ = _indel_chunk(
+        np.random.default_rng(3), n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
+        match1, match2, collapse_rows=False, **kw)
+
+    # Uncollapsed: site0 alone has on1(1)+on2(1)+c1(0)+c2(8, insertion
+    # stack capped at max_stack) = 10 rows -- the whole T=6 budget is
+    # consumed at site0, refpos never advances past it.
+    assert (refpos_u[0][refpos_u[0] >= 0] == 0).all()
+    # Collapsed: site0 has only 3 GROUPS (on1, on2, ins-H2), so the
+    # remaining budget advances to later sites.
+    max_site_collapsed = refpos_c[0][refpos_c[0] >= 0].max()
+    assert max_site_collapsed > 0, \
+        "collapse_rows should let the window advance past site0"
+    assert max_site_collapsed >= 2
+
+
+def test_indel_chunk_collapse_rows_weight_matches_raw_stack_size():
+    """Fuzz: each emitted row's count (decoded back through _encode_dist's
+    own inverse on a small integer range, which is exact/lossless there)
+    equals 1 for on1/on2-kind rows and the real (already max_stack-capped)
+    c1/c2 value for insertion-kind rows -- reconstructed independently
+    from _row_counts's own on1/on2/c1/c2 arrays, not from _indel_chunk's
+    internals, so this can't just be checking the implementation against
+    itself."""
+    rng = np.random.default_rng(11)
+    for trial in range(10):
+        n, M, K, R = 1, 2, 3, int(rng.integers(6, 16))
+        lineage = rng.integers(0, M, size=(n, K, R)).astype(np.int64)
+        del_lin, ins_lin = _indel_tracts(rng, n, M, R, **_TRACT_KW)
+        h1 = rng.integers(0, K, size=(n, R))
+        h2 = rng.integers(0, K, size=(n, R))
+        match1 = (rng.random((n, R, K)) < 0.5).astype(np.int8)
+        match2 = (rng.random((n, R, K)) < 0.5).astype(np.int8)
+
+        # Reproduce _indel_chunk's own pres1/pres2/m1/m2/ins1/ins2 derivation
+        # (needed to independently recompute on1/on2/c1/c2 via _row_counts)
+        dist_lin = _anchor_distance(del_lin)
+        dist_kt = _gather_by_lineage(dist_lin, lineage)
+        ii = np.arange(n)[:, None]
+        tt = np.arange(R)[None, :]
+        m1 = lineage[ii, h1, tt]
+        m2 = lineage[ii, h2, tt]
+        pres1 = dist_kt[ii, h1, tt] <= 0
+        pres2 = dist_kt[ii, h2, tt] <= 0
+        ins1 = ins_lin[ii, m1, tt]
+        ins2 = ins_lin[ii, m2, tt]
+
+        chunk_rng = np.random.default_rng(trial)
+        row_rng_state = np.random.default_rng(trial)  # same seed -> same draws
+        on1, on2, c1, c2, _ = _row_counts(
+            row_rng_state, pres1, pres2, ins1, ins2, gamete_balance=0.5,
+            coverage=6.0, ins_read_per_bp=2e-2, max_stack=6)
+
+        T = int(rng.integers(2, R))
+        tern, dist, count, lab1, lab2, refpos, short, *_ = _indel_chunk(
+            chunk_rng, n, R, T, K, h1, h2, lineage, del_lin, ins_lin,
+            match1, match2, gamete_balance=0.5, coverage=6.0,
+            ins_read_per_bp=2e-2, max_stack=6, anchor_thresh=0,
+            ref_founder=-1, dist_scale=DIST_LOG_SCALE, collapse_rows=True)
+
+        # _row_counts is called with an INDEPENDENT rng instance seeded
+        # identically to chunk_rng's starting state, so its draws match
+        # _indel_chunk's own internal call bit-for-bit (both are the very
+        # first rng consumer in their respective call chains).
+        for wi in range(n):
+            valid = refpos[wi] >= 0
+            if not valid.any():
+                continue
+            for ri in np.flatnonzero(valid):
+                site = refpos[wi, ri]
+                tv = tuple(tern[wi, ri].tolist())
+                cv = count[wi, ri, 0]  # scalar, broadcast across K
+                # kind0 (on1) always shows match1's pattern; kind1 (on2)
+                # shows match2's; distinguish by which weight is consistent
+                w1_expect = _encode_dist(np.array([1]), DIST_LOG_SCALE)[0]
+                candidates = {w1_expect}
+                if c1[wi, site] > 0:
+                    candidates.add(_encode_dist(np.array([int(c1[wi, site])]),
+                                                 DIST_LOG_SCALE)[0])
+                if c2[wi, site] > 0:
+                    candidates.add(_encode_dist(np.array([int(c2[wi, site])]),
+                                                 DIST_LOG_SCALE)[0])
+                assert cv in candidates, (
+                    f"trial={trial} window={wi} row={ri} site={site}: "
+                    f"count={cv} not in expected {candidates} "
+                    f"(c1={c1[wi,site]} c2={c2[wi,site]})")
+
+
+def test_simulate_collapse_rows_requires_emit_read_counts():
+    with pytest.raises(ValueError, match="collapse_rows requires emit_read_counts"):
+        simulate(
+            np.random.default_rng(0), windows=2, sites=32, founders=4,
+            min_cross=1, max_cross=2, inbreeding=0.0, allele_sharing=0.6,
+            bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+            sharing_theta=4.0, simulate_indels=True, indel_model="overlay",
+            indel_region_mult=8, indel_coverage=2.0,
+            emit_read_counts=False, collapse_rows=True)
+
+
+def test_simulate_collapse_rows_end_to_end_shape():
+    """collapse_rows=True runs end-to-end through simulate() with the same
+    3K+2 contract as emit_read_counts alone -- no shape/dtype change from
+    the row-sampling mechanism swap."""
+    K, T = 8, 256
+    out = simulate(
+        np.random.default_rng(5), windows=3, sites=T, founders=K,
+        min_cross=1, max_cross=3, inbreeding=0.0, allele_sharing=0.6,
+        bad_frac=0.02, sharing_model="coalescent", ancestors=6,
+        sharing_theta=4.0, simulate_indels=True, indel_model="overlay",
+        indel_region_mult=8, indel_coverage=2.0,
+        emit_read_counts=True, collapse_rows=True)[0]
+    assert out.shape == (3, T, 3 * K + 2)
+    assert out.dtype == np.int8
+    tern = out[:, :, :K]
+    count = out[:, :, 2 * K + 2:3 * K + 2]
+    real_cell = tern != TERN_PAD
+    assert (count[real_cell] > 0).all()
+
+
+def test_simulate_collapse_rows_off_by_default_matches_grouped_count():
+    """collapse_rows=False (default) is byte-identical to not passing the
+    parameter at all -- same golden-hash-safety pattern as every other
+    flag in this module."""
+    K, T = 8, 128
+    kw = dict(windows=2, sites=T, founders=K, min_cross=1, max_cross=3,
+              inbreeding=0.0, allele_sharing=0.6, bad_frac=0.02,
+              sharing_model="coalescent", ancestors=6, sharing_theta=4.0,
+              simulate_indels=True, indel_model="overlay",
+              indel_region_mult=8, indel_coverage=2.0, emit_read_counts=True)
+    out_default = simulate(np.random.default_rng(5), **kw)[0]
+    out_explicit_false = simulate(np.random.default_rng(5), collapse_rows=False, **kw)[0]
+    np.testing.assert_array_equal(out_default, out_explicit_false)
+
+
+# --- --indel-model replacement (experiments/het-replacement/PLAN.md §2.3) ---
+
+def test_replacement_indels_sharing_and_groups():
+    rng = np.random.default_rng(0)
+    n, K, R = 3, 25, 4000
+    del_mask, rep_grp = _replacement_indels(rng, n, K, R, rate=2e-3, mean_len=40.0,
+                                            max_share=10, groups_mean=2.0, max_len=500)
+    assert del_mask.shape == rep_grp.shape == (n, K, R)
+    np.testing.assert_array_equal(del_mask, rep_grp >= 0)
+    k = del_mask.sum(1)
+    assert k.max() >= 2, "tracts must be shared by several founders"
+    assert np.bincount(k.ravel())[1:].sum() > 0
+
+
+def _repl_sim(**kw):
+    base = dict(windows=4, sites=20000, founders=12, min_cross=2, max_cross=6, inbreeding=0.0,
+                allele_sharing=0.2, bad_frac=0.05, sharing_model="coalescent", ancestors=6,
+                sharing_theta=4.0, simulate_indels=True, indel_coverage=2.0, indel_region_mult=2,
+                indel_model="replacement", repl_rate=5e-3, repl_mean_len=60.0, repl_max_share=8)
+    base.update(kw)
+    return simulate(np.random.default_rng(1), **base)[0]
+
+
+def test_replacement_rows_exist_where_both_founders_are_deleted():
+    K = 12
+    out = _repl_sim()
+    dist, h1, h2 = out[..., K + 2:2 * K + 2], out[..., K].astype(int), out[..., K + 1].astype(int)
+    dele = dist > 0
+    g = lambda f: np.take_along_axis(dele, np.clip(f, 0, K - 1)[..., None], 2)[..., 0]
+    both = g(h1) & g(h2) & (h1 >= 0)
+    assert both.any(), "a site where both haplotypes lack the B73 sequence must still yield rows"
+
+
+def test_replacement_rows_keep_matches_at_deleted_founders():
+    K = 12
+    out = _repl_sim()
+    tern, dist = out[..., :K], out[..., K + 2:2 * K + 2]
+    # overlay/tracts rows never show MATCH at a founder deleted at the row's site;
+    # replacement rows must (refmap marks set members MATCH regardless of distance)
+    assert ((tern == TERN_MATCH) & (dist > 0)).any()
+
+
+def test_replacement_rows_are_placed_off_site_with_shift():
+    K = 12
+    a = _repl_sim(repl_shift_sites=0.0)
+    b = _repl_sim(repl_shift_sites=200.0)
+    assert not np.array_equal(a, b)
+
+
+def _obs_table(p_del=(0.3, 0.3, 0.4, 0.6, 0.7, 0.75), p_pres=0.1):
+    pmf = lambda lo, hi: [0.0] + [1.0 if lo <= c < hi else 0.0 for c in range(128)]
+    return {"len_edges_bp": [0, 100, 500, 1000, 4000, 20000, 10 ** 12],
+            "p_minus1_given_del_by_len": list(p_del), "p_minus1_given_present": p_pres,
+            "bp_per_site": 3000.0, "dist_code_offset": 1,
+            "dist_code_pmf": {"present|0": pmf(40, 60), "present|-1": pmf(90, 100),
+                              "del|0": pmf(70, 80), "del|-1": pmf(100, 110)}}
+
+
+def test_run_length_counts_each_run():
+    m = np.array([[0, 1, 1, 0, 1, 1, 1, 0, 0, 1]], bool)
+    assert _run_length(m).tolist() == [[0, 2, 2, 0, 3, 3, 3, 0, 0, 1]]
+
+
+def test_refmap_observation_rates_and_codes():
+    rng = np.random.default_rng(0)
+    dm = np.zeros((40, 6, 3000), bool)
+    dm[:, :, 100:110] = True                      # 10 sites * 3kb = 30kb run -> last bucket
+    dm[:, :, 500] = True                          # 1 site = 3kb -> 1-4kb bucket
+    od, code = _refmap_observation(rng, dm, 0, _obs_table())
+    assert not od[:, 0].any() and (code[:, 0] == 0).all()          # reference founder
+    long_ = dm[:, 1:, 100:110]
+    assert abs(od[:, 1:, 100:110][long_].mean() - 0.75) < 0.03
+    assert abs(od[:, 1:, 500].mean() - 0.6) < 0.05
+    pres = ~dm[:, 1:]
+    assert abs(od[:, 1:][pres].mean() - 0.1) < 0.01
+    c, o, d = code[:, 1:], od[:, 1:], dm[:, 1:]
+    assert ((c[~d & ~o] >= 40) & (c[~d & ~o] < 60)).all()
+    assert ((c[~d & o] >= 90) & (c[~d & o] < 100)).all()
+    assert ((c[d & o] >= 100) & (c[d & o] < 110)).all()
+
+
+def test_obs_table_changes_only_observation_not_reads():
+    kw = dict(windows=2, sites=6000, founders=12, min_cross=2, max_cross=4, inbreeding=1.0,
+              allele_sharing=0.2, bad_frac=0.05, sharing_model="coalescent", ancestors=4,
+              sharing_theta=4.0, simulate_indels=True, indel_model="overlay", indel_coverage=2.0,
+              indel_region_mult=2)
+    K = 12
+    a = simulate(np.random.default_rng(3), **kw)[0]
+    b = simulate(np.random.default_rng(3), obs_table=_obs_table(), **kw)[0]
+    ta, tb = a[..., :K], b[..., :K]
+    live = ta != TERN_PAD
+    assert np.array_equal(live, tb != TERN_PAD)
+    # rows and matches are the same reads; only -1/0 of non-matching founders and distances change
+    assert np.array_equal(ta == TERN_MATCH, tb == TERN_MATCH)
+    assert np.array_equal(a[..., K:K + 2], b[..., K:K + 2])
+    assert ((tb[live] == TERN_DEL) != (ta[live] == TERN_DEL)).any()
+
+
+def test_replacement_lineage_groups_follow_lineages():
+    rng = np.random.default_rng(0)
+    n, K, R = 3, 10, 400
+    lineage = np.zeros((n, K, R), dtype=np.int32)
+    lineage[:, 5:, :] = 1                         # two clades
+    lineage[:, 8:, 200:] = 2                      # founders 8,9 switch lineage at site 200
+    dm, grp = _replacement_indels(rng, n, K, R, 0.01, 30.0, 3, 1.0, 400, lineage=lineage)
+    assert dm.any()
+    for w in range(n):
+        for t in range(R):
+            for lin in np.unique(lineage[w, :, t]):
+                members = lineage[w, :, t] == lin
+                # founders sharing a lineage at a site share its deletion state and group
+                assert len(set(dm[w, members, t].tolist())) == 1
+                assert len(set(grp[w, members, t].tolist())) == 1
+
+
+def test_replacement_random_groups_default_unchanged():
+    kw = dict(windows=2, sites=6000, founders=12, min_cross=2, max_cross=4, inbreeding=1.0,
+              allele_sharing=0.2, bad_frac=0.05, sharing_model="coalescent", ancestors=4,
+              sharing_theta=4.0, simulate_indels=True, indel_model="replacement", indel_coverage=2.0,
+              indel_region_mult=2)
+    a = simulate(np.random.default_rng(3), **kw)[0]
+    b = simulate(np.random.default_rng(3), repl_groups="random", **kw)[0]
+    c = simulate(np.random.default_rng(3), repl_groups="lineage", **kw)[0]
+    assert np.array_equal(a, b) and not np.array_equal(a, c)
+
+
+def test_obs_by_lineage_makes_ibd_founders_identical():
+    kw = dict(windows=2, sites=6000, founders=12, min_cross=2, max_cross=4, inbreeding=1.0,
+              allele_sharing=0.2, bad_frac=0.05, sharing_model="coalescent", ancestors=4,
+              sharing_theta=4.0, simulate_indels=True, indel_model="replacement", repl_groups="lineage",
+              indel_coverage=2.0, indel_region_mult=2, obs_table=_obs_table())
+    a = simulate(np.random.default_rng(3), **kw)[0]
+    b = simulate(np.random.default_rng(3), obs_by_lineage=False, **kw)[0]
+    assert np.array_equal(a, b)                                  # default unchanged
+    out = simulate(np.random.default_rng(3), obs_by_lineage=True, **kw)
+    o, ibd, refpos = out[0], out[1], out[6]
+    K = 12
+    t, d = o[..., :K], o[..., K + 2:2 * K + 2]
+    lin = np.take_along_axis(ibd, np.clip(refpos, 0, None)[..., None], axis=1)   # [n,L,K]
+    live = refpos >= 0
+    diff = 0
+    for i in range(o.shape[0]):
+        for r in np.nonzero(live[i])[0][:2000]:
+            for l in np.unique(lin[i, r]):
+                m = lin[i, r] == l
+                nm = m & (t[i, r] != 1)
+                if nm.sum() > 1:
+                    diff += len(set(zip(t[i, r][nm].tolist(), d[i, r][nm].tolist()))) > 1
+    assert diff == 0
+
+
+# --emit-row-provenance sidecar (supervised-heads branch) ---------------------
+
+def _prov_kw(**kw):
+    base = dict(windows=3, sites=6000, founders=12, min_cross=2, max_cross=4, inbreeding=0.0,
+                allele_sharing=0.2, bad_frac=0.1, sharing_model="coalescent", ancestors=4,
+                sharing_theta=4.0, simulate_indels=True, indel_model="replacement",
+                repl_groups="lineage", repl_rate=5e-3, repl_mean_len=60.0, repl_max_share=8,
+                repl_shift_sites=2.0, indel_coverage=2.0, indel_region_mult=2,
+                emit_read_counts=True, collapse_rows=True, obs_table=_obs_table())
+    base.update(kw)
+    return base
+
+
+def test_row_provenance_off_is_byte_identical():
+    a = simulate(np.random.default_rng(5), **_prov_kw())
+    b = simulate(np.random.default_rng(5), emit_row_provenance=True, **_prov_kw())
+    assert len(a) == 9 and len(b) == 10
+    for x, y in zip(a, b[:9]):
+        if isinstance(x, np.ndarray):
+            assert np.array_equal(x, y)
+    assert b[9].shape == b[0].shape[:2] and b[9].dtype == np.int8
+
+
+def test_row_provenance_semantics():
+    from python.crf.simulate_alleles import (PROV_KIND_MASK, PROV_OFF_SITE, PROV_BAD_SITE,
+                                             prov_is_clean)
+    K = 12
+    out = simulate(np.random.default_rng(5), emit_row_provenance=True, **_prov_kw())
+    o, prov = out[0], out[9].astype(int)
+    kind = prov & PROV_KIND_MASK
+    assert (prov >= 0).all() and set(np.unique(kind)) <= set(range(6))
+    assert {0, 1, 4, 5} <= set(np.unique(kind))
+    bad, off = (prov & PROV_BAD_SITE) > 0, (prov & PROV_OFF_SITE) > 0
+    assert not (bad & (kind > 1)).any() and not (off & (kind < 4)).any()
+    assert off.any() and bad.any()
+    coll = kind <= 1
+    assert 0.05 < bad[coll].mean() < 0.15            # ~ bad_frac=0.1
+    tern = o[..., :K]
+    h = np.where(kind == 0, o[..., K], o[..., K + 1]).astype(int)
+    own = np.take_along_axis(tern, h[..., None], -1)[..., 0]
+    # a clean collinear read always matches the founder of the haplotype it came from
+    assert (own[coll & ~bad] == 1).all()
+    assert (own[coll & bad] != 1).mean() > 0.2       # corrupted reads often do not
+    clean = prov_is_clean(prov)
+    assert np.array_equal(clean, ~bad & ~off)
+    assert not prov_is_clean(np.array([-1])).any()
+
+
+class TestStructuredDistance:
+    """--dist-structure: shared-mode anchor-distance codes obey refmap's 2kb rule and IBD sharing."""
+
+    def _tabs(self):
+        import json
+        from pathlib import Path
+        from python.crf.simulate_alleles import _prep_dist_structure
+        root = Path(__file__).resolve().parents[3] / "experiments/het-replacement/results"
+        ds = json.loads((root / "calib_dist_structure_s200.json").read_text())
+        obs = json.loads((root / "repl_params_v3.json").read_text())["suggested_sim_params"]["obs_table"]
+        return _prep_dist_structure(ds, obs)
+
+    def test_rules_and_sharing(self):
+        from python.crf.simulate_alleles import _structured_distance
+        rng = np.random.default_rng(0)
+        N, K = 4000, 25
+        tern = rng.choice([-1, 0, 1], size=(N, K), p=[.25, .4, .35]).astype(np.int8)
+        lin = rng.integers(0, 12, size=(N, K))
+        lin[:, 1] = lin[:, 0]
+        tern[:, 1] = tern[:, 0]
+        tern[:, 3] = 1                                          # the reference always matches itself
+        truth = tern == -1
+        code = _structured_distance(rng, tern, truth, lin, np.zeros(N, bool), 3, self._tabs(), 0.0, 88)
+        assert ((code[tern == -1] > 88).all())
+        assert ((code[tern == 0] <= 88).all())
+        assert ((code[:, 3] == 0).all())
+        assert ((code[:, 0] == code[:, 1]).all())       # same lineage + state -> same code
+        distinct = np.mean([len(np.unique(r)) for r in code]) / K
+        assert distinct < 0.6                          # shared, not K independent draws
+
+    def test_same_site_copy(self):
+        from python.crf.simulate_alleles import _structured_distance
+        rng = np.random.default_rng(1)
+        tern = np.ones((6, 25), np.int8)
+        lin = np.tile(np.arange(25), (6, 1))
+        ssp = np.array([False, True, True, False, True, True])
+        code = _structured_distance(rng, tern, tern < 0, lin, ssp, -1, self._tabs(), 1.0, 88)
+        assert ((code[0] == code[1]).all() and (code[1] == code[2]).all())
+        assert ((code[3] == code[5]).all())
