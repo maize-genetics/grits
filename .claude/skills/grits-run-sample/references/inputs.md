@@ -1,10 +1,9 @@
 # Resources the pipeline needs
 
-Every path lives in `scripts/grits.env` and can be overridden by environment variable. The defaults
-are locations under three variables you set: `GRITS_WORKDIR`, `GRITS_REFMAP_ROOT` and
-`GRITS_PYTHON_ENV` (or `GRITS_PY`). On the lab's Cornell server these are the lab's working directory,
-the ropebwt index directory and its pixi environment; ask the lab for the exact values. On another
-machine you need all of the "required" items. The model
+Every path is read from `scripts/grits.env`, which has no built-in values: the user sets each one, by
+exporting the variable or in a copy of `grits.env` pointed at by `GRITS_ENV`. If the lab already has these
+resources on a shared server, ask the lab for their locations. On another machine you need all of the
+"required" items. The model
 is tied to one specific 25-founder panel, so the index, lift and checkpoint must all come from that panel.
 
 ## Required
@@ -14,7 +13,7 @@ is tied to one specific 25-founder panel, so the index, lift and checkpoint must
 | `GRITS_ROPEBWT3` | ropebwt3 with the GRITS `refmap` options | Build [maize-genetics/ropebwt3-phg](https://github.com/maize-genetics/ropebwt3-phg), branch `develop` (PR #10 merged the GRITS options there): `git clone https://github.com/maize-genetics/ropebwt3-phg && cd ropebwt3-phg && git checkout develop && make`. `check_setup.sh` confirms the build has `--err-noclip`. |
 | `GRITS_INDEX` | FM-index of the 25 founder assemblies (`.fmd`), with `.fmd.ssa` and `.fmd.len.gz` beside it | Ask the lab for the v2 maize index (about 8 GB). To rebuild, see below. |
 | `GRITS_REF_PREFIX` | name of the reference assembly in the index (default `B73`) | For another panel, the assembly you built the lift against. |
-| `GRITS_LIFT` | anchor map from each founder to the reference, `-k 50 -s 200` | `ropebwt3 lift --ref-prefix=B73 -k 50 -s 200 -t 16 -o k50_s200.lift INDEX.fmd B73.fa` takes about 4 min and 10 GB RAM. It must be k50/s200: the read-placement fix relies on dense anchors. |
+| `GRITS_LIFT` | anchor map from each founder to the reference, `-k 50 -s 200` | Ask the lab for its copy, or build one: `ropebwt3 lift --ref-prefix=B73 -k 50 -s 200 -t 16 -o k50_s200.lift INDEX.fmd B73.fa` takes about 4 min and 10 GB RAM. It must be k50/s200: the read-placement fix relies on dense anchors. |
 | `GRITS_CKPT` | the promoted model checkpoint (`v6cfullfe-stage2B/last.ckpt`, 23 MB) | Ask the lab. It is trained for exactly this panel. |
 | `GRITS_PY`, `GRITS_LD` | Python with torch, pytorch_lightning, numpy, pandas | The repo's default pixi environment works: `pixi install` (its torch build supports CUDA; the `gpu` environment is not needed and currently fails to build `mamba-ssm`), then set `GRITS_PY` to its python and `GRITS_LD` to its `lib/`. |
 

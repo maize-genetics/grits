@@ -27,7 +27,7 @@ S=/path/to/grits/.claude/skills/grits-run-sample/scripts
 | ropebwt3 | `GRITS_ROPEBWT3` | Build [maize-genetics/ropebwt3-phg](https://github.com/maize-genetics/ropebwt3-phg) branch `develop` with `make`. Older builds lack `--err-noclip`. |
 | FM-index of the founder assemblies | `GRITS_INDEX` | `.fmd`, with `.fmd.ssa` and `.fmd.len.gz` beside it (~8 GB for maize). For maize, copy the lab's v2 25-founder index; for anything else, build one (section 2). |
 | Reference assembly name | `GRITS_REF_PREFIX` | the assembly the lift and BED coordinates are relative to. Default `B73`. |
-| Lift | `GRITS_LIFT` | built from the index (section 2), ~4 min, 10 GB RAM. It must be `-k 50 -s 200`. |
+| Lift | `GRITS_LIFT` | ask the lab for its copy, or build it from the index (section 2), ~4 min, 10 GB RAM. It must be `-k 50 -s 200`. |
 | Model checkpoint | `GRITS_CKPT` | `v6cfullfe-stage2B/last.ckpt` (23 MB). Get it from the lab; it can't be rebuilt from the assemblies. |
 | Python | `GRITS_PY`, `GRITS_LD` | torch, pytorch_lightning, numpy, pandas. Use the repo's default pixi env: `pixi install` (on Linux its torch build already supports CUDA GPUs). The `gpu` env is not needed and currently fails to build `mamba-ssm`. |
 | GPU | — | ~30 GB free for a 1x sample; less at 0.1x. CPU works but is slow. |
@@ -70,11 +70,10 @@ index itself, the panel and order must match the lab's exactly, or the checkpoin
 
 ## 3. Point the scripts at your resources
 
-Every path is read from `$S/grits.env`. Either export the variables, or copy that file, edit it and point
-`GRITS_ENV` at the copy. The simplest setup is to set each path explicitly:
+Every path is read from `$S/grits.env`, which has no built-in values. Either export the variables, or copy that
+file, fill it in and point `GRITS_ENV` at the copy:
 
 ```bash
-export GRITS_WORKDIR=/path/to/grits_workdir          # required by grits.env; other defaults live under it
 export GRITS_ROPEBWT3=/path/to/ropebwt3-phg/ropebwt3
 export GRITS_INDEX=/path/to/maizeFastaIndex_SampleContig_v2.fmd
 export GRITS_LIFT=/path/to/k50_s200.lift

@@ -17,6 +17,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 source "${GRITS_ENV:-$HERE/grits.env}"
 REPO=$(cd "$HERE/../../../.." && pwd)
 [ $# -ge 3 ] || { sed -n '2,13p' "$0"; exit 2; }
+for v in GRITS_ROPEBWT3 GRITS_INDEX GRITS_LIFT GRITS_PY; do
+  [ -n "${!v:-}" ] || { echo "$v is not set: export it or set it in a copy of grits.env (GRITS_ENV); run check_setup.sh" >&2; exit 2; }
+done
 OUT=$1; T=$2; shift 2
 mkdir -p "$OUT"
 [ -f "$OUT/align.done" ] && { echo "already aligned: $OUT"; exit 0; }

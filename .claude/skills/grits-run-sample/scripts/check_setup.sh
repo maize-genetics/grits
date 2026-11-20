@@ -10,6 +10,13 @@ fail() { printf '  FAIL  %s\n' "$*"; bad=1; }
 need() { [ -e "$2" ] && ok "$1: $2" || fail "$1 missing: $2"; }
 
 echo "Required:"
+unset_vars=
+for v in GRITS_ROPEBWT3 GRITS_INDEX GRITS_LIFT GRITS_CKPT GRITS_PY; do [ -n "${!v:-}" ] || unset_vars="$unset_vars $v"; done
+if [ -n "$unset_vars" ]; then
+  fail "not set:$unset_vars (export them, or set them in a copy of grits.env and point GRITS_ENV at it)"
+  echo "Set every required path first (see references/inputs.md)."
+  exit 1
+fi
 [ -x "$GRITS_ROPEBWT3" ] && ok "ropebwt3: $GRITS_ROPEBWT3" || fail "ropebwt3 not executable: $GRITS_ROPEBWT3"
 if [ -x "$GRITS_ROPEBWT3" ]; then
   "$GRITS_ROPEBWT3" refmap 2>&1 | grep -q -- '--err-noclip' && ok "ropebwt3 has the promoted refmap options" \
@@ -52,7 +59,7 @@ fi
 
 if [ "${1:-}" = --vcf ]; then
   echo "Optional (VCF output):"
-  need "panel VCF" "$GRITS_PANEL_VCF"
+  [ -n "${GRITS_PANEL_VCF:-}" ] && need "panel VCF" "$GRITS_PANEL_VCF" || fail "GRITS_PANEL_VCF not set"
   B=$(command -v "$GRITS_BED2VCF") && ok "bed-to-vcf CLI: $B" || fail "bed-to-vcf CLI not found: $GRITS_BED2VCF (set GRITS_BED2VCF to the sample CLI)"
   TP=${GRITS_JAVA_HOME_BIN:+$GRITS_JAVA_HOME_BIN:}${GRITS_HTSLIB_BIN:+$GRITS_HTSLIB_BIN:}$PATH
   J=$(PATH=$TP command -v java) && ok "java: $("$J" -version 2>&1 | head -1)" || fail "java 21 not found (put it on PATH or set GRITS_JAVA_HOME_BIN)"

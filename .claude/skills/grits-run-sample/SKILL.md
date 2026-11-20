@@ -19,14 +19,17 @@ and in-panel samples at 0.1x and 1x), so results are comparable with the publish
 
 ## Before you start: what to ask and check
 
-1. **Run `scripts/check_setup.sh`** (add `--vcf` if they want a VCF). It checks every resource listed in
-   `scripts/grits.env` (index, lift, checkpoint, ropebwt3 build, Python env, GPU). First export three
-   variables: `GRITS_WORKDIR` (the GRITS working directory holding the checkpoint and lift),
-   `GRITS_REFMAP_ROOT` (the directory holding `rope_bwt_index_v2/`) and `GRITS_PYTHON_ENV` (a Python
-   environment with torch). The other paths default to locations under these. If a line says FAIL, read
-   `references/inputs.md`: it says what each resource is and how to build or obtain it. Point the scripts at other paths by exporting the
-   variables or with `GRITS_ENV=/path/to/copy.env`.
-2. **Find out about the sample**, because it decides how much to trust the result:
+1. **Get the resource paths from the user.** The skill has no built-in paths. It needs:
+   `GRITS_ROPEBWT3` (the ropebwt3-phg build), `GRITS_INDEX` (the pangenome `.fmd`), `GRITS_LIFT` (the
+   k50/s200 lift), `GRITS_CKPT` (the model checkpoint) and `GRITS_PY` or `GRITS_PYTHON_ENV` (Python with
+   torch); for a VCF also `GRITS_PANEL_VCF`. If they are already exported, or `GRITS_ENV` points at a filled-in
+   copy of `scripts/grits.env`, use those. Otherwise **ask the user for each missing one**: never guess a
+   path, search the filesystem for one, or reuse a path from another project. If they don't have a resource,
+   `references/inputs.md` says what it is and how to build or obtain it.
+2. **Run `scripts/check_setup.sh`** (add `--vcf` if they want a VCF). It checks every resource (set, exists,
+   ropebwt3 version, reference name in the index, panel size against the checkpoint, Python env, GPU). Fix
+   every FAIL before running anything.
+3. **Find out about the sample**, because it decides how much to trust the result:
    - **Species and panel.** The model was trained on the 25-founder maize panel. Other species, or panels of
      up to 25 assemblies, can be run **experimentally**: build an index and lift for that panel
      (`references/inputs.md`), set `GRITS_REF_PREFIX` to the reference assembly's name, and the decode pads the
@@ -41,7 +44,7 @@ and in-panel samples at 0.1x and 1x), so results are comparable with the publish
      early.
    - **Depth.** The model was tuned at about 0.1x and 1x genome coverage (roughly 1.5M and 15M 150 bp
      reads). Lower or much higher depth works but is outside what was calibrated.
-3. **Pick an output directory per sample** with enough space (~1 GB at 0.1x, ~5 GB at 1x while running).
+4. **Ask where to write the output**, one directory per sample, with enough space (~1 GB at 0.1x, ~5 GB at 1x while running).
 
 ## Step 1: align
 
