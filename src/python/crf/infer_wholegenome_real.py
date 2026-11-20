@@ -61,7 +61,8 @@ def _encode_real(model, feats, starts, win, ext_emb, device, bs, homo_scale):
         Xb = Xs[i:i + bs].to(device)
         eb = ext_emb.expand(Xb.shape[0], -1, -1) if ext_emb is not None else None
         hs = torch.full((Xb.shape[0],), homo_scale, device=device)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        dev_type = torch.device(device).type
+        with torch.autocast(dev_type, dtype=torch.bfloat16, enabled=dev_type == "cuda"):
             emis_p, _g, c = model(Xb, hs, eb)
         em.append(emis_p.float().cpu())
         cc.append(c.float().cpu())
@@ -109,6 +110,8 @@ def k_target_to_name(idx_target, dropped_idx, gamete_names):
     idx_source = idx_target
     if dropped_idx is not None and idx_target >= dropped_idx:
         idx_source += 1
+    if idx_source >= len(gamete_names):
+        return None                                   # null state: no founder
     return gamete_names[idx_source]
 
 
@@ -123,14 +126,23 @@ def write_wholechrom_bed(sample, contig_preds, model, gamete_names, dropped_idx,
     written = []
     for contig, (pred, bp) in contig_preds.items():
         pred_np = pred.numpy()
-        p1 = [k_target_to_name(int(pi_c[p]), dropped_idx, gamete_names) for p in pred_np]
-        p2 = [k_target_to_name(int(pj_c[p]), dropped_idx, gamete_names) for p in pred_np]
-        df = pd.DataFrame({"chrom": contig, "start": bp, "end": bp + 256,
-                            "parent1": p1, "parent2": p2})
+        p1 = np.array([k_target_to_name(int(pi_c[p]), dropped_idx, gamete_names) for p in pred_np], object)
+        p2 = np.array([k_target_to_name(int(pj_c[p]), dropped_idx, gamete_names) for p in pred_np], object)
+        # Same convention as heldout_assembly_eval.write_imputed_bed and decode_sample.py: each row is
+        # a 1 bp marker at its bin start, a founder switch between consecutive rows is split at the
+        # midpoint, and null-state rows are left out (their stretch stays uncalled).
+        keep = np.array([a is not None and b is not None for a, b in zip(p1, p2)], bool)
+        if not keep.any():
+            print(f"  {contig}: all {len(pred_np):,} sites null-state, no BED written")
+            continue
+        df = pd.DataFrame({"chrom": contig, "start": bp[keep], "end": bp[keep] + 1,
+                           "parent1": p1[keep], "parent2": p2[keep], "row": np.flatnonzero(keep)})
         out_path = out_dir / f"{sample}_{contig}_imputed.bed"
-        output_collapse_bed(df, str(out_path))
+        output_collapse_bed(df, str(out_path), fill_switch_gaps=True)
         written.append(out_path)
-        print(f"  {contig}: {len(pred_np):,} real sites -> {out_path}")
+        n_null = int((~keep).sum())
+        print(f"  {contig}: {int(keep.sum()):,} real sites -> {out_path}"
+              + (f" ({n_null:,} null-state sites skipped)" if n_null else ""))
     return written
 
 

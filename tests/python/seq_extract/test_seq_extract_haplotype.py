@@ -461,3 +461,14 @@ def test_tile_projection_queries_second_pass(world):
     assert second == [(0, 20, "B"), (0, 8, "B"), (8, 16, "B"), (16, 20, "B"), (20, 40, "A"), (0, 40, "A")]
     with pytest.raises(ValueError, match="tile_on_failure"):
         HaplotypeBuilder({}, None, None, "N", tile_on_failure=-1)
+
+
+def test_read_bed_dir_contig_with_underscore(tmp_path):
+    d = tmp_path / "bed"
+    d.mkdir()
+    (d / "S1_chr1_imputed.bed").write_text("chrom\tstart\tend\tparent1\tparent2\nchr1\t0\t5\tA\tA\n")
+    (d / "S1_scaffold_10_imputed.bed").write_text(
+        "chrom\tstart\tend\tparent1\tparent2\nscaffold_10\t0\t5\tB\tB\n")
+    by = read_bed_dir(d)
+    assert sorted(by) == ["chr1", "scaffold_10"]
+    assert sorted(read_bed_dir(d, sample="S1")) == ["chr1", "scaffold_10"]

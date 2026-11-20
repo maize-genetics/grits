@@ -19,8 +19,34 @@ class EMACallback(pl.Callback):
         self.decay = decay
         self.shadow = None
         self._backup = None
+        self._resume = None
+        self._module = None
 
+    def state_dict(self):
+        # A checkpoint written during validation holds the EMA weights as the model weights,
+        # while the optimizer moments belong to the raw weights. Keep the raw weights and the
+        # shadow here so --resume continues from the raw weights the optimizer state matches.
+        if self.shadow is None:
+            return {}
+        raw = self._backup
+        if raw is None:
+            raw = {k: v for k, v in self._module.state_dict().items() if k in self.shadow}
+        return {"shadow": {k: v.detach().cpu() for k, v in self.shadow.items()},
+                "raw": {k: v.detach().cpu() for k, v in raw.items()}}
+
+    def load_state_dict(self, state_dict):
+        self._resume = state_dict or None
+
+    @torch.no_grad()
     def on_train_start(self, trainer, pl_module):
+        self._module = pl_module
+        if self._resume:
+            sd = pl_module.state_dict()
+            for k, v in self._resume["raw"].items():
+                sd[k].copy_(v.to(sd[k].device, sd[k].dtype))
+            self.shadow = {k: v.to(sd[k].device).float() for k, v in self._resume["shadow"].items()}
+            self._resume = None
+            return
         self.shadow = {k: v.detach().clone().float()
                        for k, v in pl_module.state_dict().items()
                        if v.is_floating_point()}

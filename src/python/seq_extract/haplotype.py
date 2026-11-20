@@ -199,6 +199,22 @@ def group_bed(intervals: Iterable[BedInterval], ref_assembly: str = "B73", overl
     return by
 
 
+def _bed_sample_name(f: Path) -> str | None:
+    """Sample name of `<sample>_<chrom>_imputed.bed`. The chrom comes from the file's first data row,
+    so contig names containing `_` (e.g. scaffold_10) are stripped whole; files with no data rows fall
+    back to the name pattern, which assumes a chrom without `_`."""
+    with open(f) as fh:
+        for line in fh:
+            if line.strip() and not line.startswith(("#", "chrom\t")):
+                chrom = line.split("\t", 1)[0]
+                suffix = f"_{chrom}_imputed.bed"
+                if f.name.endswith(suffix) and len(f.name) > len(suffix):
+                    return f.name[:-len(suffix)]
+                break
+    m = _BED_NAME.match(f.name)
+    return m["sample"] if m else None
+
+
 def read_bed_dir(bed_dir, sample: str | None = None, ref_assembly: str = "B73", overlap: str = "trim",
                  stats: dict | None = None) -> dict[str, list[BedInterval]]:
     """All `<sample>_<chr>_imputed.bed` files of one sample (a single .bed file path also works)."""
@@ -208,9 +224,9 @@ def read_bed_dir(bed_dir, sample: str | None = None, ref_assembly: str = "B73", 
     files = sorted(p.glob("*_imputed.bed"))
     by_sample: dict[str, list[Path]] = {}
     for f in files:
-        m = _BED_NAME.match(f.name)
-        if m:
-            by_sample.setdefault(m["sample"], []).append(f)
+        name = _bed_sample_name(f)
+        if name:
+            by_sample.setdefault(name, []).append(f)
     if sample is None:
         if len(by_sample) != 1:
             raise ValueError(f"{p}: expected exactly one sample's *_imputed.bed files, found "

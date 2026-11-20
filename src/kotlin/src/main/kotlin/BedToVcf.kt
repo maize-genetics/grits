@@ -62,9 +62,7 @@ class BedToVcf : CliktCommand(help = "Convert a set of imputed BED files to a si
                         bedPattern.matches(file.nameWithoutExtension)
             }
             ?.forEach { bedFile ->
-                val match = bedPattern.matchEntire(bedFile.nameWithoutExtension)!!
-
-                val sampleId = match.groupValues[1]
+                val sampleId = sampleIdFromBedName(bedFile, bedPattern)
 
                 // do work here
                 val currentBedRangeMap = createRangeMapFromBedFile(bedFile)
@@ -77,6 +75,25 @@ class BedToVcf : CliktCommand(help = "Convert a set of imputed BED files to a si
                 }
             }
         return ranges
+    }
+
+    /**
+     * Sample name of a <sample>_<chrom>_imputed.bed file. The chrom is taken from the file's first
+     * data row, so contig names with underscores (e.g. scaffold_10) are stripped correctly; files
+     * without data rows fall back to the _chrX_ name pattern.
+     */
+    fun sampleIdFromBedName(bedFile: File, bedPattern: Regex): String {
+        val name = bedFile.nameWithoutExtension
+        if (name.endsWith("_imputed")) {
+            val chrom = bedFile.useLines { lines ->
+                lines.firstOrNull { it.isNotBlank() && !it.startsWith("chrom\t") && !it.startsWith("#") }
+                    ?.substringBefore("\t")
+            }
+            if (chrom != null && name.endsWith("_${chrom}_imputed")) {
+                return name.removeSuffix("_${chrom}_imputed")
+            }
+        }
+        return bedPattern.matchEntire(name)!!.groupValues[1]
     }
 
     /**
@@ -177,15 +194,17 @@ class BedToVcf : CliktCommand(help = "Convert a set of imputed BED files to a si
         // always "." -- silently zeroing out every AF-binned accuracy/R2
         // table this pipeline has ever produced (both in-panel and
         // held-out reports).
+        // One AC per ALT allele (VCF Number=A): most panel sites carry a symbolic <DEL> next to
+        // the SNP allele, so a single summed count would overstate the SNP allele's frequency.
+        val alts = vc.alternateAlleles
+        val ac = IntArray(alts.size)
         var an = 0
-        var ac = 0
         for (genotype in vc.genotypes) {
             for (allele in genotype.alleles) {
                 if (allele.isCalled) {
                     an++
-                    if (allele.isNonReference) {
-                        ac++
-                    }
+                    val i = alts.indexOf(allele)
+                    if (i >= 0) ac[i]++
                 }
             }
         }
@@ -193,7 +212,7 @@ class BedToVcf : CliktCommand(help = "Convert a set of imputed BED files to a si
         //Build a new variant context with the new genotype
         val newVc = VariantContextBuilder(vc)
             .genotypes(genotypeList)
-            .attribute("AC", ac)
+            .attribute("AC", ac.toList())
             .attribute("AN", an)
             .make()
         return newVc
@@ -258,6 +277,8 @@ class BedToVcf : CliktCommand(help = "Convert a set of imputed BED files to a si
         )
         headerLines.add(VCFInfoHeaderLine("DP", 1, VCFHeaderLineType.Integer, "Total Depth"))
         headerLines.add(VCFInfoHeaderLine("NS", 1, VCFHeaderLineType.Integer, "Number of Samples With Data"))
+        headerLines.add(VCFInfoHeaderLine("AC", VCFHeaderLineCount.A, VCFHeaderLineType.Integer, "Reference panel allele count, one per ALT allele"))
+        headerLines.add(VCFInfoHeaderLine("AN", 1, VCFHeaderLineType.Integer, "Reference panel called allele number"))
         headerLines.add(VCFInfoHeaderLine("AF", 3, VCFHeaderLineType.Integer, "Allele Frequency"))
         headerLines.add(VCFInfoHeaderLine("END", 1, VCFHeaderLineType.Integer, "Stop position of the interval"))
         // These last 4 are needed for assembly g/hvcfs, but not for reference.  I am keeping them in as header

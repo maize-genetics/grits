@@ -409,8 +409,10 @@ def extract_allele_frequency(t_info: str) -> tuple:
 
     for field in t_info.split(";"):
         if field.startswith("AC="):
+            # one count per ALT allele (VCF Number=A); a single value stays an int
             try:
-                ac = int(field.split("=")[1])
+                vals = [int(v) for v in field.split("=")[1].split(",")]
+                ac = vals[0] if len(vals) == 1 else vals
             except ValueError:
                 pass
         elif field.startswith("AN="):
@@ -428,10 +430,25 @@ def update_frequency_bins(t_alleles, i_alleles, ac, an, t_alt, counts, partial_c
         print(f"Skipping frequency bin update: ac={ac}, an={an}")
         return
 
-    alt_freq = ac / an
-    ref_freq = 1 - alt_freq
-    maf = min(alt_freq, ref_freq)
-    af = alt_freq if t_alt in t_alleles else ref_freq
+    alts = t_alt.split(",") if t_alt and t_alt != "." else []
+    acs = list(ac) if isinstance(ac, (list, tuple)) else [ac]
+    if len(acs) == 1 and len(alts) > 1:
+        # legacy single AC summed over every ALT: it can't be split per allele, so treat the
+        # site as REF vs all ALTs together
+        alt_freq = acs[0] / an
+        freq = {a: alt_freq for a in alts}
+        ref_freq = 1 - alt_freq
+    else:
+        freq = {a: c / an for a, c in zip(alts, acs)}
+        ref_freq = 1 - sum(acs) / an
+
+    def allele_freq(a):
+        return freq.get(a, ref_freq)
+
+    # frequency of the truth's own allele(s): hom sites bin on that allele, het sites on the
+    # rarer of the two (for a biallelic site this is the old alt/ref and minor-allele frequency)
+    af = allele_freq(t_alleles[0])
+    maf = min(allele_freq(a) for a in t_alleles)
     NBINS = len(counts["af_bin_total"])
 
     # Calculate ALT allele counts for this site

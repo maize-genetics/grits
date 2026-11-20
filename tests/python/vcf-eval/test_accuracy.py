@@ -426,3 +426,32 @@ def test_handle_missing_genotypes():
 
 def test_next_or_none():
     pass
+
+def test_extract_allele_frequency_per_alt():
+    assert extract_allele_frequency("AC=3;AN=50") == (3, 50)
+    assert extract_allele_frequency("AC=3,10;AN=50") == ([3, 10], 50)
+
+
+def _bin_of(t_alleles, ac, an, alt):
+    counts = initialize_counts()
+    update_frequency_bins(t_alleles, t_alleles, ac, an, alt, counts, partial_credit=False,
+                          phase_sensitive=False)
+    hom = [i for i, v in enumerate(counts["af_bin_total"]) if v]
+    het = [i for i, v in enumerate(counts["het_bin_total"]) if v]
+    return hom, het
+
+
+def test_frequency_bins_biallelic_unchanged():
+    # AF(G) = 5/50 = 0.10 -> bin 2; REF freq 0.90 -> bin 18; het maf 0.10 -> bin 2
+    assert _bin_of(("G", "G"), 5, 50, "G") == ([2], [])
+    assert _bin_of(("A", "A"), 5, 50, "G") == ([18], [])
+    assert _bin_of(("A", "G"), 5, 50, "G") == ([], [2])
+
+
+def test_frequency_bins_multiallelic_use_truth_allele():
+    # G carried by 5/50, <DEL> by 30/50: a hom-G site bins at 0.10, not at the summed 0.70
+    assert _bin_of(("G", "G"), [5, 30], 50, "G,<DEL>") == ([2], [])
+    # REF frequency = 1 - 35/50 = 0.30 -> bin 6
+    assert _bin_of(("A", "A"), [5, 30], 50, "G,<DEL>") == ([6], [])
+    # het A/G: rarer of 0.30 and 0.10 -> bin 2
+    assert _bin_of(("A", "G"), [5, 30], 50, "G,<DEL>") == ([], [2])

@@ -89,6 +89,11 @@ def output_collapse_bed(bed_df, output_bed, fill_switch_gaps=False):
             (bed_df["parent2"] != bed_df["parent2"].shift()) |
             (bed_df["chrom"] != bed_df["chrom"].shift())
     )
+    has_row = "row" in bed_df.columns
+    if has_row:
+        # a skipped row (null-state call) between two calls of the same pair must stay uncalled,
+        # so a jump in the row index also ends the run
+        group_change |= bed_df["row"] != bed_df["row"].shift() + 1
     group_id = group_change.cumsum()
     # Collapse into ranges. NOTE: "end" must come from the "end" column's own
     # max, not "start"'s max -- aggregating "start" with both min/max (as a
@@ -99,7 +104,6 @@ def output_collapse_bed(bed_df, output_bed, fill_switch_gaps=False):
     # end by exactly one base (the last row's own 1bp span was never
     # included).
     agg = {"chrom": "first", "start": "min", "end": "max", "parent1": "first", "parent2": "first"}
-    has_row = "row" in bed_df.columns
     if has_row:
         agg["row"] = ["min", "max"]
     ranges_df = bed_df.groupby(group_id).agg(agg).reset_index(drop=True)

@@ -480,4 +480,37 @@ class BedToVCFTest {
             assertEquals("For range ${entry.key}, expected value ${entry.value} but found $foundValue" ,foundValue, entry.value)
         }
     }
+
+    @Test
+    fun testPanelAcPerAltAllele() {
+        val bedToVcf = BedToVcf()
+        val ref = Allele.create("A", true)
+        val g = Allele.create("G", false)
+        val del = Allele.create("<DEL>", false)
+        val gts = listOf(
+            GenotypeBuilder("f1", listOf(g)).make(),
+            GenotypeBuilder("f2", listOf(del)).make(),
+            GenotypeBuilder("f3", listOf(del)).make(),
+            GenotypeBuilder("f4", listOf(ref)).make(),
+            GenotypeBuilder("f5", listOf(Allele.NO_CALL)).make()
+        )
+        val vc = VariantContextBuilder("t", "chr1", 100, 100, listOf(ref, g, del)).genotypes(gts).make()
+        val newVc = bedToVcf.buildNewVariantContext(mapOf(), vc, bedToVcf.buildGameteToAlleleMap(vc))
+        assertEquals(listOf(1, 2), newVc.getAttribute("AC"))
+        assertEquals(4, newVc.getAttribute("AN"))
+        val header = bedToVcf.createGenericHeaderLineSet()
+        assertTrue("AC header line missing", header.any { it.toString().startsWith("INFO=<ID=AC,Number=A,") })
+    }
+
+    @Test
+    fun testBuildRangeMapsContigWithUnderscore() {
+        val dir = kotlin.io.path.createTempDirectory("bedname").toFile()
+        File(dir, "S1_chr1_imputed.bed").writeText("chrom\tstart\tend\tparent1\tparent2\nchr1\t0\t5\tA\tA\n")
+        File(dir, "S1_scaffold_10_imputed.bed").writeText(
+            "chrom\tstart\tend\tparent1\tparent2\nscaffold_10\t0\t5\tB\tB\n")
+        val maps = BedToVcf().buildRangeMaps(dir.path)
+        assertEquals(setOf("S1"), maps.keys)
+        assertEquals(Pair("B", "B"), maps["S1"]!!.get(Position("scaffold_10", 3)))
+        dir.deleteRecursively()
+    }
 }
