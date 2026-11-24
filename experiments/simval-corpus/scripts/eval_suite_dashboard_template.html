@@ -1,0 +1,446 @@
+<title>GRITS Model Board</title>
+<style>
+:root{
+  --ground:#eef1f4; --panel:#f8fafb; --panel-2:#e4e9ee; --line:#cfd7df; --line-2:#b5c0ca;
+  --ink:#18212a; --ink-2:#4a5866; --ink-3:#73808d;
+  --accent:#2a5d8f; --accent-soft:#d6e3f0; --focus:#2a5d8f;
+  --good:#17703f; --good-bg:#dcefe3; --good-line:#3a9a63;
+  --same:#5b6773; --same-bg:#e7ebef; --same-line:#9aa6b1;
+  --warn:#8a5a00; --warn-bg:#f8ebc8; --warn-line:#d39b1c;
+  --bad:#a32a2a; --bad-bg:#f6dcdc; --bad-line:#d05555;
+  --bar-base:#8c99a6; --bar-ceil:#b9c3cc; --bar-rand:#c9a46a;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme:dark;
+    --ground:#11161b; --panel:#182027; --panel-2:#212b34; --line:#2c3843; --line-2:#3d4a57;
+    --ink:#e3e9ef; --ink-2:#a9b5c1; --ink-3:#7d8a97;
+    --accent:#79aee0; --accent-soft:#1f3346; --focus:#79aee0;
+    --good:#6fd39a; --good-bg:#16301f; --good-line:#3f9c66;
+    --same:#a7b2bd; --same-bg:#212a32; --same-line:#5d6974;
+    --warn:#f0c264; --warn-bg:#352a12; --warn-line:#b98a26;
+    --bad:#f19494; --bad-bg:#3a1c1c; --bad-line:#c25555;
+    --bar-base:#6c7986; --bar-ceil:#3f4b56; --bar-rand:#8a6c3c;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --ground:#11161b; --panel:#182027; --panel-2:#212b34; --line:#2c3843; --line-2:#3d4a57;
+  --ink:#e3e9ef; --ink-2:#a9b5c1; --ink-3:#7d8a97;
+  --accent:#79aee0; --accent-soft:#1f3346; --focus:#79aee0;
+  --good:#6fd39a; --good-bg:#16301f; --good-line:#3f9c66;
+  --same:#a7b2bd; --same-bg:#212a32; --same-line:#5d6974;
+  --warn:#f0c264; --warn-bg:#352a12; --warn-line:#b98a26;
+  --bad:#f19494; --bad-bg:#3a1c1c; --bad-line:#c25555;
+  --bar-base:#6c7986; --bar-ceil:#3f4b56; --bar-rand:#8a6c3c;
+}
+*{box-sizing:border-box}
+body{background:var(--ground);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.45}
+.wrap{max-width:1180px;margin:0 auto;padding-inline:clamp(16px,3vw,32px);padding-block:20px 40px;display:grid;gap:18px}
+.num,td,.val{font-variant-numeric:tabular-nums}
+.mono{font-family:var(--mono)}
+header.top{display:flex;flex-wrap:wrap;align-items:end;justify-content:space-between;gap:12px 24px;border-bottom:2px solid var(--ink);padding-bottom:10px}
+h1{font-size:20px;font-weight:600;margin:0;letter-spacing:.01em}
+h1 .unit{font-family:var(--mono);font-weight:400;font-size:12px;color:var(--ink-3);margin-left:8px;letter-spacing:0}
+.controls{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center}
+.ctl{display:flex;align-items:center;gap:6px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3)}
+.seg{display:inline-flex;border:1px solid var(--line-2);border-radius:3px;overflow:hidden}
+.seg button{font:500 12px var(--mono);padding:5px 10px;border:0;background:var(--panel);color:var(--ink-2);cursor:pointer}
+.seg button+button{border-left:1px solid var(--line-2)}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--ground)}
+select{font:500 12px var(--mono);padding:4px 6px;border:1px solid var(--line-2);border-radius:3px;background:var(--panel);color:var(--ink);max-width:62vw}
+button:focus-visible,select:focus-visible,summary:focus-visible,a:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--ink-2);align-items:center}
+.legend .k{display:inline-flex;align-items:center;gap:6px}
+.sw{width:4px;height:14px;border-radius:1px;display:inline-block}
+abbr{text-decoration:underline dotted var(--ink-3);text-underline-offset:3px;cursor:help}
+.scroll{overflow-x:auto;border:1px solid var(--line);background:var(--panel);border-radius:4px}
+table.board{border-collapse:separate;border-spacing:0;width:100%;min-width:900px}
+.board th,.board td{padding:0;text-align:left;vertical-align:middle}
+.board thead th{font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:.07em;color:var(--ink-3);padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+.board thead tr.scopes th{font:600 12px var(--mono);color:var(--ink);letter-spacing:.12em;text-align:center;border-bottom:1px solid var(--line-2);padding-top:9px}
+.board .grp{border-left:1px solid var(--line-2)}
+.board tbody tr{border-bottom:1px solid var(--line)}
+.board tbody td,.board tbody th{border-bottom:1px solid var(--line)}
+.board tbody tr:last-child td,.board tbody tr:last-child th{border-bottom:0}
+.board tbody tr.sel{background:var(--accent-soft)}
+.mcell{padding:8px 10px;min-width:190px;position:sticky;left:0;background:var(--panel);z-index:1;border-right:1px solid var(--line)}
+tr.sel .mcell{background:var(--accent-soft)}
+.mbtn{all:unset;cursor:pointer;display:grid;gap:3px;width:100%}
+.mbtn .nm{font:600 13px var(--mono);color:var(--ink)}
+.mbtn .nm .base{font:500 10px var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent);border-radius:2px;padding:0 4px;margin-left:6px;vertical-align:1px}
+.mbtn:hover .nm{color:var(--accent)}
+.cell{display:flex;flex-direction:column;justify-content:center;gap:1px;padding:7px 8px 7px 11px;min-width:76px;height:100%;position:relative}
+.cell::before{content:"";position:absolute;left:3px;top:6px;bottom:6px;width:3px;border-radius:1px;background:transparent}
+.cell .val{font:500 13px var(--mono);color:var(--ink);white-space:nowrap}
+.cell .d{font:400 11px var(--mono);white-space:nowrap;color:var(--ink-3)}
+.s-better{background:var(--good-bg)} .s-better::before{background:var(--good-line)!important} .s-better .d{color:var(--good)}
+.s-similar::before{background:var(--same-line)!important}
+.s-worse{background:var(--bad-bg)} .s-worse::before{background:var(--bad-line)!important} .s-worse .d{color:var(--bad)}
+.s-warn{background:var(--warn-bg)} .s-warn::before{background:var(--warn-line)!important} .s-warn .d,.s-warn .val{color:var(--warn)}
+.s-na .val{color:var(--ink-3)}
+.vcell{padding:6px 10px;min-width:180px}
+.chip{display:inline-flex;align-items:center;gap:6px;font:500 12px var(--sans);padding:3px 8px 3px 6px;border-radius:3px;border:1px solid;line-height:1.3}
+.chip::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+.chip.good{color:var(--good);background:var(--good-bg);border-color:var(--good-line)}
+.chip.warn{color:var(--warn);background:var(--warn-bg);border-color:var(--warn-line)}
+.chip.bad{color:var(--bad);background:var(--bad-bg);border-color:var(--bad-line)}
+.chip.same{color:var(--same);background:var(--same-bg);border-color:var(--same-line)}
+.chip.ref{color:var(--accent);background:var(--panel);border-color:var(--accent)}
+section.drill{display:grid;gap:14px;border-top:2px solid var(--ink);padding-top:12px}
+.dhead{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline}
+.dhead h2{font:600 17px var(--mono);margin:0}
+.dhead .note{color:var(--ink-2);font-size:13px}
+.dhead .tags{font:400 11px var(--mono);color:var(--ink-3)}
+h3{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--ink-2);margin:0 0 6px}
+.multiples{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:8px}
+.mini{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:8px 9px;display:grid;gap:5px;position:relative}
+.mini .cls{font:600 11px var(--mono);letter-spacing:.04em;display:flex;justify-content:space-between;gap:6px}
+.mini .cls .st{font-weight:500}
+.mini.s-better{border-color:var(--good-line)} .mini.s-worse{border-color:var(--bad-line)} .mini.s-warn{border-color:var(--warn-line)}
+.mini.s-better,.mini.s-worse,.mini.s-warn{background:var(--panel)}
+.mini::before{display:none}
+.st.better{color:var(--good)} .st.worse{color:var(--bad)} .st.warn{color:var(--warn)} .st.similar{color:var(--ink-3)}
+.bar{display:grid;grid-template-columns:34px 1fr 62px;align-items:center;gap:6px;font:400 11px var(--mono);color:var(--ink-2)}
+.bar .tr{height:9px;background:var(--panel-2);border-radius:1px;position:relative;overflow:hidden}
+.bar .fl{position:absolute;inset:0 auto 0 0;border-radius:1px}
+.bar.m .fl{background:var(--accent)} .bar.b .fl{background:var(--bar-base)}
+.bar.c .fl{background:repeating-linear-gradient(135deg,var(--bar-ceil) 0 3px,transparent 3px 5px);border:1px solid var(--bar-base)}
+.bar .v{text-align:right;color:var(--ink)}
+.bar.c .v{color:var(--ink-3)}
+.bar.r .fl{background:var(--bar-rand)} .bar.r .v{color:var(--ink-3)}
+details.grp{background:var(--panel);border:1px solid var(--line);border-radius:4px}
+details.grp>summary{cursor:pointer;padding:8px 12px;font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2);list-style:none;display:flex;justify-content:space-between;gap:10px}
+details.grp>summary::-webkit-details-marker{display:none}
+details.grp>summary::after{content:"+";font:500 14px var(--mono);color:var(--ink-3)}
+details.grp[open]>summary::after{content:"−"}
+details.grp>summary .hint{font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink-3);margin-left:auto}
+.dt{overflow-x:auto;border-top:1px solid var(--line)}
+table.det{border-collapse:collapse;width:100%;min-width:820px;font-size:12px}
+.det th,.det td{padding:5px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+.det th:first-child{text-align:left;font-weight:500;color:var(--ink-2);position:sticky;left:0;background:var(--panel)}
+.det thead th{font:600 11px var(--mono);color:var(--ink-3);letter-spacing:.03em}
+.det td{font-family:var(--mono)}
+.det td .dd{display:block;font-size:10px;color:var(--ink-3)}
+.det td.better .dd{color:var(--good)} .det td.worse .dd{color:var(--bad)}
+.det tr:last-child td,.det tr:last-child th{border-bottom:0}
+.foot{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:12px;color:var(--ink-3);border-top:1px solid var(--line);padding-top:10px}
+.foot a{color:var(--accent)}
+.rules{font-size:12px;color:var(--ink-2);padding:4px 14px 12px}
+.rules ul{margin:4px 0;padding-left:18px;display:grid;gap:3px}
+.empty{color:var(--ink-3);font-size:12px;padding:8px 0}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+.bar .fl{transition:width .25s ease-out}
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<div class="wrap">
+  <header class="top">
+    <h1>GRITS model board <span class="unit" id="gen"></span></h1>
+    <div class="controls">
+      <div class="ctl" role="group" aria-label="Depth">Depth
+        <div class="seg" id="depthSeg">
+          <button type="button" data-d="0.1" aria-pressed="true">0.1x</button>
+          <button type="button" data-d="1" aria-pressed="false">1x</button>
+          <button type="button" data-d="both" aria-pressed="false">both</button>
+        </div>
+      </div>
+      <div class="ctl" role="group" aria-label="Gene-window indel counting"><abbr title="Gene-window errors: count each indel / unaligned run once (per event, variant-style) or every inserted, deleted and unaligned base (per bp)">Indels</abbr>
+        <div class="seg" id="indelSeg">
+          <button type="button" data-i="event" aria-pressed="true">per event</button>
+          <button type="button" data-i="bp" aria-pressed="false">per bp</button>
+        </div>
+      </div>
+      <label class="ctl" for="baseSel">Baseline <select id="baseSel"></select></label>
+    </div>
+  </header>
+
+  <div class="legend" aria-label="Legend">
+    <span class="k"><span class="sw" style="background:var(--good-line)"></span>better than baseline</span>
+    <span class="k"><span class="sw" style="background:var(--same-line)"></span>similar</span>
+    <span class="k"><span class="sw" style="background:var(--bad-line)"></span>worse</span>
+    <span class="k"><span class="sw" style="background:var(--warn-line)"></span>coverage &lt; 95% (abstains)</span>
+    <span class="k"><abbr title="Best possible single-panel-founder choice per gene window (gene-window) or best panel path (SNP+RC). 1× = as good as any panel founder.">ceiling</abbr></span>
+    <span class="k"><abbr title="Gene-window: 0 = random founder per window, 100 = best panel founder per window.">random→ceiling %</abbr></span>
+    <span class="k"><abbr title="Model founder-pair changes ÷ reference-path changes. ~1 is ideal; ≪1 = under-switching.">switch ratio</abbr></span>
+  </div>
+
+  <div class="scroll" id="boardWrap"><table class="board" id="board"></table></div>
+
+  <section class="drill" id="drill" aria-live="polite"></section>
+
+  <details class="grp" id="rulesBox">
+    <summary>Rules <span class="hint">how cells and verdicts are colored</span></summary>
+    <div class="rules">
+      <ul>
+        <li><b>SNP+RC error</b>, <b>GW×ceil</b>, gene-window error %: better / worse when the change vs baseline is ≥ 5% relative and ≥ 0.01 pp (SNP+RC), ≥ 0.05× (GW×ceil) or ≥ 0.005 pp (gene-window %); otherwise similar.</li>
+        <li><b>R→C</b> (random → ceiling %): 100 × (random − model) ÷ (random − ceiling) on gene-window error; 0 = random founder per window, 100 = best panel founder per window. Random = exact expectation over the panel founders scorable in each window. Better / worse at ≥ 1 point change.</li>
+        <li><b>Gene-window error %</b>: errors ÷ called truth bases in gene ±5 kb windows. <i>Per event</i>: mismatches + indel events + unaligned runs (one 45 bp deletion = 1). <i>Per bp</i>: every mismatched, inserted, deleted and unaligned base, capped at the window's called bases. Ceiling = best single panel founder per window under the same counting. Per event is the primary measure (per bp charges every base of an indel). Haplotype windows whose in-panel truth founder's own panel sequence failed extraction are excluded from model, ceiling and random (“truth unextractable”, shown in the Gene window table). Scorer v2 (2026-10-16): when a founder segment's projection onto the founder assembly fails, it is split into 2 kb tiles and only the failed tiles are N (v1 made the whole segment N); the panel ceiling and random baseline use the same rule.</li>
+        <li><b>Coverage</b>: amber below 95% genome; better / worse at ≥ 1 pp change. An error win in a scope below 95% coverage turns amber, never green.</li>
+        <li><b>Switch ratio</b>: closer to 1 is better; status from the change in |ln ratio| (≥ 0.10).</li>
+        <li><b>Verdict</b>: per scope from SNP+RC; a class inside a non-worse scope is a regression at ≥ 10% relative and ≥ 0.02 pp worse. With “both” depths a scope counts only if it moves the same way at both depths, otherwise “mixed”. Green: wins and no losses; red: losses and no wins; amber: mixed or abstaining.</li>
+        <li>Scope values: mean of class SNP+RC and coverage; gene-window error pooled over the scope's windows; switch ratio = Σ model changes ÷ Σ reference changes. “both” averages the two depths.</li>
+      </ul>
+    </div>
+  </details>
+
+  <div class="foot">
+    <span id="footGen"></span>
+    <span>Corpus: simulated validation, 8 classes × 5 samples</span>
+  </div>
+</div>
+
+<script>
+const DATA = /*__DATA__*/null;
+(function(){
+"use strict";
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const SCOPES = DATA.scopes, CLASSES = DATA.classes;
+const M = Object.fromEntries(DATA.models.map(m => [m.name, m]));
+let state = {depth: "0.1", base: DATA.baseline, sel: null, indel: "event"};
+try { const s = JSON.parse(localStorage.getItem("grits-board-v2") || "{}"); if (s.depth) state.depth = s.depth; if (s.base && M[s.base]) state.base = s.base; if (s.indel) state.indel = s.indel; } catch (e) {}
+const save = () => { try { localStorage.setItem("grits-board-v2", JSON.stringify({depth: state.depth, base: state.base, indel: state.indel})); } catch (e) {} };
+const EV = () => state.indel === "event";
+/* gene-window field names for the current indel counting */
+const GWF = () => EV() ? {pct: "event_err_pct", ceil: "ceil_event_err_pct", rand: "rand_event_err_pct", r2c: "r2c_event_pct", x: "event_x_ceiling", t50: "t50_event_err_pct", t50c: "t50_ceil_event_err_pct", exact: "pct_exact_event"}
+                       : {pct: "err_pct_capped", ceil: "ceil_err_pct_capped", rand: "rand_err_pct_capped", r2c: "r2c_bp_pct", x: "err_x_ceiling", t50: "t50_err_pct_capped", t50c: "t50_ceil_err_pct_capped", exact: "pct_exact"};
+const GW_TIP = "Gene-window error %: errors (mismatches + indels + unaligned sequence, counted per event or per bp as set by Indels) ÷ truth bases in gene ±5 kb windows";
+const depths = () => state.depth === "both" ? ["0.1", "1"] : [state.depth];
+
+/* value lookup: src core|gw, group = class or scope; averaged over the selected depths */
+function get(m, src, grp, key, ds) {
+  ds = ds || depths();
+  const vals = ds.map(d => { const b = m && m[src] && m[src][d] && m[src][d][grp]; return b ? b[key] : null; })
+                 .filter(v => v !== null && v !== undefined);
+  return vals.length === ds.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+}
+
+/* metric meta: dir -1 lower better, +1 higher better, 0 = closeness to 1, null = descriptive */
+const COV_WARN = 0.95;
+function cmp(kind, v, b) {
+  if (v == null || b == null) return null;
+  if (kind === "err") { const dv = v - b; if (Math.abs(dv) < 1e-4 || (b > 0 && Math.abs(dv) / b < 0.05)) return "similar"; return dv < 0 ? "better" : "worse"; }
+  if (kind === "gwp") { const dv = v - b; if (Math.abs(dv) < 0.005 || (b > 0 && Math.abs(dv) / b < 0.05)) return "similar"; return dv < 0 ? "better" : "worse"; }
+  if (kind === "gwx") { const dv = v - b; if (Math.abs(dv) < 0.05 || (b > 0 && Math.abs(dv) / b < 0.05)) return "similar"; return dv < 0 ? "better" : "worse"; }
+  if (kind === "cov") { const dv = v - b; if (Math.abs(dv) < 0.01) return "similar"; return dv > 0 ? "better" : "worse"; }
+  if (kind === "r2c") { const dv = v - b; if (Math.abs(dv) < 1) return "similar"; return dv > 0 ? "better" : "worse"; }
+  if (kind === "swr") { if (v <= 0 || b <= 0) return null; const dv = Math.abs(Math.log(v)) - Math.abs(Math.log(b)); if (Math.abs(dv) < 0.10) return "similar"; return dv < 0 ? "better" : "worse"; }
+  return null;
+}
+const pct = (v, dp) => v == null ? "–" : (100 * v).toFixed(dp);
+function fmtErr(v) { if (v == null) return "–"; const p = 100 * v; return (p < 1 ? p.toFixed(3) : p.toFixed(2)) + "%"; }
+function fmtX(v) { return v == null ? "–" : "×" + (v < 10 ? v.toFixed(2) : v.toFixed(1)); }
+function arrow(v, b, kind) {
+  if (v == null || b == null) return "";
+  const up = v > b, a = v === b ? "=" : (up ? "▲" : "▼");
+  if (kind === "cov") return `${a}${Math.abs(100 * (v - b)).toFixed(1)}pp`;
+  if (kind === "swr") return `${a}${Math.abs(v - b).toFixed(2)}`;
+  if (kind === "r2c") return `${a}${Math.abs(v - b).toFixed(1)}`;
+  if (b === 0) return a;
+  return `${a}${Math.abs(100 * (v - b) / b).toFixed(0)}%`;
+}
+
+const COLS = [
+  {key: "snprc", label: "SNP+RC", tip: "SNP+RefCall genotype error (lead metric). Lower is better.", kind: "err", src: "core", f: "snprc_err", fmt: fmtErr},
+  {key: "cov", label: "Cov", tip: "% of genome inside called BED intervals. Below 95% = abstaining.", kind: "cov", src: "core", f: "genome_covered", fmt: v => v == null ? "–" : pct(v, 1) + "%"},
+  {key: "gwx", label: "GW×ceil", tip: "Gene-window error (minimap2 vs truth assembly, gene ±5 kb) as a multiple of the panel ceiling (best single founder per window); per event or per bp as set by Indels. 1× = at ceiling.", kind: "gwx", src: "gw", f: () => GWF().x, fmt: fmtX},
+  {key: "r2c", label: "R→C", tip: "Random → ceiling %, gene-window error (per event or per bp as set by Indels): 0 = random founder per window, 100 = best panel founder per window", kind: "r2c", src: "gw", f: () => GWF().r2c, fmt: v => v == null ? "–" : v.toFixed(1)},
+  {key: "swr", label: "Switch", tip: "Switch ratio: model founder-pair changes ÷ reference-path changes (summed over the scope). ~1 ideal; ≪1 under-switching. In panel (IDX) the reference only switches in RIL2 (~28 changes), so IDX ≫1 means spurious switches.", kind: "swr", src: "core", f: "swr", fmt: v => v == null ? "–" : v.toFixed(2)},
+];
+
+function scopeCov(m, s, ds) { return get(m, "core", s, "genome_covered", ds); }
+
+const fld = c => typeof c.f === "function" ? c.f() : c.f;
+function cellState(m, col, grp) {
+  const f = fld(col), v = get(m, col.src, grp, f), base = M[state.base];
+  const cov = scopeCov(m, grp);
+  let st = m.name === state.base ? null : cmp(col.kind, v, get(base, col.src, grp, f));
+  if (col.kind === "cov" && v != null && v < COV_WARN) st = "warn";
+  else if ((col.kind === "err" || col.kind === "gwx" || col.kind === "gwp" || col.kind === "r2c") && st === "better" && cov != null && cov < COV_WARN) st = "warn";
+  return {v, st, b: get(base, col.src, grp, f)};
+}
+
+/* verdict */
+function verdict(m) {
+  if (m.name === state.base) return {cls: "ref", text: "Baseline"};
+  const base = M[state.base], ds = depths();
+  const per = SCOPES.map(s => ds.map(d => cmp("err", get(m, "core", s, "snprc_err", [d]), get(base, "core", s, "snprc_err", [d]))));
+  const better = [], worse = [], mixed = [], abst = [], regress = [];
+  SCOPES.forEach((s, i) => {
+    const st = per[i].filter(x => x);
+    const cv = Math.min(...ds.map(d => scopeCov(m, s, [d]) ?? 1));
+    const b = st.includes("better"), w = st.includes("worse");
+    if (cv < COV_WARN) abst.push(`${s} ${pct(cv, 0)}%`);
+    if (b && !w) { if (cv < COV_WARN) {} else better.push(s); }
+    else if (w && !b) worse.push(s);
+    else if (w && b) mixed.push(s);
+    if (!(w && !b)) CLASSES.filter(c => c.startsWith(s)).forEach(c => {
+      if (ds.some(d => { const v = get(m, "core", c, "snprc_err", [d]), bb = get(base, "core", c, "snprc_err", [d]);
+        return v != null && bb != null && v - bb >= 2e-4 && (bb === 0 || (v - bb) / bb >= 0.10); })) regress.push(c);
+    });
+  });
+  const parts = [];
+  if (better.length) parts.push(`Better on ${better.join("/")}`);
+  if (worse.length) parts.push(`${parts.length ? "worse" : "Worse"} on ${worse.join("/")}`);
+  if (regress.length) parts.push(`${parts.length ? "regresses" : "Regresses"} ${regress.join(", ")}`);
+  if (mixed.length) parts.push(`${parts.length ? "mixed" : "Mixed"} ${mixed.join("/")}`);
+  if (abst.length) parts.push(`${parts.length ? "abstains" : "Abstains"} ${abst.join(", ")}`);
+  let cls;
+  if (!parts.length) return {cls: "same", text: "On par"};
+  const losses = worse.length + regress.length;
+  if (better.length && !losses && !mixed.length && !abst.length) cls = "good";
+  else if (losses && !better.length && !mixed.length) cls = "bad";
+  else cls = "warn";
+  return {cls, text: parts.join(" · ")};
+}
+
+function order() {
+  const score = m => { const v = SCOPES.map(s => get(m, "core", s, "snprc_err")).filter(x => x != null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : 9; };
+  const abst = m => SCOPES.some(s => (scopeCov(m, s) ?? 1) < COV_WARN) ? 1 : 0;   /* abstainers never rank above full-coverage models */
+  return DATA.models.slice().sort((a, b) => (b.name === state.base) - (a.name === state.base) || abst(a) - abst(b) || score(a) - score(b));
+}
+
+function renderBoard() {
+  const t = $("#board");
+  let h = `<thead><tr class="scopes"><th rowspan="2" style="position:sticky;left:0;background:var(--panel);z-index:2;text-align:left">Model</th>`;
+  SCOPES.forEach(s => h += `<th colspan="${COLS.length}" class="grp">${s}</th>`);
+  h += `<th rowspan="2" class="grp">Verdict vs baseline</th></tr><tr>`;
+  SCOPES.forEach(() => COLS.forEach((c, i) => h += `<th class="${i ? "" : "grp"}"><abbr title="${esc(c.tip)}">${c.label}</abbr></th>`));
+  h += `</tr></thead><tbody>`;
+  for (const m of order()) {
+    const sel = m.name === state.sel;
+    h += `<tr class="${sel ? "sel" : ""}"><th scope="row" class="mcell"><button type="button" class="mbtn" data-m="${esc(m.name)}" aria-pressed="${sel}" title="${esc(m.note)}">` +
+         `<span class="nm">${esc(m.name)}${m.name === state.base ? '<span class="base">base</span>' : ""}</span></button></th>`;
+    SCOPES.forEach(s => COLS.forEach((c, i) => {
+      const {v, st, b} = cellState(m, c, s);
+      const d = st && m.name !== state.base ? arrow(v, b, c.kind) : "";
+      const lab = st === "warn" ? (c.kind === "cov" ? "low" : "abstains") : "";
+      h += `<td class="${i ? "" : "grp"}"><div class="cell ${v == null ? "s-na" : st ? "s-" + st : ""}" title="${esc(s + " " + c.label + (st ? ": " + st : ""))}"><span class="val">${c.fmt(v)}</span><span class="d">${d}${lab ? " " + lab : ""}&nbsp;</span></div></td>`;
+    }));
+    const vd = verdict(m);
+    h += `<td class="vcell grp"><span class="chip ${vd.cls}">${esc(vd.text)}</span></td></tr>`;
+  }
+  t.innerHTML = h + "</tbody>";
+  t.querySelectorAll(".mbtn").forEach(b => b.addEventListener("click", () => { state.sel = b.dataset.m; render(); $("#drill").scrollIntoView({block: "start", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"}); }));
+}
+
+function mini(cls, m, base, src, key, ceilKey, fmt, kind, randKey) {
+  const v = get(m, src, cls, key), b = m.name === state.base ? null : get(base, src, cls, key);
+  const c = ceilKey ? get(m, src, cls, ceilKey) ?? get(base, src, cls, ceilKey) : null;
+  const r = randKey ? get(m, src, cls, randKey) ?? get(base, src, cls, randKey) : null;
+  const mx = Math.max(v || 0, b || 0, c || 0, r || 0) || 1;
+  const st = b == null ? null : cmp(kind, v, b);
+  const cov = get(m, "core", cls, "genome_covered");
+  const st2 = st === "better" && cov != null && cov < COV_WARN ? "warn" : st;
+  const row = (k, lab, x) => x == null ? "" : `<div class="bar ${k}"><span>${lab}</span><span class="tr"><span class="fl" style="width:${(100 * x / mx).toFixed(1)}%"></span></span><span class="v">${fmt(x)}</span></div>`;
+  return `<div class="mini ${st2 ? "s-" + st2 : ""}"><div class="cls"><span>${cls}</span><span class="st ${st2 || ""}">${st2 ? (st2 === "warn" ? "abstains" : st2) + " " + arrow(v, b, kind) : ""}</span></div>` +
+    (v == null ? `<div class="empty">not run</div>` : row("m", "mod", v) + row("b", "base", b) + row("c", "ceil", c) + row("r", "rand", r)) + `</div>`;
+}
+
+const fpct = (dp) => v => v == null ? "–" : pct(v, dp);
+const fnum = (dp) => v => v == null ? "–" : v.toFixed(dp);
+const GROUPS = [
+  {id: "acc", title: "Accuracy", hint: "% error", rows: [
+    ["snprc_err", "SNP+RC error %", "core", -1, fpct(3)], ["all_err", "All-sites error %", "core", -1, fpct(3)],
+    ["snprc_err_truth_het", "SNP+RC at truly het sites %", "core", -1, fpct(3)], ["snprc_err_truth_hom", "SNP+RC at truly hom sites %", "core", -1, fpct(3)],
+    ["excess_over_ceiling", "Excess over panel ceiling, pp", "core", -1, fpct(3)], ["ceiling_snprc_err", "Panel ceiling %", "core", null, fpct(3)]]},
+  {id: "gw", title: "Gene window", hint: "minimap2 vs truth assembly, 1000 genes ±5 kb; scorer v2 (tile-on-failure)", rows: () => [
+    [GWF().pct, `Gene-window error % (${EV() ? "per event" : "per bp, capped"})`, "gw", -1, fnum(3)],
+    [GWF().ceil, "Ceiling error %", "gw", null, fnum(3)], [GWF().rand, "Random-founder error %", "gw", null, fnum(3)],
+    [GWF().r2c, "Random → ceiling % (0 = random, 100 = ceiling)", "gw", 1, fnum(1)], [GWF().x, "× ceiling", "gw", -1, fnum(2)],
+    [GWF().t50, "Error %, ends trimmed (t50)", "gw", -1, fnum(3)], [GWF().t50c, "Ceiling error %, t50", "gw", null, fnum(3)],
+    [GWF().exact, "Windows exact %", "gw", 1, fnum(1)],
+    ["indel_bp_per_event", "Indel bp per indel event", "gw", null, fnum(1)],
+    ["pct_truth_unextractable", "Truth unextractable (excluded) % of hap-windows", "gw", null, fnum(2)],
+    ["pct_all_N", "All-N (unextracted) % of hap-windows", "gw", -1, fnum(1)],
+    ["pct_uncalled_bp", "Uncalled bases %", "gw", -1, fnum(1)],
+    ["sf_better_pct", "Single-founder windows with a better founder %", "gw", -1, fnum(1)],
+    ["pick_rank_median", "Picked founder, median rank (1 = best)", "gw", -1, fnum(1)],
+    ["wrongpick_rank_median", "Median rank when a better founder exists", "gw", -1, fnum(1)],
+    ["wrongpick_excess_bp_median", "Median excess errors over best founder (bp)", "gw", -1, fnum(0)],
+    ["n_ranked_median", "Founders ranked per window (median)", "gw", null, fnum(0)],
+    ["excess_share", "Error that is excess over best founder %", "gw", -1, fnum(1)]]},
+  {id: "cov", title: "Coverage", hint: "abstention", rows: [
+    ["genome_covered", "Genome in BED intervals %", "core", 1, fpct(1)], ["snprc_called_frac", "Reference SNP+RC sites called %", "core", 1, fpct(1)],
+    ["gaps_100kb", "Uncalled stretches ≥ 100 kb", "core", -1, fnum(0)], ["longest_gap_mb", "Longest uncalled (Mb)", "core", -1, fnum(2)]]},
+  {id: "zyg", title: "Zygosity", hint: "het calls", rows: [
+    ["pred_het_frac", "Predicted het sites %", "core", null, fpct(2)], ["truth_het_frac", "True het sites %", "core", null, fpct(2)],
+    ["het_precision", "Het precision %", "core", 1, fpct(1)], ["het_recall", "Het recall %", "core", 1, fpct(1)],
+    ["router_correct", "Router inbred/hybrid correct %", "core", 1, fpct(0)]]},
+  {id: "bp", title: "Breakpoints", hint: "vs reference path", rows: [
+    ["swr", "Switch ratio (model ÷ reference)", "core", 0, fnum(2)], ["pair_changes", "Founder-pair changes", "core", null, fnum(0)],
+    ["ref_pair_changes", "Reference changes", "core", null, fnum(0)],
+    ["bp_precision_10kb", "Precision @10 kb %", "core", 1, fpct(0)], ["bp_recall_10kb", "Recall @10 kb %", "core", 1, fpct(0)],
+    ["bp_precision_100kb", "Precision @100 kb %", "core", 1, fpct(0)], ["bp_recall_100kb", "Recall @100 kb %", "core", 1, fpct(0)],
+    ["median_segment_mb", "Median segment (Mb)", "core", null, fnum(2)], ["ref_median_segment_mb", "Reference median segment (Mb)", "core", null, fnum(2)],
+    ["snprc_err_dist_0-10kb", "Error % < 10 kb from a reference switch", "core", -1, fpct(2)],
+    ["snprc_err_dist_10-100kb", "Error % 10–100 kb", "core", -1, fpct(2)], ["snprc_err_dist_100-1000kb", "Error % 0.1–1 Mb", "core", -1, fpct(2)],
+    ["snprc_err_dist_1000-infkb", "Error % > 1 Mb", "core", -1, fpct(2)]]},
+  {id: "freq", title: "Frequency", hint: "founder share, allele rarity", rows: [
+    ["founder_share_tvd", "Founder-share distance (TVD)", "core", -1, fnum(3)],
+    ["snprc_err_af_singleton", "Error %, allele in 1 founder", "core", -1, fpct(2)], ["snprc_err_af_rare_2-3", "Error %, 2–3 founders", "core", -1, fpct(2)],
+    ["snprc_err_af_low_4-6", "Error %, 4–6 founders", "core", -1, fpct(2)], ["snprc_err_af_common_7+", "Error %, 7+ founders", "core", -1, fpct(2)]]},
+  {id: "aff", title: "Affinity", hint: "read-based founder prior", rows: [
+    ["affinity_spearman", "Affinity vs reference share (Spearman)", "core", 1, fnum(2)],
+    ["parents_in_aff_top2", "True parents in affinity top 2 %", "core", 1, fpct(0)],
+    ["pred_parents_in_share_top2", "True parents in predicted share top 2 %", "core", 1, fpct(0)]]},
+  {id: "cost", title: "Cost", hint: "wall-clock", rows: [["decode_seconds", "Decode seconds / sample", "core", -1, fnum(0)]]},
+];
+let openGroups = new Set();
+
+function detailTable(g, m, base) {
+  let h = `<div class="dt"><table class="det"><thead><tr><th scope="col">Metric</th>${CLASSES.map(c => `<th scope="col">${c}</th>`).join("")}</tr></thead><tbody>`;
+  for (const [key, lab, src, dir, fmt] of (typeof g.rows === "function" ? g.rows() : g.rows)) {
+    h += `<tr><th scope="row">${lab}</th>`;
+    for (const c of CLASSES) {
+      const v = get(m, src, c, key), b = m.name === state.base ? null : get(base, src, c, key);
+      let st = "";
+      if (dir !== null && v != null && b != null) {
+        const s = dir === 0 ? cmp("swr", v, b) : (dir < 0 ? (v < b * 0.95 - 1e-9 ? "better" : v > b * 1.05 + 1e-9 ? "worse" : "") : (v > b * 1.02 + 1e-9 ? "better" : v < b * 0.98 - 1e-9 ? "worse" : ""));
+        st = s === "similar" ? "" : (s || "");
+      }
+      h += `<td class="${st}">${fmt(v)}${b != null ? `<span class="dd">${fmt(b)}</span>` : ""}</td>`;
+    }
+    h += `</tr>`;
+  }
+  return h + `</tbody></table></div>`;
+}
+
+function renderDrill() {
+  const m = M[state.sel], base = M[state.base], el = $("#drill");
+  if (!m) { el.innerHTML = ""; return; }
+  const vd = verdict(m);
+  const tags = Object.entries(m.tags || {}).map(([d, t]) => `${d}x=${t}`).join("  ");
+  let h = `<div class="dhead"><h2>${esc(m.name)}</h2><span class="chip ${vd.cls}">${esc(vd.text)}</span><span class="note">${esc(m.note || "")}</span><span class="tags">${esc(tags)}${state.depth === "both" ? " · avg of 0.1x & 1x" : " · " + state.depth + "x"}</span></div>`;
+  h += `<div><h3>SNP+RC error by class <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink-3)">· model / baseline (${esc(state.base)}) / <abbr title="Best panel-founder path (in-panel: true path, 0%).">ceiling</abbr> · each class on its own scale</span></h3><div class="multiples">` +
+       CLASSES.map(c => mini(c, m, base, "core", "snprc_err", "ceiling_snprc_err", fmtErr, "err")).join("") + `</div></div>`;
+  const hasGw = depths().every(d => m.gw && m.gw[d]);
+  h += `<div><h3><abbr title="${esc(GW_TIP)}">Gene-window error %</abbr> by class <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink-3)">· ${EV() ? "indels per event" : "indels per bp, capped"} · model / baseline (${esc(state.base)}) / <abbr title="Best single panel founder per window and truth line.">ceiling</abbr> = best single founder per window / <abbr title="Exact expectation of a random scorable panel founder per window and truth line.">random</abbr> founder</span></h3>` +
+       (hasGw ? `<div class="multiples">${CLASSES.map(c => mini(c, m, base, "gw", GWF().pct, GWF().ceil, v => v == null ? "–" : (v < 0.1 ? v.toFixed(4) : v < 1 ? v.toFixed(3) : v.toFixed(2)) + "%", "gwp", GWF().rand)).join("")}</div>`
+              : `<div class="empty">Gene-window eval not run for this model at this depth (eval_suite.py run --model ${esc(m.name)} --sections genewindow).</div>`) + `</div>`;
+  h += `<div style="display:grid;gap:6px">` + GROUPS.map(g => `<details class="grp" data-g="${g.id}"${openGroups.has(g.id) ? " open" : ""}><summary>${g.title}<span class="hint">${g.hint}${m.name !== state.base ? " · small = baseline" : ""}</span></summary>${detailTable(g, m, base)}${g.id === "cost" && m.gw_seconds ? `<div class="rules">Gene-window eval: ${Math.round(m.gw_seconds)} s for all samples (cached panel ceiling).</div>` : ""}</details>`).join("") + `</div>`;
+  el.innerHTML = h;
+  el.querySelectorAll("details.grp").forEach(d => d.addEventListener("toggle", () => { d.open ? openGroups.add(d.dataset.g) : openGroups.delete(d.dataset.g); }));
+}
+
+function render() {
+  document.querySelectorAll("#depthSeg button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.d === state.depth)));
+  document.querySelectorAll("#indelSeg button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.i === state.indel)));
+  $("#baseSel").value = state.base;
+  renderBoard(); renderDrill(); save();
+}
+
+$("#gen").textContent = `${DATA.models.length} models · SNP+RC first`;
+$("#footGen").textContent = `Generated ${DATA.generated}`;
+$("#baseSel").innerHTML = DATA.models.map(m => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("");
+$("#baseSel").addEventListener("change", e => { state.base = e.target.value; render(); });
+document.querySelectorAll("#depthSeg button").forEach(b => b.addEventListener("click", () => { state.depth = b.dataset.d; render(); }));
+document.querySelectorAll("#indelSeg button").forEach(b => b.addEventListener("click", () => { state.indel = b.dataset.i; render(); }));
+state.sel = (order().find(m => m.name !== state.base) || DATA.models[0] || {}).name;
+render();
+})();
+</script>

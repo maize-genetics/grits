@@ -174,7 +174,8 @@ lerna-debug.log*
 # =========================================
 # ML/LLM metadata
 # =========================================
-.claude/
+.claude/*
+!.claude/skills/
 modernbert.pth
 *.pth
 src/python/supervised/data/

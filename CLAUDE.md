@@ -5,6 +5,21 @@ GRITS (**G**enetic **R**ecombination **I**mputation **T**ool **S**et) imputes
 founder haplotype paths in diploid plant genomes. The ML stack lives entirely
 under `src/python/`.
 
+## Running GRITS on a user's sample
+If someone wants to impute, genotype or find the founders of their own maize sample, use the
+**`grits-run-sample` skill** (`.claude/skills/grits-run-sample/SKILL.md`). Do not assemble the pipeline from
+the training code or the experiment scripts.
+- It runs the promoted pipeline: ropebwt3-phg `develop` refmap with the promoted flags, then
+  `infer_real_founder_pairs(preset="placedfix_hetdel_hs_peel")` with checkpoint `v6cfullfe-stage2B`.
+- Other species or panels (up to the checkpoint's 25 founders) run experimentally: the user builds an index
+  and lift, sets `GRITS_REF_PREFIX`, and the decode pads the panel. Never present non-maize results as
+  validated.
+- Start with `scripts/check_setup.sh`. Resource paths come from `scripts/grits.env` via `GRITS_*`
+  environment variables; never hard-code them.
+- The human-readable version of the same steps is `docs/run-sample.md`; keep the two in sync.
+- The `--workdir` convention below applies to training scripts, not to this skill: its outputs go in the
+  user's chosen OUTDIR.
+
 ## Active branch for encoder work
 All new encoder development goes on **`crf-relatedness`**, branched from
 `crf-tests`. Do not commit encoder changes directly to `main`.

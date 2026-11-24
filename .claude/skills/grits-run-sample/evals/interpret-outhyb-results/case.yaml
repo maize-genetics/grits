@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: interpret-outhyb-results
+expected_outcome: |
+  A summary built from the BEDs and decode_summary.txt (founder pairs per chromosome, main founders genome-wide, het fraction ~0.98 consistent with an F1) together with a calibrated trust statement: out-of-panel hybrids have the highest error (~10% SNP error at 0.1x), calls mean 'closest of the 25 founders', errors cluster near founder switches.

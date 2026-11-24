@@ -26,6 +26,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import Dataset, DataLoader
 
 from python.crf.train_crf import FounderPathEncoder
+from python.crf.callbacks import EMACallback
 
 
 # --------------------------------------------------------------------------- #
@@ -433,6 +434,12 @@ class GRITSCRFHaploid(pl.LightningModule):
         pred = self.decode(emis_f, c)
         acc = (pred == tags).float().mean()
         self.log("val/loss", loss, prog_bar=True)
+        self.log("val_loss", loss)                     # slash-free alias: ModelCheckpoint's
+                                                         # filename= can't safely interpolate a
+                                                         # metric name containing "/" (Lightning
+                                                         # treats it as a path separator and
+                                                         # scatters checkpoints into a stray
+                                                         # val/ subdir) — see callbacks below.
         self.log("val/crf_loss", crf_loss)
         self.log("val/acc", acc, prog_bar=True)
         self.log("val/gate", g.mean())
@@ -575,6 +582,14 @@ def main():
     p.add_argument("--patience",    type=int, default=10)
     p.add_argument("--devices",     type=int, default=1,
                    help="Number of GPUs (default 1; use 1 to avoid DDP overhead)")
+    p.add_argument("--resume", default=None,
+                   help="Path to a .ckpt to resume training from (optimizer/scheduler "
+                        "state included; passed as Trainer.fit(ckpt_path=...)).")
+    p.add_argument("--ema", action="store_true",
+                   help="Track a weight EMA and swap it in for validation/checkpoint "
+                        "(tames late-epoch oscillation/collapse).")
+    p.add_argument("--ema-decay", type=float, default=0.999,
+                   help="EMA decay rate (only used with --ema).")
     args = p.parse_args()
 
     workdir = Path(args.workdir)
@@ -627,10 +642,16 @@ def main():
     )
 
     callbacks = [
-        ModelCheckpoint(dirpath=str(ckpt_dir), monitor="val/loss", mode="min",
-                        save_top_k=3, filename="e1-{epoch:02d}-{val/loss:.3f}"),
-        EarlyStopping(monitor="val/loss", mode="min", patience=args.patience),
+        # monitor the slash-free "val_loss" alias (logged alongside "val/loss"): a
+        # filename= token containing "/" makes Lightning scatter checkpoints into a
+        # stray val/ subdir instead of writing directly under ckpt_dir.
+        ModelCheckpoint(dirpath=str(ckpt_dir), monitor="val_loss", mode="min",
+                        save_top_k=3, save_last=True,
+                        filename="e1-{epoch:02d}-{val_loss:.3f}"),
+        EarlyStopping(monitor="val_loss", mode="min", patience=args.patience),
     ]
+    if args.ema:
+        callbacks.append(EMACallback(args.ema_decay))
 
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
@@ -642,7 +663,7 @@ def main():
         gradient_clip_val=args.grad_clip,
     )
 
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, train_loader, val_loader, ckpt_path=args.resume)
     print(f"Best checkpoint: {callbacks[0].best_model_path}")
 
 
